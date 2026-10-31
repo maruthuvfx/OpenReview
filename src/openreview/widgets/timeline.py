@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QLabel,
     QSpinBox,
+    QDoubleSpinBox,
     QComboBox,
     QFrame,
     QMenu,
@@ -41,6 +42,7 @@ class TimelineRuler(QWidget):
     """
 
     seek_requested = Signal(int)
+    seek_finished = Signal(int)
 
     def __init__(
         self,
@@ -344,9 +346,12 @@ class TimelineRuler(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
+            was_scrubbing = (self._drag_mode == "playhead")
             self._drag_mode = None
             self.setCursor(Qt.CursorShape.ArrowCursor)
             self.update()
+            if was_scrubbing:
+                self.seek_finished.emit(self.clock.current_frame)
 
     # --------------------------------------------------------------------------
     # Painting
@@ -664,6 +669,7 @@ class MagnifiedTimelinePopup(QFrame):
     Enables high-precision scrubbing in an expanded window around the current frame (Shift+T).
     """
     seek_requested = Signal(int)
+    seek_finished = Signal(int)
 
     def __init__(self, clock: PlaybackClock, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -794,10 +800,12 @@ class TimelineWidget(QFrame):
     cache_mode_cycle_requested = Signal()
     cache_mode_selected = Signal(str)
     seek_requested = Signal(int)
+    seek_finished = Signal(int)
     audio_clicked = Signal()
     focus_viewport_requested = Signal()
     clear_cache_requested = Signal()
     clear_annotations_requested = Signal()
+    fps_dialog_requested = Signal()
 
     def __init__(
         self,
@@ -812,6 +820,7 @@ class TimelineWidget(QFrame):
         self.canvas_widget = canvas_widget
         self.magnified_popup: Optional[MagnifiedTimelinePopup] = None
         self._setup_ui()
+        self.clock.fps_changed.connect(self._on_clock_fps_changed)
 
     def set_canvas_widget(self, canvas: QWidget) -> None:
         """Set the canvas/viewport widget used as the overlay parent for the magnifier."""
@@ -820,6 +829,15 @@ class TimelineWidget(QFrame):
             self.magnified_popup.setParent(canvas)
             if self.magnified_popup.isVisible():
                 self.magnified_popup.auto_center_in_parent()
+
+
+    def _on_clock_fps_changed(self, fps: float) -> None:
+        if hasattr(self, "btn_fps"):
+            self.btn_fps.setText(f"{fps:.2f} fps")
+        if hasattr(self, "fps_spin"):
+            self.fps_spin.blockSignals(True)
+            self.fps_spin.setValue(fps)
+            self.fps_spin.blockSignals(False)
 
     def _setup_ui(self) -> None:
         from openreview.ui.theme import get_spinbox_arrow_stylesheet
@@ -852,6 +870,8 @@ class TimelineWidget(QFrame):
         self.ruler = TimelineRuler(self.clock, self.annotation_store, self)
         self.ruler.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.ruler.seek_requested.connect(self.seek_requested.emit)
+        if hasattr(self.ruler, "seek_finished"):
+            self.ruler.seek_finished.connect(self.seek_finished.emit)
         layout.addWidget(self.ruler)
 
         # 2. Bottom Row: Transport controls + Compact Cache Bar + Frame info
@@ -913,21 +933,47 @@ class TimelineWidget(QFrame):
         self.btn_magnifier.clicked.connect(self.toggle_magnifier_widget)
         transport_row.addWidget(self.btn_magnifier)
 
-        # Target FPS Display (Moved next to Magnified timeline scrub ruler)
+        # Target FPS Display (Clickable studio badge)
         fps_lbl = QLabel("FPS:", self)
         fps_lbl.setStyleSheet("color: #777777; margin-left: 4px;")
         transport_row.addWidget(fps_lbl)
 
-        self.fps_spin = QSpinBox(self)
-        self.fps_spin.setRange(1, 240)
-        self.fps_spin.setValue(int(self.clock.fps))
-        self.fps_spin.setSuffix(" fps")
-        self.fps_spin.setKeyboardTracking(False)
-        self.fps_spin.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-        self.fps_spin.editingFinished.connect(self.fps_spin.clearFocus)
-        self.fps_spin.wheelEvent = lambda event: event.ignore()
+        self.btn_fps = QPushButton(self)
+        self.btn_fps.setObjectName("fpsBadgeBtn")
+        self.btn_fps.setText(f"{self.clock.fps:.2f} fps")
+        self.btn_fps.setToolTip("Playback Frame Rate (Shift+F) - Click to change")
+        self.btn_fps.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_fps.setStyleSheet("""
+            QPushButton#fpsBadgeBtn {
+                background-color: #222222;
+                color: #e5a823;
+                font-weight: bold;
+                font-size: 11px;
+                font-family: Consolas, monospace;
+                border: 1px solid #3c3c3c;
+                border-radius: 3px;
+                padding: 1px 7px;
+                min-height: 20px;
+                max-height: 22px;
+            }
+            QPushButton#fpsBadgeBtn:hover {
+                background-color: #333333;
+                border-color: #e5a823;
+                color: #ffffff;
+            }
+            QPushButton#fpsBadgeBtn:pressed {
+                background-color: #1a1a1a;
+                border-color: #c98e16;
+            }
+        """)
+        self.btn_fps.clicked.connect(self.fps_dialog_requested.emit)
+        transport_row.addWidget(self.btn_fps)
+
+        self.fps_spin = QDoubleSpinBox(self)
+        self.fps_spin.setRange(0.1, 240.0)
+        self.fps_spin.setValue(self.clock.fps)
+        self.fps_spin.hide()
         self.fps_spin.valueChanged.connect(lambda v: self.clock.set_fps(float(v)))
-        transport_row.addWidget(self.fps_spin)
 
         # Set Handles Dropdown next to FPS input
         handles_lbl = QLabel("Set Handles:", self)

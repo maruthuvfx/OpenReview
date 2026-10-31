@@ -123,10 +123,10 @@ def test_atomic_session_reset(qtbot):
     assert len(win.session_graph.sources) == 0
     assert len(win._source_readers) == 0
     assert win.reader is None
-    assert win.clock.start_frame == 1
-    assert win.clock.end_frame == 100
-    assert win.clock.in_frame == 1
-    assert win.clock.out_frame == 100
+    assert win.clock.start_frame == 1001
+    assert win.clock.end_frame == 1200
+    assert win.clock.in_frame == 1001
+    assert win.clock.out_frame == 1200
     assert win.sources_dock.panel.list_inputs.count() == 0
 
     win.close()

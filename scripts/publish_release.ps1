@@ -10,8 +10,8 @@
 
 [CmdletBinding()]
 param(
-    [string]$Version = "1.2.0",
-    [string]$TagName = "v1.2.0",
+    [string]$Version = "1.3.0",
+    [string]$TagName = "v1.3.0",
     [string]$RemoteName = "origin",
     [string]$RepoUrl = "https://github.com/maruthuvfx/OpenReview.git",
     [switch]$SkipPush

@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.3.0] - 2026-11-01
+
+### Added
+- **Live Real-Time Waveform Monitor (`hud_waveform.py`)**: Added dedicated Waveform HUD supporting RGB Overlay, RGB Parade, and Luma (Y) trace modes with phosphor intensity glow and broadcast graticule scale.
+- **Live Real-Time Vectorscope Monitor (`hud_vectorscope.py`)**: Added dedicated Vectorscope HUD displaying chrominance (Cb, Cr) signals, Rec.709 75%/100% color targets, I-axis / skin-tone line, and trace accumulation.
+- **Generic Standard Colorspaces Catalog (`standard_colorspaces.py`)**: Integrated Foundry Nuke-aligned transfer functions and curves for linear, sRGB, rec709, Cineon, Gamma 1.8, Gamma 2.2, Panalog, REDLog, ViperLog, REDSpace, and Raw.
+- **Intelligent Auto Colorspace Detection**: Automatic identification of color spaces from file metadata, camera header tags (RED, ARRI, Sony S-Log), and container attributes with fallback heuristics.
+- **Per-Clip Colorspace Assignment & Persistence**: Dropdown selector in Sources panel to override input color space per media item, persisted seamlessly across sessions.
+- **Adaptive Playback & Scrubbing Engine**: Dynamic proxy downsampling (`InteractiveDecodeTask`) for butter-smooth, drop-free playback and scrubbing across 4K/8K media, instantly upgrading to pristine full-resolution upon pausing or resting.
+- **Asynchronous Dual-Queue & Cooperative Cancellation**: Non-blocking reader engine with `CancellationToken` preventing queue backpressure during rapid JKL bidirectional transport.
+- **Dedicated Frame Rate Dialog (`frame_rate_dialog.py`)**: Sleek keyboard-first floating modal for selecting playback FPS with standard VFX preset pills (23.976, 24, 25, 29.97, 30, 48, 50, 59.94, 60), direct numerical entry, and `Ctrl+Alt+R` hotkey.
+- **Per-Media Premultiplied Alpha Control**: Per-clip premultiplication toggle with auto-detection for transparent PNG/EXR graphics.
+- **Per-Media Annotation Stashing**: Vector drawings and notes are automatically stashed and restored per source clip across session switches.
+- **Optimized PNG-8 Palette Export**: High-performance PNG export pipeline with PNG-8 quantized palette mode, configurable Floyd-Steinberg dithering, and multithreaded compression.
+- **Automatic Downscaling (> Full HD)**: Delivery preference and export dialog option to automatically downscale 4K/8K images to Full HD (1920x1080) for rapid client previews and review sheets.
+- **New Shortcuts & Navigation**: Added Export Annotations (`Ctrl+Shift+E`), Fit Width (`W` / `Shift+W` / `Alt+W`), and protected viewer zoom-scroll against accidental trackpad triggers.
+
+### Changed
+- **Default Image Export Format**: Set JPEG (85% quality) as the default format for single frame and image sequence exports with automatic Full HD downscaling support.
+- **Session Window Title**: Enhanced window title bar with clean asterisk (`*`) indicators for unsaved changes and clear file paths.
+- **Preferences Dialog**: Added new "Export & Delivery" configuration tab exposing default formats, PNG quantization parameters, and PDF report styling.
+
+### Fixed
+- **Scrubbing Bottlenecks**: Eliminated UI hangs during rapid scrub by canceling stale in-flight decode tasks before queuing new ones.
+- **Viewer Trackpad Zoom Sensitivity**: Protected against inadvertent zoom spikes from high-precision trackpads and mouse wheel bounce.
+- **Menu Hierarchy**: Streamlined Help and Window menus, removing duplicate action registrations.
+
+---
+
 ## [1.2.0] - 2026-10-25
 
 ### Added

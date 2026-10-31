@@ -180,7 +180,7 @@ def test_annotation_manager_export_workflow(qtbot, monkeypatch, tmp_path):
     assert target_md.exists()
     assert "Review render passes" in target_md.read_text(encoding="utf-8")
 
-    # 3. Export PDF with PNG frames prompt accepted
+    # 3. Export PDF with image frames prompt accepted
     target_pdf = tmp_path / "review_sheet.pdf"
     monkeypatch.setattr(
         "PySide6.QtWidgets.QFileDialog.getSaveFileName",
@@ -189,9 +189,9 @@ def test_annotation_manager_export_workflow(qtbot, monkeypatch, tmp_path):
     monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.StandardButton.Yes)
     dlg._on_export_clicked()
     assert target_pdf.exists()
-    png_dir = tmp_path / "review_sheet_frames"
-    assert png_dir.exists()
-    assert (png_dir / "frame_1005.png").exists()
+    img_dir = tmp_path / "review_sheet_frames"
+    assert img_dir.exists()
+    assert (img_dir / "frame_1005.jpg").exists() or (img_dir / "frame_1005.png").exists()
 
     dlg.close()
 

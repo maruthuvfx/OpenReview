@@ -10,8 +10,15 @@ import subprocess
 import shutil
 from pathlib import Path
 from typing import List, Callable, Optional, Tuple, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import BoundedSemaphore, Lock
 import numpy as np
 from PIL import Image
+from openreview.color.standard_colorspaces import (
+    apply_standard_to_linear,
+    apply_linear_to_standard,
+    linear_to_srgb,
+)
 
 try:
     import cv2
@@ -162,9 +169,11 @@ class MediaExporter:
     def save_image_file(
         image_data: np.ndarray,
         file_path: str | Path,
-        compression: str = "zip",
-        bit_depth: str = "16",
+        compression: str | int = "zip",
+        bit_depth: str = "8",
         quality: int = 95,
+        dither: bool = True,
+        png_mode: str = "png24_opt",
     ) -> None:
         """Save image array to disk in EXR, DPX, TIFF, PNG, JPEG, or Targa format."""
         if isinstance(image_data, (tuple, list)):
@@ -182,7 +191,7 @@ class MediaExporter:
                 f_img = image_data.astype(np.float32) / 65535.0
             else:
                 f_img = image_data.astype(np.float32)
-            MediaExporter.save_exr(p, f_img, compression=compression, bit_depth=bit_depth)
+            MediaExporter.save_exr(p, f_img, compression=str(compression), bit_depth=bit_depth)
             return
 
         if ext == ".dpx":
@@ -212,7 +221,25 @@ class MediaExporter:
                 return
 
         if ext == ".png":
-            if str(bit_depth).strip() == "16":
+            # Extract PNG compression level (0..9, default 4 for balanced size & speed)
+            png_comp = 4
+            if isinstance(compression, int):
+                png_comp = max(0, min(9, compression))
+            elif isinstance(compression, str):
+                s = compression.strip().lower()
+                if s.isdigit():
+                    png_comp = max(0, min(9, int(s)))
+                elif "fast" in s:
+                    png_comp = 1
+                elif "max" in s:
+                    png_comp = 9
+                elif "bal" in s:
+                    png_comp = 4
+
+            is_16bit = str(bit_depth).strip() in ("16", "half", "deep") or png_mode == "16"
+            is_png8 = (png_mode == "png8" or str(bit_depth).strip() in ("png8", "8_indexed", "quantize"))
+
+            if is_16bit:
                 if image_data.dtype in (np.float32, np.float64, np.float16):
                     arr_16 = np.clip(image_data * 65535.0, 0, 65535).astype(np.uint16)
                 elif image_data.dtype == np.uint8:
@@ -221,19 +248,32 @@ class MediaExporter:
                     arr_16 = image_data.astype(np.uint16)
                 if HAS_CV2:
                     bgr = cv2.cvtColor(arr_16, cv2.COLOR_RGB2BGR) if arr_16.ndim >= 3 and arr_16.shape[2] >= 3 else arr_16
-                    cv2.imwrite(str(p), bgr)
+                    cv2.imwrite(str(p), bgr, [cv2.IMWRITE_PNG_COMPRESSION, png_comp])
                 else:
                     img = Image.fromarray(arr_16)
-                    img.save(str(p))
+                    img.save(str(p), compress_level=png_comp)
+                return
+
+            # Convert to uint8 (H, W, C)
+            arr_8 = MediaExporter._to_uint8(image_data)
+
+            if is_png8:
+                # Ultra-Compressed 8-bit Indexed Palette (PNG-8)
+                # Adaptive 256 colors with optional Floyd-Steinberg dithering (~70% smaller)
+                has_alpha = (arr_8.ndim == 3 and arr_8.shape[2] == 4)
+                img = Image.fromarray(arr_8, mode="RGBA" if has_alpha else "RGB")
+                dither_algo = Image.Dither.FLOYDSTEINBERG if dither else Image.Dither.NONE
+                quantized = img.quantize(colors=256, method=Image.Quantize.MEDIANCUT, dither=dither_algo)
+                quantized.save(str(p), format="PNG", optimize=True, compress_level=png_comp)
                 return
             else:
-                arr_8 = MediaExporter._to_uint8(image_data)
+                # PNG-24 Truecolor Optimized (Strictly Lossless)
                 if HAS_CV2:
                     bgr = cv2.cvtColor(arr_8, cv2.COLOR_RGB2BGR) if arr_8.ndim >= 3 and arr_8.shape[2] >= 3 else arr_8
-                    cv2.imwrite(str(p), bgr, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+                    cv2.imwrite(str(p), bgr, [cv2.IMWRITE_PNG_COMPRESSION, png_comp])
                 else:
                     img = Image.fromarray(arr_8)
-                    img.save(str(p))
+                    img.save(str(p), optimize=True, compress_level=png_comp)
                 return
 
         if ext in (".jpg", ".jpeg"):
@@ -414,43 +454,93 @@ class MediaExporter:
         filename_prefix: str = "frame",
         file_ext: str = "png",
         pad: int = 4,
-        compression: str = "zip",
-        bit_depth: str = "16",
+        compression: str = "4",
+        bit_depth: str = "8",
         quality: int = 95,
         progress_callback: Optional[Callable[[int, int], None]] = None,
         cancel_token: Optional[Callable[[], bool]] = None,
+        max_workers: int = 4,
+        dither: bool = True,
+        png_mode: str = "png8",
     ) -> List[str]:
         """
-        Export list of frames as an image sequence.
-        e.g. output_dir/frame.0101.exr
+        Export list of frames as an image sequence with parallel writing.
+        e.g. output_dir/frame.0101.png
         """
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
         ext = file_ext.lstrip(".")
-        saved_paths: List[str] = []
         total = len(frames)
+        if total == 0:
+            return []
 
-        for i, f in enumerate(frames):
-            if cancel_token and cancel_token():
-                break
-            frame_num_str = f"{f:0{pad}d}"
-            filename = f"{filename_prefix}.{frame_num_str}.{ext}"
-            file_path = out_dir / filename
-            img = frame_provider(f)
-            MediaExporter.save_image_file(
-                img,
-                file_path,
-                compression=compression,
-                bit_depth=bit_depth,
-                quality=quality,
-            )
-            saved_paths.append(str(file_path))
+        # Determine thread count
+        num_workers = min(max_workers, max(1, os.cpu_count() or 4), total)
+        if num_workers <= 1 or total == 1:
+            saved_paths: List[str] = []
+            for i, f in enumerate(frames):
+                if cancel_token and cancel_token():
+                    break
+                frame_num_str = f"{f:0{pad}d}"
+                filename = f"{filename_prefix}.{frame_num_str}.{ext}"
+                file_path = out_dir / filename
+                img = frame_provider(f)
+                MediaExporter.save_image_file(
+                    img,
+                    file_path,
+                    compression=compression,
+                    bit_depth=bit_depth,
+                    quality=quality,
+                    dither=dither,
+                    png_mode=png_mode,
+                )
+                saved_paths.append(str(file_path))
+                if progress_callback:
+                    progress_callback(i + 1, total)
+            return saved_paths
 
-            if progress_callback:
-                progress_callback(i + 1, total)
+        # Multithreaded pipelined writing with bounded memory
+        saved_paths = [None] * total
+        completed_count = 0
+        lock = Lock()
+        sem = BoundedSemaphore(num_workers * 2)
 
-        return saved_paths
+        def _worker_write(idx: int, frame_img: np.ndarray, target_path: Path):
+            nonlocal completed_count
+            try:
+                if not (cancel_token and cancel_token()):
+                    MediaExporter.save_image_file(
+                        frame_img,
+                        target_path,
+                        compression=compression,
+                        bit_depth=bit_depth,
+                        quality=quality,
+                        dither=dither,
+                        png_mode=png_mode,
+                    )
+                    with lock:
+                        saved_paths[idx] = str(target_path)
+            finally:
+                sem.release()
+                with lock:
+                    completed_count += 1
+                    cur_comp = completed_count
+                if progress_callback:
+                    progress_callback(cur_comp, total)
+
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            for i, f in enumerate(frames):
+                if cancel_token and cancel_token():
+                    break
+                sem.acquire()
+                frame_num_str = f"{f:0{pad}d}"
+                filename = f"{filename_prefix}.{frame_num_str}.{ext}"
+                file_path = out_dir / filename
+                img = frame_provider(f)
+                executor.submit(_worker_write, i, img, file_path)
+
+        return [p for p in saved_paths if p is not None]
 
     @staticmethod
     def _build_smooth_bezier_path(points: list) -> Any:
@@ -999,29 +1089,17 @@ class MediaExporter:
     @staticmethod
     def _linearize_input(rgb: np.ndarray, input_space: int = 0) -> np.ndarray:
         """Convert float32 RGB to scene-linear based on input color space index."""
-        if input_space == 0:  # sRGB
-            higher = np.power(np.maximum((rgb + 0.055) / 1.055, 0.0), 2.4)
-            lower = rgb / 12.92
-            return np.where(rgb > 0.04045, higher, lower)
-        elif input_space == 3:  # Cineon
-            x = (rgb * 1023.0 - 685.0) / 300.0
-            return np.maximum(0.0, (np.power(10.0, x) - 0.010798) / 0.989202)
-        elif input_space == 4:  # ALEXA LogC
+        if 0 <= input_space <= 10:
+            return apply_standard_to_linear(rgb, input_space)
+        elif input_space == 101:  # ALEXA LogC
             cut, a, b, c, d, e, f = 0.1496582, 0.247190, 0.385537, 0.078277, 0.105910, 5.253018, 0.0400405
             lin = np.where(rgb > cut, (np.power(10.0, (rgb - b) / a) - d) / c, (rgb - f) / e)
             return np.maximum(lin, 0.0)
-        elif input_space == 5:  # ALEXA LogC Film
+        elif input_space == 102:  # ALEXA LogC Film
             cut, a, b, c, d, e, f = 0.1496582, 0.247190, 0.385537, 0.078277, 0.105910, 5.253018, 0.0400405
             lin = np.where(rgb > cut, (np.power(10.0, (rgb - b) / a) - d) / c, (rgb - f) / e)
             return np.power(np.maximum(lin, 0.0), 1.15) * 1.1
-        elif input_space == 6:  # Rec.709
-            higher = np.power(np.maximum((rgb + 0.099) / 1.099, 0.0), 1.0 / 0.45)
-            lower = rgb / 4.5
-            return np.where(rgb > 0.081, higher, lower)
-        elif input_space == 7:  # Gamma 2.2
-            return np.power(np.maximum(rgb, 0.0), 2.2)
-        else:  # ACEScg / Linear / Raw
-            return rgb.copy()
+        return rgb.copy()
 
     @staticmethod
     def _apply_color_grade(lin: np.ndarray, viewport) -> np.ndarray:
@@ -1111,26 +1189,14 @@ class MediaExporter:
         if viewport is None:
             return lin
 
-        view_transform = int(getattr(viewport, "view_transform", 0))
-        if view_transform == 0:  # sRGB Display
-            higher = 1.055 * np.power(np.maximum(lin, 0.0), 1.0 / 2.4) - 0.055
-            lower = 12.92 * lin
-            disp = np.where(lin > 0.0031308, higher, lower)
-        elif view_transform == 1:  # ACES Filmic Tone Mapping
+        view_transform = int(getattr(viewport, "view_transform", 1))
+        if 0 <= view_transform <= 10:
+            disp = apply_linear_to_standard(lin, view_transform)
+        elif view_transform == 100:  # ACES Filmic Tone Mapping
             a, b, c, d, e = 2.51, 0.03, 2.43, 0.59, 0.14
             x = np.maximum(lin, 0.0)
             filmic = np.clip((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0)
-            higher = 1.055 * np.power(filmic, 1.0 / 2.4) - 0.055
-            lower = 12.92 * filmic
-            disp = np.where(filmic > 0.0031308, higher, lower)
-        elif view_transform == 2:  # Raw / Pass-through
-            disp = lin
-        elif view_transform == 3:  # Rec.709
-            higher = 1.099 * np.power(np.maximum(lin, 0.0), 0.45) - 0.099
-            lower = 4.5 * lin
-            disp = np.where(lin > 0.018, higher, lower)
-        elif view_transform == 4:  # Gamma 2.2
-            disp = np.power(np.maximum(lin, 0.0), 1.0 / 2.2)
+            disp = linear_to_srgb(filmic)
         else:
             disp = lin
 

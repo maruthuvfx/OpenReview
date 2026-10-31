@@ -49,6 +49,7 @@ class UserPreferences:
 
     # Caching
     default_cache_mode: str = "off"  # "off", "play_ahead", "region", "all"
+    cache_toggle_mode: str = "region"  # "region", "play_ahead", "all", "last_active"
     auto_ram_budget: bool = True
     lookahead_cache_gb: float = 4.0
     region_cache_gb: float = 4.0
@@ -84,6 +85,12 @@ class UserPreferences:
     safe_guides_matte_constrained: bool = True
     hud_opacity: float = 0.85  # 0.30 to 1.00 (30% to 100%)
 
+    # Color Management Configuration
+    color_management_mode: str = "standard"
+    standard_view_transform: str = "sRGB"
+    standard_input_space: str = "linear"
+    auto_detect_input_colorspace: bool = True  # Auto-choose input colorspace from media metadata
+
     # Studio OpenColorIO Configuration
     ocio_config_path: str = ""
     ocio_display: str = ""
@@ -116,6 +123,14 @@ class UserPreferences:
     pdf_show_stroke_count: bool = True
     pdf_show_notes: bool = True
     pdf_show_source_path: bool = True
+
+    # Export & Delivery Defaults
+    default_export_image_format: str = "jpg"  # "jpg", "png"
+    export_jpg_quality: int = 85  # 1..100
+    export_downscale_greater_than_fhd: bool = True  # Downsize by half when media > 1920x1080
+    export_png_mode: str = "png8"  # "png8", "png24_opt", "16"
+    export_png_dither: bool = True
+    export_png_compression: int = 4  # 0..9
 
 
 class PreferencesManager(QObject):
@@ -169,6 +184,7 @@ class PreferencesManager(QObject):
                     auto_retime_mismatched_fps=bool(data.get("auto_retime_mismatched_fps", True)),
                     play_all_frames=bool(data.get("play_all_frames", True)),
                     default_cache_mode=str(data.get("default_cache_mode", "off")),
+                    cache_toggle_mode=str(data.get("cache_toggle_mode", "region")),
                     auto_ram_budget=bool(data.get("auto_ram_budget", True)),
                     lookahead_cache_gb=float(data.get("lookahead_cache_gb", 4.0)),
                     region_cache_gb=float(data.get("region_cache_gb", 4.0)),
@@ -192,6 +208,10 @@ class PreferencesManager(QObject):
                     safe_guides_enabled=bool(data.get("safe_guides_enabled", False)),
                     safe_guides_matte_constrained=bool(data.get("safe_guides_matte_constrained", True)),
                     hud_opacity=float(data.get("hud_opacity", 0.85)),
+                    color_management_mode=str(data.get("color_management_mode", "standard")),
+                    standard_view_transform=str(data.get("standard_view_transform", "sRGB")),
+                    standard_input_space=str(data.get("standard_input_space", "linear")),
+                    auto_detect_input_colorspace=bool(data.get("auto_detect_input_colorspace", True)),
                     ocio_config_path=str(data.get("ocio_config_path", "")),
                     ocio_display=str(data.get("ocio_display", "")),
                     ocio_view=str(data.get("ocio_view", "")),
@@ -218,6 +238,12 @@ class PreferencesManager(QObject):
                     pdf_show_stroke_count=bool(data.get("pdf_show_stroke_count", True)),
                     pdf_show_notes=bool(data.get("pdf_show_notes", True)),
                     pdf_show_source_path=bool(data.get("pdf_show_source_path", True)),
+                    default_export_image_format=str(data.get("default_export_image_format", "jpg")),
+                    export_jpg_quality=int(data.get("export_jpg_quality", 85)),
+                    export_downscale_greater_than_fhd=bool(data.get("export_downscale_greater_than_fhd", True)),
+                    export_png_mode=str(data.get("export_png_mode", "png8")),
+                    export_png_dither=bool(data.get("export_png_dither", True)),
+                    export_png_compression=int(data.get("export_png_compression", 4)),
                 )
                 return self._prefs
             except Exception as e:
@@ -233,6 +259,7 @@ class PreferencesManager(QObject):
                 self._prefs.canvas_scrub_enabled = settings.value("canvas_scrub_enabled", True, type=bool)
                 self._prefs.auto_retime_mismatched_fps = settings.value("auto_retime_mismatched_fps", True, type=bool)
                 self._prefs.default_cache_mode = str(settings.value("default_cache_mode", "off"))
+                self._prefs.cache_toggle_mode = str(settings.value("cache_toggle_mode", "region"))
                 self._prefs.auto_ram_budget = settings.value("auto_ram_budget", True, type=bool)
                 self._prefs.lookahead_cache_gb = float(settings.value("lookahead_cache_gb", 4.0))
                 self._prefs.region_cache_gb = float(settings.value("region_cache_gb", 4.0))
@@ -259,6 +286,12 @@ class PreferencesManager(QObject):
                 self._prefs.pdf_show_stroke_count = settings.value("pdf_show_stroke_count", True, type=bool)
                 self._prefs.pdf_show_notes = settings.value("pdf_show_notes", True, type=bool)
                 self._prefs.pdf_show_source_path = settings.value("pdf_show_source_path", True, type=bool)
+                self._prefs.default_export_image_format = str(settings.value("default_export_image_format", "jpg"))
+                self._prefs.export_jpg_quality = int(settings.value("export_jpg_quality", 85))
+                self._prefs.export_downscale_greater_than_fhd = settings.value("export_downscale_greater_than_fhd", True, type=bool)
+                self._prefs.export_png_mode = str(settings.value("export_png_mode", "png8"))
+                self._prefs.export_png_dither = settings.value("export_png_dither", True, type=bool)
+                self._prefs.export_png_compression = int(settings.value("export_png_compression", 4))
             except Exception:
                 pass
         return self._prefs

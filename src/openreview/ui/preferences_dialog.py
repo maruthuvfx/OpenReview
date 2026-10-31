@@ -41,6 +41,9 @@ from openreview.widgets.draggable_scroll_area import BlenderScrollArea
 
 from openreview.core.preferences import PreferencesManager, UserPreferences
 from openreview.core.shortcuts import ShortcutManager, ShortcutAction
+from openreview.color.standard_colorspaces import STANDARD_COLORSPACES
+from openreview.color.ocio_manager import OCIOManager
+from openreview.ui.ocio_dialog import OCIOConfigWidget
 from openreview.core.gpu_detector import (
     detect_system_gpus,
     get_active_gpu_device,
@@ -154,7 +157,7 @@ class PreferencesDialog(QDialog):
 
     hud_opacity_changed = Signal(float)
 
-    def __init__(self, mgr: Optional[PreferencesManager] = None, parent: Optional[QWidget] = None):
+    def __init__(self, mgr: Optional[PreferencesManager] = None, parent: Optional[QWidget] = None, ocio_manager: Optional[OCIOManager] = None):
         if isinstance(mgr, QWidget) and parent is None:
             parent = mgr
             mgr = None
@@ -163,6 +166,7 @@ class PreferencesDialog(QDialog):
         self.resize(760, 560)
         self.mgr = mgr or PreferencesManager.instance()
         self.shortcut_mgr = ShortcutManager.instance()
+        self.ocio_manager = ocio_manager or getattr(parent, "ocio_manager", None) or OCIOManager()
         self._current_prefs = self.mgr.prefs
 
         # Temporary local shortcut working state: action_id -> shortcut_str
@@ -480,6 +484,13 @@ class PreferencesDialog(QDialog):
         self.combo_cache_mode.addItem("Full Sequence Cache", "all")
         cache_form.addRow("Default Cache Mode:", self.combo_cache_mode)
 
+        self.combo_cache_toggle = QComboBox()
+        self.combo_cache_toggle.addItem("In/Out Region Cache (Default)", "region")
+        self.combo_cache_toggle.addItem("Play-Ahead Cache", "play_ahead")
+        self.combo_cache_toggle.addItem("Full Sequence Cache", "all")
+        self.combo_cache_toggle.addItem("Resume Last Active Mode", "last_active")
+        cache_form.addRow("Cache Toggle Target:", self.combo_cache_toggle)
+
         self.chk_auto_ram_budget = QCheckBox(
             f"Adapt to Available System RAM (~{auto_budget_gb:.1f} GB / {total_ram_mb / 1024.0:.1f} GB Total)"
         )
@@ -530,10 +541,16 @@ class PreferencesDialog(QDialog):
         self.tabs.addTab(self._wrap_tab_in_scroll(tab_cache), "Caching")
 
         # -------------------------------------------------------------
-        # Tab 4: PDF Review Sheets & Layout Customization
+        # Tab 4: Dedicated Export & Delivery Settings
         # -------------------------------------------------------------
-        tab_pdf = self._create_tab_pdf_export()
-        self.tabs.addTab(self._wrap_tab_in_scroll(tab_pdf), "PDF Review Sheets")
+        tab_export = self._create_tab_export_delivery()
+        self.tabs.addTab(self._wrap_tab_in_scroll(tab_export), "Export & Delivery")
+
+        # -------------------------------------------------------------
+        # Tab 5: Color Management (Standard Colorspaces vs OpenColorIO)
+        # -------------------------------------------------------------
+        tab_color = self._create_tab_color_management()
+        self.tabs.addTab(self._wrap_tab_in_scroll(tab_color), "Color Management")
 
         # -------------------------------------------------------------
         # Tab 5: Dedicated Keyboard Shortcuts Customization
@@ -727,14 +744,174 @@ class PreferencesDialog(QDialog):
                 self._working_shortcuts[act.action_id] = act.default_shortcut
             self._refresh_shortcuts_table()
 
-    def _create_tab_pdf_export(self) -> QWidget:
-        tab_pdf = QWidget()
-        pdf_layout = QVBoxLayout(tab_pdf)
-        pdf_layout.setContentsMargins(12, 12, 12, 12)
-        pdf_layout.setSpacing(12)
+    def _create_tab_color_management(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
 
-        # 1. Branding & Header Information
-        grp_brand = QGroupBox("Branding & Header Information")
+        # 1. Mode Selection Group
+        grp_mode = QGroupBox("Color Management Mode")
+        mode_layout = QVBoxLayout(grp_mode)
+        mode_form = QFormLayout()
+        mode_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self.combo_cm_mode = QComboBox()
+        self.combo_cm_mode.addItem("Standard Colorspaces (Generic Broadcast & Film Curves)", "standard")
+        self.combo_cm_mode.addItem("OpenColorIO (Studio OCIO v2 Pipeline)", "ocio")
+        self.combo_cm_mode.currentIndexChanged.connect(self._on_cm_mode_changed)
+        mode_form.addRow("Active System:", self.combo_cm_mode)
+        mode_layout.addLayout(mode_form)
+
+        lbl_mode_info = QLabel(
+            "Choose between generic standard mathematical colorspaces (linear, sRGB, rec709, Cineon, etc.) "
+            "or a custom studio OpenColorIO v2 configuration."
+        )
+        lbl_mode_info.setStyleSheet("color: #888888; font-size: 11px;")
+        lbl_mode_info.setWordWrap(True)
+        mode_layout.addWidget(lbl_mode_info)
+        layout.addWidget(grp_mode)
+
+        # 2. Standard Colorspaces Configuration
+        self.grp_std_cm = QGroupBox("Standard Colorspace Configuration (Viewing & Internal Working Space)")
+        std_layout = QVBoxLayout(self.grp_std_cm)
+        std_form = QFormLayout()
+        std_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self.combo_std_default_view = QComboBox()
+        self.combo_std_default_input = QComboBox()
+
+        for cs in STANDARD_COLORSPACES:
+            item_text = f"{cs.name} - {cs.description}"
+            self.combo_std_default_view.addItem(item_text, cs.name)
+            self.combo_std_default_input.addItem(item_text, cs.name)
+
+        self.chk_auto_detect_input = QCheckBox("Auto-choose input colorspace based on media metadata")
+        self.chk_auto_detect_input.setToolTip(
+            "When enabled, OpenReview inspects container metadata, camera tags (RED, Panavision, Viper), "
+            "and file formats (EXR scene-linear, DPX log) to set the input colorspace automatically on media open."
+        )
+        self.chk_auto_detect_input.setChecked(True)
+
+        std_form.addRow("Default Viewing Transform:", self.combo_std_default_view)
+        std_form.addRow("Default Input Colorspace:", self.combo_std_default_input)
+        std_form.addRow("", self.chk_auto_detect_input)
+        std_layout.addLayout(std_form)
+
+        lbl_cs_guide = QLabel(
+            "<b>Available Standard Colorspaces:</b><br>"
+            "• <b>linear</b>: The internal working space for compositing operations.<br>"
+            "• <b>sRGB</b>: The standard for 8-bit web and monitor displays.<br>"
+            "• <b>rec709</b>: The standard for HDTV and broadcast video.<br>"
+            "• <b>Cineon</b>: The standard for film scan data (logarithmic).<br>"
+            "• <b>Gamma 1.8 & 2.2</b>: Standard gamma curves for different display standards.<br>"
+            "• <b>Panalog</b>: A logarithmic curve used in older video systems.<br>"
+            "• <b>REDLog</b>: The color encoding for RED digital cinema cameras.<br>"
+            "• <b>ViperLog</b>: The color encoding for Pace/Viper cameras.<br>"
+            "• <b>REDSpace</b>: A linear colorspace specific to RED cameras.<br>"
+            "• <b>Raw</b>: Direct pass-through without color transformation."
+        )
+        lbl_cs_guide.setStyleSheet("color: #a0a0a0; font-size: 11px; background-color: #161616; padding: 10px; border-radius: 4px; border: 1px solid #2a2a2a;")
+        lbl_cs_guide.setWordWrap(True)
+        std_layout.addWidget(lbl_cs_guide)
+        layout.addWidget(self.grp_std_cm)
+
+        # 3. OpenColorIO Studio Configuration
+        self.grp_ocio_cm = QGroupBox("OpenColorIO Studio Configuration")
+        ocio_layout = QVBoxLayout(self.grp_ocio_cm)
+        self.ocio_config_widget = OCIOConfigWidget(self.ocio_manager, self.grp_ocio_cm)
+        ocio_layout.addWidget(self.ocio_config_widget)
+        layout.addWidget(self.grp_ocio_cm)
+
+        layout.addStretch()
+        return tab
+
+    def _on_cm_mode_changed(self) -> None:
+        mode = self.combo_cm_mode.currentData() or "standard"
+        is_standard = (mode == "standard")
+        self.grp_std_cm.setVisible(is_standard)
+        self.grp_ocio_cm.setVisible(not is_standard)
+
+    def _create_tab_export_delivery(self) -> QWidget:
+        tab_export = QWidget()
+        export_layout = QVBoxLayout(tab_export)
+        export_layout.setContentsMargins(12, 12, 12, 12)
+        export_layout.setSpacing(12)
+
+        # 1. Image & Sequence Export Defaults
+        grp_defaults = QGroupBox("General Image & Sequence Export Defaults")
+        defaults_form = QFormLayout(grp_defaults)
+        defaults_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self.combo_default_export_fmt = QComboBox()
+        self.combo_default_export_fmt.addItem("JPEG Image / Sequence (.jpg) [Compact & Fast]", "jpg")
+        self.combo_default_export_fmt.addItem("PNG Image / Sequence (.png) [Lossless / Quantized]", "png")
+        defaults_form.addRow("Default Export Format:", self.combo_default_export_fmt)
+
+        self.chk_downscale_greater_than_fhd = QCheckBox("Downscale resolution by half (50%) when media exceeds Full HD (1920x1080)")
+        self.chk_downscale_greater_than_fhd.setToolTip(
+            "When enabled, exports of media larger than 1920x1080 (such as 2K, 4K UHD, 8K) "
+            "will be downscaled to 50% width and height to optimize delivery file sizes."
+        )
+        defaults_form.addRow("", self.chk_downscale_greater_than_fhd)
+
+        export_layout.addWidget(grp_defaults)
+
+        # 2. JPEG Compression & Quality Settings
+        grp_jpeg = QGroupBox("JPEG Quality & Compression")
+        jpeg_form = QFormLayout(grp_jpeg)
+        jpeg_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        row_jpg_q = QHBoxLayout()
+        self.slider_jpg_quality = QSlider(Qt.Orientation.Horizontal)
+        self.slider_jpg_quality.setRange(1, 100)
+        self.slider_jpg_quality.setValue(85)
+        self.slider_jpg_quality.setTickInterval(10)
+        self.slider_jpg_quality.setTickPosition(QSlider.TickPosition.TicksBelow)
+
+        self.spin_jpg_quality = QSpinBox()
+        self.spin_jpg_quality.setRange(1, 100)
+        self.spin_jpg_quality.setValue(85)
+        self.spin_jpg_quality.setSuffix(" %")
+
+        self.slider_jpg_quality.valueChanged.connect(self.spin_jpg_quality.setValue)
+        self.spin_jpg_quality.valueChanged.connect(self.slider_jpg_quality.setValue)
+
+        row_jpg_q.addWidget(self.slider_jpg_quality, 1)
+        row_jpg_q.addWidget(self.spin_jpg_quality)
+        jpeg_form.addRow("JPEG Quality (1-100):", row_jpg_q)
+
+        lbl_jpg_hint = QLabel("Higher values preserve visual fidelity; lower values reduce file size. 85 is recommended.")
+        lbl_jpg_hint.setStyleSheet("color: #888888; font-size: 11px;")
+        jpeg_form.addRow("", lbl_jpg_hint)
+
+        export_layout.addWidget(grp_jpeg)
+
+        # 3. PNG Compression & Quantization Settings
+        grp_png = QGroupBox("PNG Compression & Quantization")
+        png_form = QFormLayout(grp_png)
+        png_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self.combo_default_png_mode = QComboBox()
+        self.combo_default_png_mode.addItem("PNG-8 Indexed (Quantized 256 Colors - ~70% smaller)", "png8")
+        self.combo_default_png_mode.addItem("PNG-24 Truecolor Optimized (Strictly Lossless)", "png24_opt")
+        self.combo_default_png_mode.addItem("16-bit Unsigned Int (Deep Color)", "16")
+        png_form.addRow("Default PNG Mode:", self.combo_default_png_mode)
+
+        self.chk_default_png_dither = QCheckBox("Enable Color Dithering for Gradients (Floyd-Steinberg)")
+        png_form.addRow("", self.chk_default_png_dither)
+
+        self.combo_default_png_comp = QComboBox()
+        self.combo_default_png_comp.addItem("Balanced (Level 4 - Recommended)", 4)
+        self.combo_default_png_comp.addItem("Maximum Compression (Level 9)", 9)
+        self.combo_default_png_comp.addItem("Standard (Level 6)", 6)
+        self.combo_default_png_comp.addItem("Fast / Draft (Level 1)", 1)
+        png_form.addRow("Default PNG Compression:", self.combo_default_png_comp)
+
+        export_layout.addWidget(grp_png)
+
+        # 4. PDF Review Sheets Branding & Information
+        grp_brand = QGroupBox("PDF Review Sheets - Branding & Header Information")
         brand_form = QFormLayout(grp_brand)
         brand_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
@@ -785,10 +962,10 @@ class PreferencesDialog(QDialog):
         color_row.addStretch()
         brand_form.addRow("Header Accent Color:", color_row)
 
-        pdf_layout.addWidget(grp_brand)
+        export_layout.addWidget(grp_brand)
 
-        # 2. Header Subtitle Elements
-        grp_sub = QGroupBox("Header Subtitle Elements")
+        # 5. PDF Header Subtitle Elements
+        grp_sub = QGroupBox("PDF Review Sheets - Header Subtitle Elements")
         sub_layout = QVBoxLayout(grp_sub)
         sub_layout.setSpacing(6)
 
@@ -804,10 +981,10 @@ class PreferencesDialog(QDialog):
         self.chk_pdf_show_keyframe_count.setChecked(True)
         sub_layout.addWidget(self.chk_pdf_show_keyframe_count)
 
-        pdf_layout.addWidget(grp_sub)
+        export_layout.addWidget(grp_sub)
 
-        # 3. Page Layout & Presentation
-        grp_page = QGroupBox("Page Format & Layout")
+        # 6. PDF Page Layout & Presentation
+        grp_page = QGroupBox("PDF Review Sheets - Page Format & Layout")
         page_form = QFormLayout(grp_page)
         page_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
@@ -827,10 +1004,10 @@ class PreferencesDialog(QDialog):
         self.combo_pdf_layout_mode.addItem("Dense Grid (Storyboards: 2 Columns with Notes Below)", "dense_grid")
         page_form.addRow("Card Layout Mode:", self.combo_pdf_layout_mode)
 
-        pdf_layout.addWidget(grp_page)
+        export_layout.addWidget(grp_page)
 
-        # 4. Card Content Elements
-        grp_card = QGroupBox("Review Card Content Elements")
+        # 7. PDF Card Content Elements
+        grp_card = QGroupBox("PDF Review Sheets - Review Card Content Elements")
         card_layout = QVBoxLayout(grp_card)
         card_layout.setSpacing(6)
 
@@ -854,10 +1031,14 @@ class PreferencesDialog(QDialog):
         self.chk_pdf_show_notes.setChecked(True)
         card_layout.addWidget(self.chk_pdf_show_notes)
 
-        pdf_layout.addWidget(grp_card)
-        pdf_layout.addStretch()
+        export_layout.addWidget(grp_card)
+        export_layout.addStretch()
 
-        return tab_pdf
+        return tab_export
+
+    def _create_tab_pdf_export(self) -> QWidget:
+        """Backwards compatibility alias for _create_tab_export_delivery."""
+        return self._create_tab_export_delivery()
 
     def _on_browse_pdf_logo(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
@@ -961,6 +1142,23 @@ class PreferencesDialog(QDialog):
         self.spin_prefetch_threads.setValue(getattr(p, "prefetch_worker_threads", 4))
         self.chk_laptop_mode.setChecked(getattr(p, "fast_playback_laptop_mode", False))
 
+        # Export Defaults
+        idx_fmt = self.combo_default_export_fmt.findData(getattr(p, "default_export_image_format", "jpg"))
+        if idx_fmt >= 0:
+            self.combo_default_export_fmt.setCurrentIndex(idx_fmt)
+        self.chk_downscale_greater_than_fhd.setChecked(getattr(p, "export_downscale_greater_than_fhd", True))
+        jpg_q = getattr(p, "export_jpg_quality", 85)
+        self.spin_jpg_quality.setValue(jpg_q)
+        self.slider_jpg_quality.setValue(jpg_q)
+
+        idx_png = self.combo_default_png_mode.findData(getattr(p, "export_png_mode", "png8"))
+        if idx_png >= 0:
+            self.combo_default_png_mode.setCurrentIndex(idx_png)
+        self.chk_default_png_dither.setChecked(getattr(p, "export_png_dither", True))
+        idx_comp = self.combo_default_png_comp.findData(getattr(p, "export_png_compression", 4))
+        if idx_comp >= 0:
+            self.combo_default_png_comp.setCurrentIndex(idx_comp)
+
         # GPU Acceleration settings
         self._populate_gpu_devices()
         idx_engine = self.combo_playback_engine.findData(getattr(p, "playback_engine", "opengl_core"))
@@ -979,9 +1177,32 @@ class PreferencesDialog(QDialog):
         self.spin_gpu_vram.setValue(int(getattr(p, "gpu_vram_limit_mb", 2048.0)))
         self._update_gpu_telemetry()
 
+        # Color Management
+        cm_mode = getattr(p, "color_management_mode", "standard")
+        idx_cm = self.combo_cm_mode.findData(cm_mode)
+        if idx_cm >= 0:
+            self.combo_cm_mode.setCurrentIndex(idx_cm)
+        self._on_cm_mode_changed()
+
+        std_view = getattr(p, "standard_view_transform", "sRGB")
+        idx_std_v = self.combo_std_default_view.findData(std_view)
+        if idx_std_v >= 0:
+            self.combo_std_default_view.setCurrentIndex(idx_std_v)
+
+        std_in = getattr(p, "standard_input_space", "linear")
+        idx_std_i = self.combo_std_default_input.findData(std_in)
+        if idx_std_i >= 0:
+            self.combo_std_default_input.setCurrentIndex(idx_std_i)
+
+        self.chk_auto_detect_input.setChecked(getattr(p, "auto_detect_input_colorspace", True))
+
         idx = self.combo_cache_mode.findData(p.default_cache_mode)
         if idx >= 0:
             self.combo_cache_mode.setCurrentIndex(idx)
+
+        idx_toggle = self.combo_cache_toggle.findData(getattr(p, "cache_toggle_mode", "region"))
+        if idx_toggle >= 0:
+            self.combo_cache_toggle.setCurrentIndex(idx_toggle)
 
         auto_ram = getattr(p, "auto_ram_budget", True)
         self.chk_auto_ram_budget.setChecked(auto_ram)
@@ -1081,6 +1302,7 @@ class PreferencesDialog(QDialog):
         p.canvas_scrub_enabled = self.chk_canvas_scrub.isChecked()
         p.auto_retime_mismatched_fps = self.chk_auto_retime.isChecked()
         p.default_cache_mode = self.combo_cache_mode.currentData()
+        p.cache_toggle_mode = self.combo_cache_toggle.currentData()
         p.auto_ram_budget = self.chk_auto_ram_budget.isChecked()
         p.lookahead_cache_gb = self.spin_lookahead_gb.value()
         p.region_cache_gb = self.spin_region_gb.value()
@@ -1100,6 +1322,14 @@ class PreferencesDialog(QDialog):
         p.gpu_vram_limit_mb = float(self.spin_gpu_vram.value())
         p.hud_opacity = self.slider_hud_opacity.value() / 100.0
 
+        # Export Defaults
+        p.default_export_image_format = self.combo_default_export_fmt.currentData() or "jpg"
+        p.export_downscale_greater_than_fhd = self.chk_downscale_greater_than_fhd.isChecked()
+        p.export_jpg_quality = self.spin_jpg_quality.value()
+        p.export_png_mode = self.combo_default_png_mode.currentData() or "png8"
+        p.export_png_dither = self.chk_default_png_dither.isChecked()
+        p.export_png_compression = int(self.combo_default_png_comp.currentData() or 4)
+
         # PDF Review Sheet Settings
         p.pdf_title = self.edit_pdf_title.text().strip() or "OpenReview - VFX Review Sheet"
         p.pdf_studio_name = self.edit_pdf_studio.text().strip()
@@ -1118,6 +1348,10 @@ class PreferencesDialog(QDialog):
         p.pdf_show_stroke_count = self.chk_pdf_show_stroke_count.isChecked()
         p.pdf_show_notes = self.chk_pdf_show_notes.isChecked()
 
+        p.color_management_mode = self.combo_cm_mode.currentData() or "standard"
+        p.standard_view_transform = self.combo_std_default_view.currentData() or "sRGB"
+        p.standard_input_space = self.combo_std_default_input.currentData() or "linear"
+        p.auto_detect_input_colorspace = self.chk_auto_detect_input.isChecked()
         p.shortcuts = dict(self._working_shortcuts)
         return p
 

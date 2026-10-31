@@ -36,6 +36,7 @@ from openreview.widgets.draggable_scroll_area import BlenderScrollArea
 
 from openreview.core.clock import PlaybackClock
 from openreview.core.exporter import MediaExporter
+from openreview.core.preferences import PreferencesManager
 
 
 class ExportWorker(QThread):
@@ -103,7 +104,13 @@ class ExportWorker(QThread):
                             img = MediaExporter.render_strokes_on_image(img, strokes)
 
                 # 3. Downrez / Resizing
-                if target_w and target_h and (img.shape[1] != target_w or img.shape[0] != target_h):
+                downscale_gt_fhd = self.config.get("downscale_gt_fhd", False)
+                is_custom_res = self.config.get("is_custom_res", False)
+                if not is_custom_res and downscale_gt_fhd and (img.shape[1] > 1920 or img.shape[0] > 1080):
+                    half_w = max(1, img.shape[1] // 2)
+                    half_h = max(1, img.shape[0] // 2)
+                    img = MediaExporter.resize_frame(img, half_w, half_h)
+                elif target_w and target_h and (img.shape[1] != target_w or img.shape[0] != target_h):
                     img = MediaExporter.resize_frame(img, target_w, target_h)
 
                 return img
@@ -118,10 +125,13 @@ class ExportWorker(QThread):
                 self.progress.emit(0, 1, "Rendering single frame...")
                 target_f = frames[0]
                 img = _frame_provider(target_f)
-                comp = self.config.get("compression", "zip")
-                bd = self.config.get("bit_depth", "16")
-                q = self.config.get("quality", 95)
-                MediaExporter.save_image_file(img, dest, compression=comp, bit_depth=bd, quality=q)
+                ext = self.config.get("ext", Path(dest).suffix.lstrip(".").lower() or "jpg")
+                comp = self.config.get("compression", "4" if ext == "png" else "zip")
+                bd = self.config.get("bit_depth", "8" if ext == "png" else "16")
+                q = int(self.config.get("quality", 85))
+                dither = bool(self.config.get("dither", True))
+                png_mode = self.config.get("png_mode", "png8")
+                MediaExporter.save_image_file(img, dest, compression=comp, bit_depth=bd, quality=q, dither=dither, png_mode=png_mode)
                 self.progress.emit(1, 1, "Completed.")
                 self.finished.emit(str(dest))
 
@@ -147,8 +157,8 @@ class ExportWorker(QThread):
                 prefix = self.config.get("prefix", "frame")
                 ext = self.config.get("ext", "exr")
                 pad = int(self.config.get("pad", 4))
-                comp = self.config.get("compression", "zip")
-                bd = self.config.get("bit_depth", "16")
+                comp = self.config.get("compression", "4" if ext == "png" else "zip")
+                bd = self.config.get("bit_depth", "8" if ext == "png" else "16")
                 q = self.config.get("quality", 95)
                 MediaExporter.export_sequence(
                     _frame_provider,
@@ -162,6 +172,8 @@ class ExportWorker(QThread):
                     quality=q,
                     progress_callback=_progress_cb,
                     cancel_token=self.is_cancelled,
+                    dither=bool(self.config.get("dither", True)),
+                    png_mode=self.config.get("png_mode", "png8"),
                 )
                 if not self._is_cancelled:
                     self.finished.emit(str(dest))
@@ -368,9 +380,44 @@ class ExportDialog(QDialog):
         page_png = QWidget()
         form_png = QFormLayout(page_png)
         form_png.setContentsMargins(0, 4, 0, 0)
-        self.combo_png_depth = QComboBox()
-        self.combo_png_depth.addItems(["8-bit Unsigned Int", "16-bit Unsigned Int"])
-        form_png.addRow("Bit Depth:", self.combo_png_depth)
+
+        prefs = PreferencesManager.instance().prefs
+        pref_png_mode = getattr(prefs, "export_png_mode", "png8")
+        pref_png_dither = getattr(prefs, "export_png_dither", True)
+        pref_png_comp = getattr(prefs, "export_png_compression", 4)
+        pref_jpg_quality = getattr(prefs, "export_jpg_quality", 85)
+        pref_default_fmt = getattr(prefs, "default_export_image_format", "jpg").lower()
+
+        self.combo_png_mode = QComboBox()
+        self.combo_png_mode.addItem("PNG-8 Indexed (Quantized 256 Colors - ~70% smaller)", "png8")
+        self.combo_png_mode.addItem("PNG-24 Truecolor Optimized (Strictly Lossless)", "png24_opt")
+        self.combo_png_mode.addItem("16-bit Unsigned Int (Deep Color)", "16")
+        idx_mode = self.combo_png_mode.findData(pref_png_mode)
+        if idx_mode >= 0:
+            self.combo_png_mode.setCurrentIndex(idx_mode)
+        form_png.addRow("Format Mode:", self.combo_png_mode)
+
+        self.chk_png_dither = QCheckBox("Enable Color Dithering for Gradients")
+        self.chk_png_dither.setChecked(pref_png_dither)
+        self.chk_png_dither.setToolTip("Apply Floyd-Steinberg dithering for smooth color transitions in PNG-8. Uncheck for maximum flat compression.")
+        form_png.addRow("", self.chk_png_dither)
+
+        self.combo_png_comp = QComboBox()
+        self.combo_png_comp.addItem("Balanced (Level 4 - Recommended)", "4")
+        self.combo_png_comp.addItem("Maximum Compression (Level 9)", "9")
+        self.combo_png_comp.addItem("Standard (Level 6)", "6")
+        self.combo_png_comp.addItem("Fast / Draft (Level 1)", "1")
+        idx_comp = self.combo_png_comp.findData(str(pref_png_comp))
+        if idx_comp >= 0:
+            self.combo_png_comp.setCurrentIndex(idx_comp)
+        form_png.addRow("Compression:", self.combo_png_comp)
+
+        def _on_png_mode_changed(idx: int):
+            is_png8 = (self.combo_png_mode.currentData() == "png8")
+            self.chk_png_dither.setEnabled(is_png8)
+        self.combo_png_mode.currentIndexChanged.connect(_on_png_mode_changed)
+        _on_png_mode_changed(self.combo_png_mode.currentIndex())
+
         self.stack_settings.addWidget(page_png)
 
         # Page 6: JPEG
@@ -379,7 +426,7 @@ class ExportDialog(QDialog):
         form_jpg.setContentsMargins(0, 4, 0, 0)
         self.spin_jpg_quality = QSpinBox()
         self.spin_jpg_quality.setRange(1, 100)
-        self.spin_jpg_quality.setValue(95)
+        self.spin_jpg_quality.setValue(pref_jpg_quality)
         form_jpg.addRow("JPEG Quality (1-100):", self.spin_jpg_quality)
         self.stack_settings.addWidget(page_jpg)
 
@@ -395,12 +442,34 @@ class ExportDialog(QDialog):
         form_single = QFormLayout(page_single)
         form_single.setContentsMargins(0, 4, 0, 0)
         self.combo_single_fmt = QComboBox()
+        self.combo_single_fmt.addItem("JPEG Image (.jpg)", "jpg")
         self.combo_single_fmt.addItem("PNG Image (.png)", "png")
         self.combo_single_fmt.addItem("OpenEXR Image (.exr)", "exr")
         self.combo_single_fmt.addItem("DPX Image (.dpx)", "dpx")
         self.combo_single_fmt.addItem("TIFF Image (.tif)", "tif")
-        self.combo_single_fmt.addItem("JPEG Image (.jpg)", "jpg")
         form_single.addRow("Format:", self.combo_single_fmt)
+
+        self.spin_single_jpg_quality = QSpinBox()
+        self.spin_single_jpg_quality.setRange(1, 100)
+        self.spin_single_jpg_quality.setValue(pref_jpg_quality)
+        self.lbl_single_jpg_q = QLabel("JPEG Quality (1-100):")
+        form_single.addRow(self.lbl_single_jpg_q, self.spin_single_jpg_quality)
+
+        self.spin_single_jpg_quality.valueChanged.connect(self.spin_jpg_quality.setValue)
+        self.spin_jpg_quality.valueChanged.connect(self.spin_single_jpg_quality.setValue)
+
+        def _on_single_fmt_changed(_=None):
+            is_jpg = (self.combo_single_fmt.currentData() == "jpg")
+            self.lbl_single_jpg_q.setVisible(is_jpg)
+            self.spin_single_jpg_quality.setVisible(is_jpg)
+
+        self.combo_single_fmt.currentIndexChanged.connect(_on_single_fmt_changed)
+
+        idx_single = self.combo_single_fmt.findData(pref_default_fmt)
+        if idx_single >= 0:
+            self.combo_single_fmt.setCurrentIndex(idx_single)
+        _on_single_fmt_changed()
+
         self.stack_settings.addWidget(page_single)
 
         layout_fmt.addWidget(self.stack_settings)
@@ -477,6 +546,15 @@ class ExportDialog(QDialog):
         self.chk_aspect.setEnabled(False)
         row_dims.addWidget(self.chk_aspect)
         layout_res.addLayout(row_dims)
+
+        self.chk_downscale_gt_fhd = QCheckBox("Downscale resolution by half (50%) when media exceeds Full HD (1920x1080)")
+        self.chk_downscale_gt_fhd.setToolTip(
+            "Automatically reduces width and height by 50% when source media is larger than 1920x1080 to minimize export file sizes."
+        )
+        pref_downscale = getattr(prefs, "export_downscale_greater_than_fhd", True)
+        self.chk_downscale_gt_fhd.setChecked(pref_downscale)
+        self.chk_downscale_gt_fhd.toggled.connect(self._update_res_summary)
+        layout_res.addWidget(self.chk_downscale_gt_fhd)
 
         self.lbl_res_summary = QLabel(f"Input: {self.in_w} x {self.in_h}  →  Output: {self.in_w} x {self.in_h} (100%)")
         self.lbl_res_summary.setStyleSheet("color: #27ae60; font-weight: bold; padding: 2px;")
@@ -574,8 +652,14 @@ class ExportDialog(QDialog):
 
         main_layout.addLayout(btn_row)
 
-        self._on_format_changed(0)
+        if pref_default_fmt == "jpg":
+            idx_seq = self.combo_format.findData("seq_jpg")
+            if idx_seq >= 0:
+                self.combo_format.setCurrentIndex(idx_seq)
+
+        self._on_format_changed(self.combo_format.currentIndex())
         self._on_colorspace_changed(0)
+        self._update_res_summary()
 
     # --------------------------------------------------------------------------
     # Handlers & Dynamic Updates
@@ -587,10 +671,11 @@ class ExportDialog(QDialog):
         is_single = (fmt == "single")
 
         # Toggle prefix and padding visibility for sequence vs file
-        for i in range(self.row_seq_name.count()):
-            w = self.row_seq_name.itemAt(i).widget()
-            if w:
-                w.setVisible(is_seq)
+        if hasattr(self, "row_seq_name"):
+            for i in range(self.row_seq_name.count()):
+                w = self.row_seq_name.itemAt(i).widget()
+                if w:
+                    w.setVisible(is_seq)
 
         if is_single:
             self.combo_range.setCurrentIndex(2)  # Current frame
@@ -691,8 +776,21 @@ class ExportDialog(QDialog):
     def _update_res_summary(self) -> None:
         out_w = self.spin_width.value()
         out_h = self.spin_height.value()
-        pct = int(round((out_w / max(1, self.in_w)) * 100))
-        self.lbl_res_summary.setText(f"Input: {self.in_w} x {self.in_h}  →  Output: {out_w} x {out_h} ({pct}%)")
+        is_custom_preset = self.combo_res_preset.currentData() not in ("100",)
+        will_downscale = (
+            not is_custom_preset
+            and hasattr(self, "chk_downscale_gt_fhd")
+            and self.chk_downscale_gt_fhd.isChecked()
+            and (self.in_w > 1920 or self.in_h > 1080)
+        )
+        if will_downscale:
+            disp_w = max(1, self.in_w // 2)
+            disp_h = max(1, self.in_h // 2)
+            pct = int(round((disp_w / max(1, self.in_w)) * 100))
+            self.lbl_res_summary.setText(f"Input: {self.in_w} x {self.in_h}  →  Output: {disp_w} x {disp_h} ({pct}% Downscale > Full HD)")
+        else:
+            pct = int(round((out_w / max(1, self.in_w)) * 100))
+            self.lbl_res_summary.setText(f"Input: {self.in_w} x {self.in_h}  →  Output: {out_w} x {out_h} ({pct}%)")
 
     def _on_range_changed(self, index: int) -> None:
         is_custom = self.combo_range.currentData() == "custom"
@@ -761,6 +859,8 @@ class ExportDialog(QDialog):
             "target_width": target_w,
             "target_height": target_h,
             "fps": self.clock.fps,
+            "downscale_gt_fhd": self.chk_downscale_gt_fhd.isChecked() if hasattr(self, "chk_downscale_gt_fhd") else False,
+            "is_custom_res": self.combo_res_preset.currentData() not in ("100",),
         }
 
         if fmt == "mov":
@@ -773,7 +873,17 @@ class ExportDialog(QDialog):
             config["crf"] = self.spin_mp4_crf.value()
         elif fmt == "single":
             config["export_type"] = "single"
-            config["ext"] = self.combo_single_fmt.currentData()
+            ext = self.combo_single_fmt.currentData()
+            config["ext"] = ext
+            if ext == "png":
+                png_mode = getattr(self, "combo_png_mode", None)
+                p_mode = png_mode.currentData() if png_mode else "png8"
+                config["png_mode"] = p_mode
+                config["bit_depth"] = "16" if p_mode == "16" else ("png8" if p_mode == "png8" else "8")
+                config["compression"] = self.combo_png_comp.currentData() if hasattr(self, "combo_png_comp") else "4"
+                config["dither"] = self.chk_png_dither.isChecked() if hasattr(self, "chk_png_dither") else True
+            elif ext == "jpg":
+                config["quality"] = self.spin_single_jpg_quality.value() if hasattr(self, "spin_single_jpg_quality") else self.spin_jpg_quality.value()
         elif str(fmt).startswith("seq_"):
             config["export_type"] = "sequence"
             ext_map = {
@@ -806,7 +916,11 @@ class ExportDialog(QDialog):
             elif fmt == "seq_tif":
                 config["bit_depth"] = "16" if "16" in self.combo_tif_depth.currentText() else "8"
             elif fmt == "seq_png":
-                config["bit_depth"] = "16" if "16" in self.combo_png_depth.currentText() else "8"
+                png_mode = self.combo_png_mode.currentData() or "png8"
+                config["png_mode"] = png_mode
+                config["bit_depth"] = "16" if png_mode == "16" else ("png8" if png_mode == "png8" else "8")
+                config["compression"] = self.combo_png_comp.currentData() or "4"
+                config["dither"] = self.chk_png_dither.isChecked()
             elif fmt == "seq_jpg":
                 config["quality"] = self.spin_jpg_quality.value()
 

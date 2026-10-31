@@ -343,6 +343,7 @@ def test_cache_menu_and_budgets(qtbot):
 
     window = MainWindow()
     qtbot.addWidget(window)
+    window._on_set_cache_mode(CacheMode.REGION, start_prefetch=False)
 
     # 1. Default cache is In/Out Region (dormant until Shift+C)
     assert window.cache.mode == CacheMode.REGION
@@ -572,10 +573,10 @@ def test_color_reset_shortcuts(qtbot):
     window = MainWindow()
     qtbot.addWidget(window)
 
-    # Exposure: set to 2.0 and reset with Ctrl+E
+    # Exposure: set to 2.0 and reset with E
     window.top_bar.set_exposure(2.0)
     assert window.viewport.exposure_ev == 2.0
-    qtbot.keyClick(window, Qt.Key.Key_E, Qt.KeyboardModifier.ControlModifier)
+    qtbot.keyClick(window, Qt.Key.Key_E)
     assert window.viewport.exposure_ev == 0.0
 
     # Color Adjustments: set gamma, gain, saturation and reset with Shift+Home

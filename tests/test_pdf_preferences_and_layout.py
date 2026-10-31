@@ -75,10 +75,10 @@ def test_preferences_dialog_pdf_tab_ui(qtbot):
     dialog = PreferencesDialog(pref_mgr)
     qtbot.addWidget(dialog)
 
-    # Verify tab exists and is the 4th tab
+    # Verify tab exists and is the 4th tab ("Export & Delivery" consolidated tab)
     tab_titles = [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())]
-    assert "PDF Review Sheets" in tab_titles
-    assert tab_titles[3] == "PDF Review Sheets"
+    assert "Export & Delivery" in tab_titles
+    assert tab_titles[3] == "Export & Delivery"
 
     # Verify values loaded into controls
     assert dialog.edit_pdf_title.text() == "Review Session A"

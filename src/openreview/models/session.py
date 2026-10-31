@@ -59,6 +59,7 @@ class OpenReviewSession:
     color: ColorSessionState = field(default_factory=ColorSessionState)
     matte: MatteSessionState = field(default_factory=MatteSessionState)
     annotations: Dict[str, Any] = field(default_factory=dict)
+    per_media_annotations: Dict[str, Any] = field(default_factory=dict)
     session_graph: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -106,6 +107,7 @@ class OpenReviewSession:
                 opacity=float(mat_data.get("opacity", 1.0)),
             ),
             annotations=data.get("annotations", {}),
+            per_media_annotations=data.get("per_media_annotations", {}),
             session_graph=data.get("session_graph", {}),
         )
 

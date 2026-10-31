@@ -11,6 +11,12 @@ from typing import List, Optional, Tuple, Dict, Any
 import numpy as np
 
 from PySide6.QtCore import QObject, Signal
+from openreview.color.standard_colorspaces import (
+    apply_standard_to_linear,
+    apply_linear_to_standard,
+    COLORSPACE_BY_NAME,
+    COLORSPACE_BY_ID,
+)
 
 try:
     import PyOpenColorIO as ocio
@@ -44,6 +50,9 @@ class OCIOManager(QObject):
         self._gamma: float = 1.0
         self._custom_search_paths: List[str] = []
         self._context_vars: Dict[str, str] = {}
+        self._color_management_mode: str = "standard"
+        self._standard_input_id: int = 0   # linear
+        self._standard_view_id: int = 1    # sRGB
 
         # Parsed text cache (works even without PyOpenColorIO binary)
         self._parsed_info: Dict[str, Any] = {
@@ -396,6 +405,33 @@ class OCIOManager(QObject):
     # Active Selections
     # --------------------------------------------------------------------------
     @property
+    def color_management_mode(self) -> str:
+        return self._color_management_mode
+
+    @color_management_mode.setter
+    def color_management_mode(self, mode: str) -> None:
+        self._color_management_mode = str(mode)
+        self.context_changed.emit()
+
+    @property
+    def standard_input_id(self) -> int:
+        return self._standard_input_id
+
+    @standard_input_id.setter
+    def standard_input_id(self, val: int) -> None:
+        self._standard_input_id = int(val)
+        self.context_changed.emit()
+
+    @property
+    def standard_view_id(self) -> int:
+        return self._standard_view_id
+
+    @standard_view_id.setter
+    def standard_view_id(self, val: int) -> None:
+        self._standard_view_id = int(val)
+        self.context_changed.emit()
+
+    @property
     def input_space(self) -> str:
         return self._current_input_space
 
@@ -444,11 +480,17 @@ class OCIOManager(QObject):
     def process_rgb(self, r: float, g: float, b: float) -> Tuple[float, float, float]:
         """Convert single RGB float pixel from input colorspace to display view + exposure/gamma."""
         gain = 2.0 ** self._exposure_ev
-        r_lin = r * gain
-        g_lin = g * gain
-        b_lin = b * gain
 
-        if self.has_ocio and self._config:
+        if self._color_management_mode == "standard":
+            pixel = np.array([r, g, b], dtype=np.float32)
+            lin = apply_standard_to_linear(pixel, self._standard_input_id)
+            lin = lin * gain
+            disp = apply_linear_to_standard(lin, self._standard_view_id)
+            r_out, g_out, b_out = float(disp[0]), float(disp[1]), float(disp[2])
+        elif self.has_ocio and self._config:
+            r_lin = r * gain
+            g_lin = g * gain
+            b_lin = b * gain
             try:
                 transform = ocio.DisplayViewTransform(
                     src=self._current_input_space,

@@ -45,7 +45,13 @@ from openreview.core.cache import (
     compute_dynamic_ram_budget_mb,
     get_dynamic_gb_presets,
 )
-from openreview.core.reader import SyntheticPatternReader, ReaderEngine
+from openreview.core.reader import (
+    SyntheticPatternReader,
+    ReaderEngine,
+    read_adaptive_frame,
+    get_adaptive_downsample_factor,
+    ensure_c_contiguous_rgba,
+)
 from openreview.core.async_source_loader import AsyncSourceLoader
 from openreview.core.video_reader import is_video_file, VideoMediaReader
 from openreview.core.preferences import PreferencesManager, UserPreferences
@@ -63,9 +69,16 @@ from openreview.models.session import (
 from openreview.core.exporter import MediaExporter
 from openreview.ui.export_dialog import ExportDialog
 from openreview.color.ocio_manager import OCIOManager
+from openreview.color.standard_colorspaces import (
+    STANDARD_COLORSPACES,
+    COLORSPACE_BY_NAME,
+    COLORSPACE_BY_ID,
+    detect_media_input_colorspace,
+    map_standard_to_ocio_space,
+)
 from openreview.color.lut_manager import CubeLut, AscCdl, ColorGradeSettings
 from openreview.ui.color_dialog import ColorAdjustmentsDialog, ColorAdjustmentsWidget
-from openreview.models.annotations import AnnotationStore, Stroke, ShapeType
+from openreview.models.annotations import AnnotationStore, PerMediaAnnotations, Stroke, ShapeType
 from openreview.models.comparison import ComparisonState, ComparisonMode
 from openreview.widgets.top_bar import TopControlBar
 from openreview.widgets.markup_tools import MarkupToolPalette
@@ -73,12 +86,15 @@ from openreview.widgets.viewport import ViewportCanvas
 from openreview.widgets.timeline import TimelineWidget
 from openreview.widgets.floating_hud import FloatingHUDCard
 from openreview.widgets.hud_histogram import HistogramHUD
+from openreview.widgets.hud_waveform import WaveformHUD
+from openreview.widgets.hud_vectorscope import VectorscopeHUD
 from openreview.widgets.hud_wipe import WipeComparisonHUD
 from openreview.widgets.hud_color_inspector import ColorInspectorHUD
 from openreview.packages.builtin.comp_qc.qc_state import QcMode
 from openreview.ui.image_info_dialog import ImageInfoDialog, ImageInfoWidget
 from openreview.ui.process_info_dialog import ProcessInfoDialog
 from openreview.ui.goto_frame_dialog import GoToFrameDialog
+from openreview.ui.frame_rate_dialog import FrameRateDialog
 from openreview.ui.annotation_manager_dialog import AnnotationManagerDialog, AnnotationManagerWidget
 from openreview.audio.audio_engine import AudioEngine
 from openreview.ui.audio_dialog import AudioSettingsDialog, AudioSettingsWidget
@@ -159,7 +175,7 @@ class MainWindow(QMainWindow):
         self.clock = PlaybackClock(start_frame=1001, end_frame=1200, fps=prefs.default_fps, parent=self)
         self.clock.set_play_all_frames(getattr(prefs, "play_all_frames", True))
         initial_cache_mode = CacheMode(getattr(prefs, "default_cache_mode", "off"))
-        self._last_active_cache_mode = CacheMode.PLAY_AHEAD
+        self._last_active_cache_mode = CacheMode.REGION
         self._active_view_is_sequence: bool = False
         self._pre_sequence_cache_mode: Optional[CacheMode] = None
         self._pre_sequence_cache_started: Optional[bool] = None
@@ -189,6 +205,7 @@ class MainWindow(QMainWindow):
         )
         self.ocio_manager = OCIOManager()
         self.annotation_store = AnnotationStore(self)
+        self.per_media_annotations = PerMediaAnnotations(self)
         self.comparison_state = ComparisonState()
         self.audio_engine = AudioEngine(self)
         self.sync_engine = DailiesSyncEngine(self)
@@ -230,6 +247,8 @@ class MainWindow(QMainWindow):
 
         self._async_drop_active = False
         self._cache_started = False
+        self._is_scrubbing: bool = False
+        self._last_prefetch_trigger_frame: int = -9999
 
         # 2. Build UI Hierarchy
         self._shortcuts: list[QShortcut] = []
@@ -242,6 +261,7 @@ class MainWindow(QMainWindow):
 
         # Apply Startup Preferences
         init_cache_mode = CacheMode(getattr(prefs, "default_cache_mode", "off"))
+        self._last_pref_default_cache_mode = init_cache_mode.value
         self._on_set_cache_mode(init_cache_mode, start_prefetch=False)
         if prefs.start_fullscreen:
             self._enter_borderless_fullscreen()
@@ -254,18 +274,25 @@ class MainWindow(QMainWindow):
             if hasattr(self, "act_matte_constrain"):
                 self.act_matte_constrain.setChecked(prefs.safe_guides_matte_constrained)
 
-        # Restore OCIO configuration & custom search paths
-        if getattr(prefs, "ocio_config_path", "") and Path(prefs.ocio_config_path).exists():
-            self.ocio_manager.load_config(prefs.ocio_config_path)
-        if getattr(prefs, "ocio_lut_paths", []):
-            for sp in prefs.ocio_lut_paths:
-                self.ocio_manager.add_search_path(sp)
-        if getattr(prefs, "ocio_display", ""):
-            self.ocio_manager.display = prefs.ocio_display
-        if getattr(prefs, "ocio_view", ""):
-            self.ocio_manager.view = prefs.ocio_view
-        if getattr(prefs, "ocio_input_space", ""):
-            self.ocio_manager.input_space = prefs.ocio_input_space
+        # Restore Color Management (Standard Colorspaces vs OCIO)
+        cm_mode = getattr(prefs, "color_management_mode", "standard")
+        std_view = getattr(prefs, "standard_view_transform", "sRGB")
+        std_input = getattr(prefs, "standard_input_space", "linear")
+        self.top_bar.set_color_management_mode(cm_mode, std_view, std_input)
+
+        if cm_mode == "ocio":
+            if getattr(prefs, "ocio_config_path", "") and Path(prefs.ocio_config_path).exists():
+                self.ocio_manager.load_config(prefs.ocio_config_path)
+            if getattr(prefs, "ocio_lut_paths", []):
+                for sp in prefs.ocio_lut_paths:
+                    self.ocio_manager.add_search_path(sp)
+            if getattr(prefs, "ocio_display", ""):
+                self.ocio_manager.display = prefs.ocio_display
+            if getattr(prefs, "ocio_view", ""):
+                self.ocio_manager.view = prefs.ocio_view
+            if getattr(prefs, "ocio_input_space", ""):
+                self.ocio_manager.input_space = prefs.ocio_input_space
+        self._update_color_menus()
 
         # Restore Dailies Sync room and username
         if getattr(prefs, "sync_room_name", ""):
@@ -340,6 +367,7 @@ class MainWindow(QMainWindow):
         self.sources_dock.panel.exr_metadata_requested.connect(self._on_show_exr_metadata_path)
         self.session_graph.active_view_changed.connect(self._on_active_view_changed)
         self.session_graph.source_properties_changed.connect(self._on_source_renamed_update_title)
+        self.session_graph.source_properties_changed.connect(self._on_source_properties_changed)
         self.session_graph.view_properties_changed.connect(lambda vt, vid: self._on_source_renamed_update_title())
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.sources_dock)
         self.sources_dock.show()
@@ -404,6 +432,7 @@ class MainWindow(QMainWindow):
             self.timeline_dock,
             canvas_widget=self.viewport,
         )
+        self.timeline.fps_dialog_requested.connect(self._on_choose_frame_rate)
         self.timeline_dock.setWidget(self.timeline)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.timeline_dock)
         self.timeline_dock.show()
@@ -425,6 +454,24 @@ class MainWindow(QMainWindow):
             content_widget=self.hist_widget,
             parent=self.viewport,
             initial_pos=QPoint(16, 16),
+        )
+
+        # A2. Waveform Monitor HUD
+        self.waveform_widget = WaveformHUD()
+        self.hud_waveform = FloatingHUDCard(
+            title="Waveform Monitor",
+            content_widget=self.waveform_widget,
+            parent=self.viewport,
+            initial_pos=QPoint(16, 175),
+        )
+
+        # A3. Vectorscope Monitor HUD
+        self.vectorscope_widget = VectorscopeHUD()
+        self.hud_vectorscope = FloatingHUDCard(
+            title="Vectorscope Monitor",
+            content_widget=self.vectorscope_widget,
+            parent=self.viewport,
+            initial_pos=QPoint(16, 420),
         )
 
         # B. A/B Wipe Comparison Controller HUD (Top-Right)
@@ -534,6 +581,8 @@ class MainWindow(QMainWindow):
 
         # HUD cards hidden by default on startup
         self.hud_hist.hide()
+        self.hud_waveform.hide()
+        self.hud_vectorscope.hide()
         self.hud_wipe.hide()
         self.hud_inspector.hide()
         self.hud_color_adj.hide()
@@ -741,7 +790,7 @@ class MainWindow(QMainWindow):
         scale_sub.addAction("2:1 Double Size (Ctrl+2)").triggered.connect(lambda: self.viewport.set_scale_preset(2.0))
         scale_sub.addAction("4:1 (Ctrl+4)").triggered.connect(lambda: self.viewport.set_scale_preset(4.0))
         scale_sub.addAction("8:1 (Ctrl+8)").triggered.connect(lambda: self.viewport.set_scale_preset(8.0))
-        scale_sub.addAction("Fit Width (Alt+F)").triggered.connect(self.viewport.fit_width)
+        scale_sub.addAction("Fit Width (Ctrl+F)").triggered.connect(self.viewport.fit_width)
 
         img_menu.addSeparator()
         self.flop_act = img_menu.addAction("Flop Horizontal (Shift+X)")
@@ -776,6 +825,13 @@ class MainWindow(QMainWindow):
         filter_toggle_act = filter_sub.addAction("Toggle Filtering (Linear/Nearest) (N)")
         filter_toggle_act.triggered.connect(self._on_toggle_texture_filtering)
 
+        img_menu.addSeparator()
+        self.premult_act = img_menu.addAction("Premultiplied Alpha")
+        self.premult_act.setCheckable(True)
+        self.premult_act.setChecked(True)
+        self.premult_act.setToolTip("Toggle Premultiplied alpha composite (GL_ONE) vs Straight alpha (GL_SRC_ALPHA).")
+        self.premult_act.triggered.connect(self._on_toggle_premultiplied_alpha)
+
         # Layered Input Menu (Dynamically visible for multi-layer EXR and Stereo)
         self.layered_input_menu = mb.addMenu("&Layered input")
         self.act_exr_pass_inspector = self.layered_input_menu.addAction("EXR Multilayer Pass Inspector")
@@ -792,7 +848,7 @@ class MainWindow(QMainWindow):
         actual_act = view_menu.addAction("Actual Size 100% (1)")
         actual_act.triggered.connect(self.viewport.set_zoom_100)
 
-        fit_w_act = view_menu.addAction("Fit Width (Alt+F)")
+        fit_w_act = view_menu.addAction("Fit Width (Ctrl+F)")
         fit_w_act.triggered.connect(self.viewport.fit_width)
 
         view_menu.addSeparator()
@@ -830,15 +886,7 @@ class MainWindow(QMainWindow):
             bg_sub.addAction(label).triggered.connect(lambda checked=False, bg=b: self.viewport.set_background_mode(bg))
 
         view_menu.addSeparator()
-        disp_sub = view_menu.addMenu("Display Transform")
-        for label, idx in [
-            ("sRGB (Standard)", 0),
-            ("Rec.709", 3),
-            ("File Gamma 2.2", 4),
-            ("ACES Filmic Tone Map", 1),
-            ("No Correction (Raw)", 2),
-        ]:
-            disp_sub.addAction(label).triggered.connect(lambda checked=False, i=idx: self._on_set_view_transform(i))
+        self.disp_sub = view_menu.addMenu("Display Transform")
 
         self.oor_act = view_menu.addAction("Show Out-of-Range Colors")
         self.oor_act.setCheckable(True)
@@ -940,6 +988,9 @@ class MainWindow(QMainWindow):
         play_mode_sub.addAction("Play Forward (Space / L)").triggered.connect(self.clock.play_forward)
         play_mode_sub.addAction("Play Backward (J / Shift+Space)").triggered.connect(self.clock.play_backward)
         play_mode_sub.addSeparator()
+        set_fps_act = play_mode_sub.addAction("Set Frame Rate... (Shift+F)")
+        set_fps_act.triggered.connect(self._on_choose_frame_rate)
+        play_mode_sub.addSeparator()
         self.play_all_frames_act = play_mode_sub.addAction("Play Every Frame (Frame-Accurate Realtime)")
         self.play_all_frames_act.setCheckable(True)
         self.play_all_frames_act.setChecked(self.clock.play_all_frames)
@@ -956,7 +1007,13 @@ class MainWindow(QMainWindow):
         self.wipes_act.triggered.connect(self._on_toggle_wipe)
 
         self.hist_act = review_menu.addAction("Live RGB Histogram (H)")
-        self.hist_act.triggered.connect(lambda: self.hud_hist.setVisible(not self.hud_hist.isVisible()))
+        self.hist_act.triggered.connect(self._toggle_hud_hist)
+
+        self.waveform_act = review_menu.addAction("Waveform Monitor (V)")
+        self.waveform_act.triggered.connect(self._toggle_hud_waveform)
+
+        self.vectorscope_act = review_menu.addAction("Vectorscope Monitor (Shift+V)")
+        self.vectorscope_act.triggered.connect(self._toggle_hud_vectorscope)
 
         self.wipe_flip_act = review_menu.addAction("Flip Wipe Orientation (Shift+W)")
         self.wipe_flip_act.triggered.connect(self._on_flip_wipe_orientation)
@@ -1042,7 +1099,7 @@ class MainWindow(QMainWindow):
         prev_annot_act.triggered.connect(self._on_prev_keyframe)
 
         annot_menu.addSeparator()
-        export_annot_act = annot_menu.addAction("Export Annotations...")
+        export_annot_act = annot_menu.addAction("Export Annotations... (Ctrl+E)")
         export_annot_act.triggered.connect(self._on_export_annotations)
 
         import_annot_act = annot_menu.addAction("Import Annotations...")
@@ -1052,17 +1109,7 @@ class MainWindow(QMainWindow):
         color_menu = mb.addMenu("&Color")
 
         # Input colorspace conversions
-        input_sub = color_menu.addMenu("Input Colorspace")
-        for label, idx in [
-            ("No Conversion (Raw/Linear)", 2),
-            ("Cineon / DPX Log", 3),
-            ("ALEXA LogC", 4),
-            ("ALEXA LogC Film", 5),
-            ("sRGB", 0),
-            ("Rec.709", 6),
-            ("File Gamma 2.2", 7),
-        ]:
-            input_sub.addAction(label).triggered.connect(lambda checked=False, i=idx: self._on_set_input_space(i))
+        self.input_sub = color_menu.addMenu("Input Colorspace")
 
         # LUT / CDL sub-menu
         lut_sub = color_menu.addMenu("LUT / CDL")
@@ -1283,8 +1330,7 @@ class MainWindow(QMainWindow):
         help_menu.addSeparator()
         upd_act = help_menu.addAction("Check for Updates...")
         upd_act.triggered.connect(self._on_open_package_manager_updates)
-        pkg_help_act = help_menu.addAction("Package & Plugin Manager...")
-        pkg_help_act.triggered.connect(self._on_open_package_manager)
+
         help_menu.addSeparator()
         about_act = help_menu.addAction("About OpenReview")
         about_act.triggered.connect(self._show_about)
@@ -1355,6 +1401,7 @@ class MainWindow(QMainWindow):
         sm.bind_callback("playback.shuttle_rev", self.clock.shuttle_reverse)
         sm.bind_callback("playback.shuttle_stop", self.clock.shuttle_stop)
         sm.bind_callback("playback.shuttle_fwd", self.clock.shuttle_forward)
+        sm.bind_callback("playback.set_fps", self._on_choose_frame_rate)
 
         # Channels
         sm.bind_callback("channel.rgb", lambda: self.top_bar.toggle_channel_mode(0))
@@ -1422,7 +1469,9 @@ class MainWindow(QMainWindow):
         sm.bind_callback("stack.cycle_bwd", self._on_stack_cycle_backward)
 
         # HUDs & Panels
-        sm.bind_callback("hud.histogram", lambda: self.hud_hist.setVisible(not self.hud_hist.isVisible()))
+        sm.bind_callback("hud.histogram", self._toggle_hud_hist)
+        sm.bind_callback("hud.waveform", self._toggle_hud_waveform)
+        sm.bind_callback("hud.vectorscope", self._toggle_hud_vectorscope)
         sm.bind_callback("hud.color_inspector", self._on_toggle_color_inspector)
         sm.bind_callback("hud.wipe", self._on_toggle_wipe)
         sm.bind_callback("hud.wipe_flip_orientation", self._on_flip_wipe_orientation)
@@ -1445,6 +1494,7 @@ class MainWindow(QMainWindow):
         sm.bind_callback("annot.prev_keyframe", self._on_prev_keyframe)
         sm.bind_callback("annot.toggle_palette", self._on_toggle_annotation_tools)
         sm.bind_callback("annot.manager", self._on_open_annotation_manager)
+        sm.bind_callback("annot.export", self._on_export_annotations)
 
         # Sources & Session Manager
         sm.bind_callback("playlist.toggle", self._on_toggle_playlist)
@@ -1612,7 +1662,7 @@ class MainWindow(QMainWindow):
         self.top_bar.channel_changed.connect(self._on_channel_changed)
         self.top_bar.layer_changed.connect(self._on_layer_changed)
         self.top_bar.stereo_changed.connect(self._on_stereo_changed)
-        self.top_bar.color_transforms_changed.connect(self.viewport.set_color_transforms)
+        self.top_bar.color_transforms_changed.connect(self._on_top_bar_color_transforms_changed)
         self.top_bar.zoom_fit_requested.connect(self.viewport.fit_image)
         self.top_bar.zoom_100_requested.connect(self.viewport.set_zoom_100)
 
@@ -1672,6 +1722,8 @@ class MainWindow(QMainWindow):
         # Audio Engine Clock & Scrubbing Sync
         self.clock.frame_changed.connect(self._on_audio_clock_sync)
         self.timeline.seek_requested.connect(self._on_timeline_seek)
+        if hasattr(self.timeline, "seek_finished"):
+            self.timeline.seek_finished.connect(self._on_scrub_settled)
         self.timeline.focus_viewport_requested.connect(self.viewport.setFocus)
         self.clock.range_changed.connect(lambda s, e: self.audio_engine.set_sequence_context(s, self.clock.fps))
         self.clock.fps_changed.connect(lambda fps: self.audio_engine.set_sequence_context(self.clock.start_frame, fps))
@@ -1709,6 +1761,85 @@ class MainWindow(QMainWindow):
             return data.astype(np.float16, copy=False)
         return data
 
+    def _update_pinned_frame(self, source_id: Optional[str], frame: int) -> None:
+        """Protect currently displayed frame in cache from eviction while streaming to viewport."""
+        last_pinned = getattr(self, "_last_pinned_key", None)
+        new_key = (source_id, frame)
+        if last_pinned != new_key:
+            if last_pinned and hasattr(self.cache, "unpin_frame"):
+                self.cache.unpin_frame(last_pinned[0], last_pinned[1])
+            if hasattr(self.cache, "pin_frame"):
+                self.cache.pin_frame(source_id, frame)
+            self._last_pinned_key = new_key
+
+    def _on_immediate_frame_ready(
+        self,
+        timeline_frame: int,
+        source_frame: int,
+        source_id: str,
+        success: bool,
+        data: Optional[np.ndarray],
+        is_proxy: bool = False,
+    ) -> None:
+        """Handle completion of an immediate high-priority asynchronous decode."""
+        if not success or data is None:
+            return
+        if self.clock.current_frame != timeline_frame:
+            return
+
+        orig_w = getattr(self.viewport, "_img_width", 0)
+        orig_h = getattr(self.viewport, "_img_height", 0)
+        logical_size = (orig_w, orig_h) if is_proxy and orig_w > 0 else None
+
+        # Store in cache if full-res upgrade and caching not OFF
+        if hasattr(self, "cache") and self.cache and self.cache.mode != CacheMode.OFF and not is_proxy:
+            if source_id:
+                self.cache.put_source_frame(source_id, source_frame, data, is_proxy=False)
+            else:
+                self.cache.put_frame(timeline_frame, data, is_proxy=False)
+
+        viewable = self.session_graph.get_active_viewable() if hasattr(self, "session_graph") else None
+        if isinstance(viewable, SequenceView):
+            source, src_frame = viewable.resolve_frame(timeline_frame, self.session_graph.sources)
+            if source and (source.id == source_id or not source_id):
+                self._update_pinned_frame(source.id, source_frame)
+                self.viewport.set_primary_frame(timeline_frame, data, logical_size=logical_size, is_proxy=is_proxy)
+                if hasattr(data, "shape") and len(data.shape) >= 2:
+                    if is_proxy:
+                        pw = orig_w if orig_w > 0 else data.shape[1]
+                        ph = orig_h if orig_h > 0 else data.shape[0]
+                        self._update_resolution_status(f"{pw}x{ph} (Proxy)")
+                    else:
+                        self._update_resolution_status(f"{data.shape[1]}x{data.shape[0]}")
+                self._update_hud_scopes(data)
+        elif isinstance(viewable, StackView):
+            layer_a = viewable.get_layer_a(self.session_graph.sources)
+            layer_b = viewable.get_layer_b(self.session_graph.sources)
+            if layer_a and (layer_a.id == source_id or not source_id):
+                self._update_pinned_frame(layer_a.id, source_frame)
+                self.viewport.set_primary_frame(timeline_frame, data, logical_size=logical_size, is_proxy=is_proxy)
+                if hasattr(data, "shape") and len(data.shape) >= 2:
+                    if is_proxy:
+                        pw = orig_w if orig_w > 0 else data.shape[1]
+                        ph = orig_h if orig_h > 0 else data.shape[0]
+                        self._update_resolution_status(f"{pw}x{ph} (Proxy)")
+                    else:
+                        self._update_resolution_status(f"{data.shape[1]}x{data.shape[0]}")
+                self._update_hud_scopes(data)
+            elif layer_b and layer_b.id == source_id:
+                self.viewport.set_reference_frame(data)
+        else:
+            self._update_pinned_frame(source_id or None, timeline_frame)
+            self.viewport.set_primary_frame(timeline_frame, data, logical_size=logical_size, is_proxy=is_proxy)
+            if hasattr(data, "shape") and len(data.shape) >= 2:
+                if is_proxy:
+                    pw = orig_w if orig_w > 0 else data.shape[1]
+                    ph = orig_h if orig_h > 0 else data.shape[0]
+                    self._update_resolution_status(f"{pw}x{ph} (Proxy)")
+                else:
+                    self._update_resolution_status(f"{data.shape[1]}x{data.shape[0]}")
+            self._update_hud_scopes(data)
+
     def _on_frame_changed(self, frame: int) -> None:
         self.cache.update_playhead(frame)
         self.viewport.update_info_strip_data(current_frame=frame)
@@ -1717,47 +1848,115 @@ class MainWindow(QMainWindow):
             self.pkg_mgr.dispatch_hook("on_frame_changed", frame)
 
         viewable = self.session_graph.get_active_viewable() if hasattr(self, "session_graph") else None
-
-        # Allow on-demand synchronous decode so playing through uncached areas displays real frames
         sync_read_allowed = not getattr(self, "_async_drop_active", False)
 
         if isinstance(viewable, SequenceView):
             source, src_frame = viewable.resolve_frame(frame, self.session_graph.sources)
             data = None
+            is_proxy = False
             if source:
                 self.cache.set_active_source(source.id)
                 data = self.cache.get_source_frame(source.id, src_frame)
-                if data is None and sync_read_allowed:
+                is_proxy = self.cache.is_source_frame_proxy(source.id, src_frame) if data is not None else False
+                if data is None:
                     reader = self._get_reader_for_source(source)
-                    data = self._normalize_frame_data(reader.read_frame(src_frame)) if reader else None
-                    if self.cache.mode != CacheMode.OFF and data is not None:
-                        self.cache.put_source_frame(source.id, src_frame, data)
+                    if reader:
+                        if self._is_scrubbing or self.clock.is_playing:
+                            data = read_adaptive_frame(reader, src_frame, normalize_fn=self._normalize_frame_data)
+                            if data is not None:
+                                is_proxy = True
+                                if self.cache.mode != CacheMode.OFF:
+                                    self.cache.put_source_frame(source.id, src_frame, data, is_proxy=True)
+                            elif hasattr(self, "reader_engine") and self.reader_engine:
+                                self.reader_engine.request_immediate_frame(
+                                    source.id, src_frame, frame, reader=reader, downsample=True, callback=self._on_immediate_frame_ready
+                                )
+                        elif not self.clock.is_playing and sync_read_allowed:
+                            data = self._normalize_frame_data(reader.read_frame(src_frame))
+                            if self.cache.mode != CacheMode.OFF and data is not None:
+                                self.cache.put_source_frame(source.id, src_frame, data, is_proxy=False)
+                        elif hasattr(self, "reader_engine") and self.reader_engine:
+                            self.reader_engine.request_immediate_frame(
+                                source.id, src_frame, frame, reader=reader, downsample=False, callback=self._on_immediate_frame_ready
+                            )
             self.viewport.comparison_state.channels_a = (True, True, True, True)
             self.viewport.set_reference_frame(None)
-            self.viewport.set_primary_frame(frame, data)
-            if data is not None and hasattr(data, "shape") and len(data.shape) >= 2:
-                self._update_resolution_status(f"{data.shape[1]}x{data.shape[0]}")
-            if self.hud_hist.isVisible() and data is not None:
-                self.hist_widget.update_frame(data)
+            if data is not None:
+                self._update_pinned_frame(source.id if source else None, src_frame if source else frame)
+                orig_w = getattr(self.viewport, "_img_width", 0)
+                orig_h = getattr(self.viewport, "_img_height", 0)
+                if orig_w == 0 or orig_h == 0:
+                    orig_w = getattr(reader, "width", 0) if "reader" in locals() and reader else 0
+                    orig_h = getattr(reader, "height", 0) if "reader" in locals() and reader else 0
+                logical_size = (orig_w, orig_h) if is_proxy and orig_w > 0 else None
+                self.viewport.set_primary_frame(frame, data, logical_size=logical_size, is_proxy=is_proxy)
+                if hasattr(data, "shape") and len(data.shape) >= 2:
+                    if is_proxy:
+                        pw = orig_w if orig_w > 0 else data.shape[1]
+                        ph = orig_h if orig_h > 0 else data.shape[0]
+                        self._update_resolution_status(f"{pw}x{ph} (Proxy)")
+                    else:
+                        self._update_resolution_status(f"{data.shape[1]}x{data.shape[0]}")
+                self._update_hud_scopes(data)
+            elif source is None:
+                self.viewport.set_primary_frame(frame, None)
 
         elif isinstance(viewable, StackView):
+            disp_is_proxy = False
             is_switch_layer_b = (viewable.compare_mode == "switch" and viewable.current_layer_index == viewable.index_b)
             if is_switch_layer_b:
                 # Solo Layer B display (toggled with Z) - strictly guaranteed full RGBA
                 layer_b = viewable.get_layer_b(self.session_graph.sources)
                 data_b = None
+                is_proxy_b = False
                 if layer_b:
                     self.cache.set_active_source(layer_b.id)
                     data_b = self.cache.get_source_frame(layer_b.id, frame)
-                    if data_b is None and sync_read_allowed:
+                    is_proxy_b = self.cache.is_source_frame_proxy(layer_b.id, frame) if data_b is not None else False
+                    if data_b is None:
                         reader_b = self._get_reader_for_source(layer_b)
-                        data_b = self._normalize_frame_data(reader_b.read_frame(frame)) if reader_b else None
-                        if self.cache.mode != CacheMode.OFF and data_b is not None:
-                            self.cache.put_source_frame(layer_b.id, frame, data_b)
+                        if reader_b:
+                            if self._is_scrubbing or self.clock.is_playing:
+                                data_b = read_adaptive_frame(reader_b, frame, normalize_fn=self._normalize_frame_data)
+                                if data_b is not None:
+                                    is_proxy_b = True
+                                    if self.cache.mode != CacheMode.OFF:
+                                        self.cache.put_source_frame(layer_b.id, frame, data_b, is_proxy=True)
+                                elif hasattr(self, "reader_engine") and self.reader_engine:
+                                    self.reader_engine.request_immediate_frame(
+                                        layer_b.id, frame, frame, reader=reader_b, downsample=True, callback=self._on_immediate_frame_ready
+                                    )
+                            elif not self.clock.is_playing and sync_read_allowed:
+                                data_b = self._normalize_frame_data(reader_b.read_frame(frame))
+                                if self.cache.mode != CacheMode.OFF and data_b is not None:
+                                    self.cache.put_source_frame(layer_b.id, frame, data_b, is_proxy=False)
+                            elif hasattr(self, "reader_engine") and self.reader_engine:
+                                self.reader_engine.request_immediate_frame(
+                                    layer_b.id, frame, frame, reader=reader_b, downsample=False, callback=self._on_immediate_frame_ready
+                                )
+                disp_is_proxy = is_proxy_b
                 self.viewport.comparison_state.mode = ComparisonMode.OFF
                 self.viewport.comparison_state.channels_a = (True, True, True, True)
                 self.viewport.set_reference_frame(None)
-                self.viewport.set_primary_frame(frame, data_b)
+                if data_b is not None:
+                    self._update_pinned_frame(layer_b.id if layer_b else None, frame)
+                    orig_w = getattr(self.viewport, "_img_width", 0)
+                    orig_h = getattr(self.viewport, "_img_height", 0)
+                    if orig_w == 0 or orig_h == 0:
+                        orig_w = getattr(reader_b, "width", 0) if "reader_b" in locals() and reader_b else 0
+                        orig_h = getattr(reader_b, "height", 0) if "reader_b" in locals() and reader_b else 0
+                    logical_size = (orig_w, orig_h) if is_proxy_b and orig_w > 0 else None
+                    self.viewport.set_primary_frame(frame, data_b, logical_size=logical_size, is_proxy=is_proxy_b)
+                    if hasattr(data_b, "shape") and len(data_b.shape) >= 2:
+                        if is_proxy_b:
+                            pw = orig_w if orig_w > 0 else data_b.shape[1]
+                            ph = orig_h if orig_h > 0 else data_b.shape[0]
+                            self._update_resolution_status(f"{pw}x{ph} (Proxy)")
+                        else:
+                            self._update_resolution_status(f"{data_b.shape[1]}x{data_b.shape[0]}")
+                    self._update_hud_scopes(data_b)
+                elif layer_b is None:
+                    self.viewport.set_primary_frame(frame, None)
                 disp_data = data_b
             else:
                 # Normal comparison or Layer A mixed over Layer B (in "switch" or "over")
@@ -1765,21 +1964,52 @@ class MainWindow(QMainWindow):
                 layer_b = viewable.get_layer_b(self.session_graph.sources)
                 data_a = None
                 data_b = None
+                is_proxy_a = False
                 if layer_a:
                     self.cache.set_active_source(layer_a.id)
                     data_a = self.cache.get_source_frame(layer_a.id, frame)
-                    if data_a is None and sync_read_allowed:
+                    is_proxy_a = self.cache.is_source_frame_proxy(layer_a.id, frame) if data_a is not None else False
+                    if data_a is None:
                         reader_a = self._get_reader_for_source(layer_a)
-                        data_a = self._normalize_frame_data(reader_a.read_frame(frame)) if reader_a else None
-                        if self.cache.mode != CacheMode.OFF and data_a is not None:
-                            self.cache.put_source_frame(layer_a.id, frame, data_a)
+                        if reader_a:
+                            if self._is_scrubbing or self.clock.is_playing:
+                                data_a = read_adaptive_frame(reader_a, frame, normalize_fn=self._normalize_frame_data)
+                                if data_a is not None:
+                                    is_proxy_a = True
+                                    if self.cache.mode != CacheMode.OFF:
+                                        self.cache.put_source_frame(layer_a.id, frame, data_a, is_proxy=True)
+                                elif hasattr(self, "reader_engine") and self.reader_engine:
+                                    self.reader_engine.request_immediate_frame(
+                                        layer_a.id, frame, frame, reader=reader_a, downsample=True, callback=self._on_immediate_frame_ready
+                                    )
+                            elif not self.clock.is_playing and sync_read_allowed:
+                                data_a = self._normalize_frame_data(reader_a.read_frame(frame))
+                                if self.cache.mode != CacheMode.OFF and data_a is not None:
+                                    self.cache.put_source_frame(layer_a.id, frame, data_a, is_proxy=False)
+                            elif hasattr(self, "reader_engine") and self.reader_engine:
+                                self.reader_engine.request_immediate_frame(
+                                    layer_a.id, frame, frame, reader=reader_a, downsample=False, callback=self._on_immediate_frame_ready
+                                )
+                disp_is_proxy = is_proxy_a
                 if layer_b:
                     data_b = self.cache.get_source_frame(layer_b.id, frame)
-                    if data_b is None and sync_read_allowed:
+                    if data_b is None:
                         reader_b = self._get_reader_for_source(layer_b)
-                        data_b = self._normalize_frame_data(reader_b.read_frame(frame)) if reader_b else None
-                        if self.cache.mode != CacheMode.OFF and data_b is not None:
-                            self.cache.put_source_frame(layer_b.id, frame, data_b)
+                        if reader_b:
+                            if self._is_scrubbing or self.clock.is_playing:
+                                data_b = read_adaptive_frame(reader_b, frame, normalize_fn=self._normalize_frame_data)
+                                if data_b is not None and self.cache.mode != CacheMode.OFF:
+                                    self.cache.put_source_frame(layer_b.id, frame, data_b, is_proxy=True)
+                        reader_b = self._get_reader_for_source(layer_b)
+                        if reader_b:
+                            if not self.clock.is_playing and sync_read_allowed:
+                                data_b = self._normalize_frame_data(reader_b.read_frame(frame))
+                                if self.cache.mode != CacheMode.OFF and data_b is not None:
+                                    self.cache.put_source_frame(layer_b.id, frame, data_b)
+                            elif hasattr(self, "reader_engine") and self.reader_engine:
+                                self.reader_engine.request_immediate_frame(
+                                    layer_b.id, frame, frame, reader=reader_b, callback=self._on_immediate_frame_ready
+                                )
 
                 mode_map = {
                     "wipe": ComparisonMode.WIPE,
@@ -1797,14 +2027,30 @@ class MainWindow(QMainWindow):
                 self.viewport.comparison_state.mode = comp_mode
                 self.viewport.comparison_state.stack_mix = getattr(viewable, "stack_mix", 1.0)
                 self.viewport.comparison_state.channels_a = getattr(viewable, "channels_a", (True, True, True, True))
-                self.viewport.set_primary_frame(frame, data_a)
-                self.viewport.set_reference_frame(data_b)
+                if data_a is not None:
+                    self._update_pinned_frame(layer_a.id if layer_a else None, frame)
+                    orig_w = getattr(self.viewport, "_img_width", 0)
+                    orig_h = getattr(self.viewport, "_img_height", 0)
+                    logical_size = (orig_w, orig_h) if is_proxy_a and orig_w > 0 else None
+                    self.viewport.set_primary_frame(frame, data_a, logical_size=logical_size, is_proxy=is_proxy_a)
+                elif layer_a is None:
+                    self.viewport.set_primary_frame(frame, None)
+
+                if data_b is not None:
+                    self.viewport.set_reference_frame(data_b)
+                elif layer_b is None:
+                    self.viewport.set_reference_frame(None)
                 disp_data = data_a
 
             if disp_data is not None and hasattr(disp_data, "shape") and len(disp_data.shape) >= 2:
-                self._update_resolution_status(f"{disp_data.shape[1]}x{disp_data.shape[0]}")
-            if self.hud_hist.isVisible() and disp_data is not None:
-                self.hist_widget.update_frame(disp_data)
+                if disp_is_proxy:
+                    orig_w = getattr(self.viewport, "_img_width", disp_data.shape[1])
+                    orig_h = getattr(self.viewport, "_img_height", disp_data.shape[0])
+                    self._update_resolution_status(f"{orig_w}x{orig_h} (Proxy)")
+                else:
+                    self._update_resolution_status(f"{disp_data.shape[1]}x{disp_data.shape[0]}")
+            if disp_data is not None:
+                self._update_hud_scopes(disp_data)
 
         elif isinstance(viewable, LayoutView):
             def _fetch(src: SourceItem) -> Optional[np.ndarray]:
@@ -1812,9 +2058,10 @@ class MainWindow(QMainWindow):
                 d = self.cache.get_source_frame(src.id, sf)
                 if d is None:
                     r = self._get_reader_for_source(src)
-                    d = self._normalize_frame_data(r.read_frame(sf)) if r else None
-                    if self.cache.mode != CacheMode.OFF and d is not None:
-                        self.cache.put_source_frame(src.id, sf, d)
+                    if r and hasattr(self, "reader_engine") and self.reader_engine:
+                        self.reader_engine.request_immediate_frame(
+                            src.id, sf, frame, reader=r, callback=self._on_immediate_frame_ready
+                        )
                 return d
 
             comp_data = composite_layout_grid(
@@ -1824,40 +2071,94 @@ class MainWindow(QMainWindow):
             )
 
             self.viewport.set_reference_frame(None)
-            self.viewport.set_primary_frame(frame, comp_data)
-            if comp_data is not None and hasattr(comp_data, "shape") and len(comp_data.shape) >= 2:
-                self._update_resolution_status(f"{comp_data.shape[1]}x{comp_data.shape[0]} ({viewable.scale_pct}%)")
-            if self.hud_hist.isVisible() and comp_data is not None:
-                self.hist_widget.update_frame(comp_data)
+            if comp_data is not None:
+                self.viewport.set_primary_frame(frame, comp_data)
+                if hasattr(comp_data, "shape") and len(comp_data.shape) >= 2:
+                    self._update_resolution_status(f"{comp_data.shape[1]}x{comp_data.shape[0]} ({viewable.scale_pct}%)")
+                self._update_hud_scopes(comp_data)
 
         elif getattr(self, "_is_exr_contact_sheet_active", False) and self._is_current_media_exr(viewable, frame):
             comp_data, tile_map = self._composite_current_exr_contact_sheet(viewable, frame)
             self._exr_contact_sheet_tile_map = tile_map
             self.viewport.set_contact_sheet_mode(True, tile_map)
             self.viewport.set_reference_frame(None)
-            self.viewport.set_primary_frame(frame, comp_data)
-            if comp_data is not None and hasattr(comp_data, "shape") and len(comp_data.shape) >= 2:
-                self._update_resolution_status(f"{comp_data.shape[1]}x{comp_data.shape[0]} (Contact Sheet)")
-            if self.hud_hist.isVisible() and comp_data is not None:
-                self.hist_widget.update_frame(comp_data)
+            if comp_data is not None:
+                self.viewport.set_primary_frame(frame, comp_data)
+                if hasattr(comp_data, "shape") and len(comp_data.shape) >= 2:
+                    self._update_resolution_status(f"{comp_data.shape[1]}x{comp_data.shape[0]} (Contact Sheet)")
+                self._update_hud_scopes(comp_data)
 
         else:
             self.viewport.set_contact_sheet_mode(False, None)
             # Standard single source or fallback
             cur_src_id = viewable.id if (viewable and hasattr(viewable, "id")) else None
             self.cache.set_active_source(cur_src_id)
+            data = None
+            is_proxy = False
             if cur_src_id:
                 data = self.cache.get_source_frame(cur_src_id, frame)
-                if data is None and sync_read_allowed and self.reader is not None:
-                    data = self._normalize_frame_data(self.reader.read_frame(frame))
-                    if self.cache.mode != CacheMode.OFF and data is not None:
-                        self.cache.put_source_frame(cur_src_id, frame, data)
+                is_proxy = self.cache.is_source_frame_proxy(cur_src_id, frame) if data is not None else False
+                if data is None and self.reader is not None:
+                    if self._is_scrubbing or self.clock.is_playing:
+                        data = read_adaptive_frame(self.reader, frame, normalize_fn=self._normalize_frame_data)
+                        if data is not None:
+                            is_proxy = True
+                            if self.cache.mode != CacheMode.OFF:
+                                self.cache.put_source_frame(cur_src_id, frame, data, is_proxy=True)
+                        elif hasattr(self, "reader_engine") and self.reader_engine:
+                            self.reader_engine.request_immediate_frame(
+                                cur_src_id, frame, frame, reader=self.reader, downsample=True, callback=self._on_immediate_frame_ready
+                            )
+                    elif (not self.clock.is_playing or self.viewport._image_a is None) and sync_read_allowed:
+                        data = self._normalize_frame_data(self.reader.read_frame(frame))
+                        if self.cache.mode != CacheMode.OFF and data is not None:
+                            self.cache.put_source_frame(cur_src_id, frame, data, is_proxy=False)
+                    elif hasattr(self, "reader_engine") and self.reader_engine:
+                        self.reader_engine.request_immediate_frame(
+                            cur_src_id, frame, frame, reader=self.reader, downsample=False, callback=self._on_immediate_frame_ready
+                        )
             else:
                 data = self.cache.get_frame(frame)
-                if data is None and sync_read_allowed and self.reader is not None:
-                    data = self._normalize_frame_data(self.reader.read_frame(frame))
-                    if self.cache.mode != CacheMode.OFF and data is not None:
-                        self.cache.put_frame(frame, data)
+                is_proxy = self.cache.is_frame_proxy(frame) if data is not None else False
+                if data is None and self.reader is not None:
+                    if self._is_scrubbing or self.clock.is_playing:
+                        data = read_adaptive_frame(self.reader, frame, normalize_fn=self._normalize_frame_data)
+                        if data is not None:
+                            is_proxy = True
+                            if self.cache.mode != CacheMode.OFF:
+                                self.cache.put_frame(frame, data, is_proxy=True)
+                        elif hasattr(self, "reader_engine") and self.reader_engine:
+                            self.reader_engine.request_immediate_frame(
+                                "", frame, frame, reader=self.reader, downsample=True, callback=self._on_immediate_frame_ready
+                            )
+                    elif (not self.clock.is_playing or self.viewport._image_a is None) and sync_read_allowed:
+                        data = self._normalize_frame_data(self.reader.read_frame(frame))
+                        if self.cache.mode != CacheMode.OFF and data is not None:
+                            self.cache.put_frame(frame, data, is_proxy=False)
+                    elif hasattr(self, "reader_engine") and self.reader_engine:
+                        self.reader_engine.request_immediate_frame(
+                            "", frame, frame, reader=self.reader, downsample=False, callback=self._on_immediate_frame_ready
+                        )
+
+            if data is not None:
+                self._update_pinned_frame(cur_src_id, frame)
+                orig_w = getattr(self.viewport, "_img_width", 0)
+                orig_h = getattr(self.viewport, "_img_height", 0)
+                if orig_w == 0 or orig_h == 0:
+                    orig_w = getattr(self.reader, "width", 0) if hasattr(self, "reader") and self.reader else 0
+                    orig_h = getattr(self.reader, "height", 0) if hasattr(self, "reader") and self.reader else 0
+                logical_size = (orig_w, orig_h) if is_proxy and orig_w > 0 else None
+                self.viewport.set_primary_frame(frame, data, logical_size=logical_size, is_proxy=is_proxy)
+                if hasattr(data, "shape") and len(data.shape) >= 2:
+                    if is_proxy:
+                        pw = orig_w if orig_w > 0 else data.shape[1]
+                        ph = orig_h if orig_h > 0 else data.shape[0]
+                        self._update_resolution_status(f"{pw}x{ph} (Proxy)")
+                    else:
+                        self._update_resolution_status(f"{data.shape[1]}x{data.shape[0]}")
+                self._update_hud_scopes(data)
+            elif cur_src_id is None and self.reader is None:
+                self.viewport.set_primary_frame(frame, None)
 
             # Check if wipe comparison is active between 2 selected sources or QC comparison
             qc = getattr(self, "comp_qc_state", None)
@@ -1904,12 +2205,6 @@ class MainWindow(QMainWindow):
                     self.viewport.set_reference_frame(None)
             elif getattr(self.viewport, "_image_b", None) is not None:
                 self.viewport.set_reference_frame(None)
-
-            if data is not None and hasattr(data, "shape") and len(data.shape) >= 2:
-                self._update_resolution_status(f"{data.shape[1]}x{data.shape[0]}")
-            self.viewport.set_primary_frame(frame, data)
-            if self.hud_hist.isVisible() and data is not None:
-                self.hist_widget.update_frame(data)
 
         # Synchronize matte frame if loaded in xtra QC Utils AND actively used
         self._sync_matte_frame(frame, sync_read_allowed=sync_read_allowed)
@@ -2007,6 +2302,7 @@ class MainWindow(QMainWindow):
 
     def _on_viewport_scrub(self, delta: int) -> None:
         """Handle viewport scrub drag: pause background prefetch and advance frame with full CPU priority."""
+        self._is_scrubbing = True
         if hasattr(self, "reader_engine") and self.reader_engine:
             self.reader_engine.pause_prefetch()
         if hasattr(self, "_delayed_cache_timer"):
@@ -2019,6 +2315,7 @@ class MainWindow(QMainWindow):
 
     def _on_timeline_seek(self, frame: int) -> None:
         """Handle timeline seek click/drag: pause background prefetch and scrub audio/clock with full CPU priority."""
+        self._is_scrubbing = True
         if hasattr(self, "reader_engine") and self.reader_engine:
             self.reader_engine.pause_prefetch()
         if hasattr(self, "_delayed_cache_timer"):
@@ -2027,12 +2324,48 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_scrub_settle_timer"):
             self._scrub_settle_timer.start(150)
 
-    def _on_scrub_settled(self) -> None:
-        """Resume background prefetching 150ms after interactive scrubbing ceases."""
+    def _on_scrub_settled(self, frame: Optional[int] = None) -> None:
+        """Resume background prefetching and trigger full-resolution decode after interactive scrubbing ceases."""
+        self._is_scrubbing = False
         if not self.clock.is_playing and hasattr(self, "audio_engine") and self.audio_engine:
             self.audio_engine.pause(self.clock.current_frame)
         if hasattr(self, "reader_engine") and self.reader_engine:
             self.reader_engine.resume_prefetch()
+
+        # If current frame was rendered as a proxy or is a proxy in cache, request immediate full-res decode
+        current_f = self.clock.current_frame
+        is_proxy = False
+        if hasattr(self, "cache") and self.cache:
+            is_proxy = self.cache.is_frame_proxy(current_f)
+        if not is_proxy and hasattr(self, "viewport") and getattr(self.viewport, "_is_proxy", False):
+            is_proxy = True
+
+        if is_proxy:
+            viewable = self.session_graph.get_active_viewable() if hasattr(self, "session_graph") else None
+            if isinstance(viewable, SequenceView):
+                source, src_frame = viewable.resolve_frame(current_f, self.session_graph.sources)
+                if source:
+                    reader = self._get_reader_for_source(source)
+                    if reader and hasattr(self, "reader_engine") and self.reader_engine:
+                        self.reader_engine.request_immediate_frame(
+                            source.id, src_frame, current_f, reader=reader, downsample=False, callback=self._on_immediate_frame_ready
+                        )
+            elif isinstance(viewable, StackView):
+                layer_a = viewable.get_layer_a(self.session_graph.sources)
+                if layer_a:
+                    reader_a = self._get_reader_for_source(layer_a)
+                    if reader_a and hasattr(self, "reader_engine") and self.reader_engine:
+                        self.reader_engine.request_immediate_frame(
+                            layer_a.id, current_f, current_f, reader=reader_a, downsample=False, callback=self._on_immediate_frame_ready
+                        )
+            else:
+                cur_src_id = viewable.id if (viewable and hasattr(viewable, "id")) else ""
+                rdr = self.reader
+                if rdr and hasattr(self, "reader_engine") and self.reader_engine:
+                    self.reader_engine.request_immediate_frame(
+                        cur_src_id, current_f, current_f, reader=rdr, downsample=False, callback=self._on_immediate_frame_ready
+                    )
+
         self._trigger_prefetch()
 
     def _schedule_cache_ui_update(self) -> None:
@@ -2056,7 +2389,42 @@ class MainWindow(QMainWindow):
             else:
                 self.audio_engine.pause(self.clock.current_frame)
         if is_playing:
+            self._last_prefetch_trigger_frame = self.clock.current_frame
             self._cancel_delayed_prefetch_and_run()
+        else:
+            # Upgrade resting frame to full resolution if currently showing a proxy
+            current_f = self.clock.current_frame
+            is_proxy = False
+            if hasattr(self, "cache") and self.cache:
+                is_proxy = self.cache.is_frame_proxy(current_f)
+            if not is_proxy and hasattr(self, "viewport") and getattr(self.viewport, "_is_proxy", False):
+                is_proxy = True
+
+            if is_proxy:
+                viewable = self.session_graph.get_active_viewable() if hasattr(self, "session_graph") else None
+                if isinstance(viewable, SequenceView):
+                    source, src_frame = viewable.resolve_frame(current_f, self.session_graph.sources)
+                    if source:
+                        reader = self._get_reader_for_source(source)
+                        if reader and hasattr(self, "reader_engine") and self.reader_engine:
+                            self.reader_engine.request_immediate_frame(
+                                source.id, src_frame, current_f, reader=reader, downsample=False, callback=self._on_immediate_frame_ready
+                            )
+                elif isinstance(viewable, StackView):
+                    layer_a = viewable.get_layer_a(self.session_graph.sources)
+                    if layer_a:
+                        reader_a = self._get_reader_for_source(layer_a)
+                        if reader_a and hasattr(self, "reader_engine") and self.reader_engine:
+                            self.reader_engine.request_immediate_frame(
+                                layer_a.id, current_f, current_f, reader=reader_a, downsample=False, callback=self._on_immediate_frame_ready
+                            )
+                else:
+                    cur_src_id = viewable.id if (viewable and hasattr(viewable, "id")) else ""
+                    rdr = self.reader
+                    if rdr and hasattr(self, "reader_engine") and self.reader_engine:
+                        self.reader_engine.request_immediate_frame(
+                            cur_src_id, current_f, current_f, reader=rdr, downsample=False, callback=self._on_immediate_frame_ready
+                        )
 
     def _on_cache_updated(self) -> None:
         viewable = self.session_graph.get_active_viewable() if hasattr(self, "session_graph") else None
@@ -2186,6 +2554,7 @@ class MainWindow(QMainWindow):
                     self.reader_engine.pause_prefetch()
                 if hasattr(self, "_delayed_cache_timer"):
                     self._delayed_cache_timer.stop()
+
         self._on_cache_updated()
         mode_names = {
             CacheMode.OFF: "Off",
@@ -2196,9 +2565,16 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Cache Mode: {mode_names.get(mode, str(mode))}", 3000)
 
     def _on_toggle_cache(self) -> None:
-        """Toggle between Cache active/OFF, resuming the last active cache mode (Shift+C)."""
+        """Toggle caching on/off (Shift+C), defaulting between OFF and In/Out Region according to preferences."""
         if not getattr(self, "_cache_started", False) or self.cache.mode == CacheMode.OFF:
-            target_mode = getattr(self, "_last_active_cache_mode", None) or CacheMode.REGION
+            toggle_pref = getattr(self.pref_mgr.prefs, "cache_toggle_mode", "region")
+            if toggle_pref == "last_active":
+                target_mode = getattr(self, "_last_active_cache_mode", None) or CacheMode.REGION
+            else:
+                try:
+                    target_mode = CacheMode(toggle_pref)
+                except Exception:
+                    target_mode = CacheMode.REGION
             self._on_set_cache_mode(target_mode, start_prefetch=True)
             mode_names = {
                 CacheMode.PLAY_AHEAD: "Play-Ahead",
@@ -2688,6 +3064,36 @@ class MainWindow(QMainWindow):
             if self.viewport.comparison_state.mode == ComparisonMode.OFF:
                 self.viewport.set_reference_frame(None)
         self.viewport.update()
+
+    def _toggle_hud_hist(self) -> None:
+        """Toggle Live RGB Histogram HUD card with instant frame update."""
+        vis = not self.hud_hist.isVisible()
+        self.hud_hist.setVisible(vis)
+        if vis and hasattr(self, "viewport") and getattr(self.viewport, "_image_a", None) is not None:
+            self.hist_widget.update_frame(self.viewport._image_a)
+
+    def _toggle_hud_waveform(self) -> None:
+        """Toggle Waveform Monitor HUD card with instant frame update."""
+        vis = not self.hud_waveform.isVisible()
+        self.hud_waveform.setVisible(vis)
+        if vis and hasattr(self, "viewport") and getattr(self.viewport, "_image_a", None) is not None:
+            self.waveform_widget.update_frame(self.viewport._image_a)
+
+    def _toggle_hud_vectorscope(self) -> None:
+        """Toggle Vectorscope Monitor HUD card with instant frame update."""
+        vis = not self.hud_vectorscope.isVisible()
+        self.hud_vectorscope.setVisible(vis)
+        if vis and hasattr(self, "viewport") and getattr(self.viewport, "_image_a", None) is not None:
+            self.vectorscope_widget.update_frame(self.viewport._image_a)
+
+    def _update_hud_scopes(self, data: Optional[np.ndarray]) -> None:
+        """Update live scopes HUDs (Histogram, Waveform, Vectorscope) if visible."""
+        if hasattr(self, "hud_hist") and self.hud_hist.isVisible():
+            self.hist_widget.update_frame(data)
+        if hasattr(self, "hud_waveform") and self.hud_waveform.isVisible():
+            self.waveform_widget.update_frame(data)
+        if hasattr(self, "hud_vectorscope") and self.hud_vectorscope.isVisible():
+            self.vectorscope_widget.update_frame(data)
 
     def _on_color_adj_changed(self, settings: ColorGradeSettings) -> None:
         """Handle adjustments from full Color Adjustments dialog/HUD."""
@@ -3374,6 +3780,14 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, "Load Failed", f"Could not load audio file:\n{path}")
 
+
+    def _on_choose_frame_rate(self) -> None:
+        """Open Frame Rate Dialog and apply chosen playback speed."""
+        fps, ok = FrameRateDialog.get_target_fps(self, self.clock.fps)
+        if ok and fps > 0:
+            self.clock.set_fps(fps)
+            self.statusBar().showMessage(f"Playback Frame Rate set to {fps:.2f} FPS", 3000)
+
     def _on_goto_frame_modal(self) -> None:
         """Prompt user with a modal dialog to jump to an exact frame number (Ctrl+G)."""
         start_f = self.clock.start_frame
@@ -3523,6 +3937,10 @@ class MainWindow(QMainWindow):
         # 10. Clear UI widgets & inspectors
         if hasattr(self, "hist_widget") and self.hist_widget:
             self.hist_widget.update_frame(None)
+        if hasattr(self, "waveform_widget") and self.waveform_widget:
+            self.waveform_widget.update_frame(None)
+        if hasattr(self, "vectorscope_widget") and self.vectorscope_widget:
+            self.vectorscope_widget.update_frame(None)
         if hasattr(self, "hud_notes_editor") and self.hud_notes_editor:
             self.hud_notes_editor.clear()
 
@@ -3556,7 +3974,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "comp_qc_state") and self.comp_qc_state:
             self.comp_qc_state.reset_defaults()
 
-        self.setWindowTitle("OpenReview - Professional VFX Review & Playback")
+        self._update_window_title()
         self.statusBar().showMessage("Session cleared - canvas and media reset", 3000)
         self._active_view_is_sequence = False
         self._pre_sequence_cache_mode = None
@@ -3988,12 +4406,10 @@ class MainWindow(QMainWindow):
                 # Load audio track from video file
                 self.audio_engine.load_audio(path)
                 self.audio_engine.set_sequence_context(1, vid_reader.fps)
-                # Video files default to sRGB input and sRGB display
-                self.top_bar.set_color_spaces(0, 0)
+                # Auto-configure input colorspace from video stream metadata
+                self._auto_configure_media_colorspace(path, source_item=src if 'src' in locals() else None)
                 base = os.path.basename(path)
-                self.setWindowTitle(
-                    f"OpenReview - {base} [{vid_reader.width}x{vid_reader.height}, {vid_reader.total_frames} frames @ {vid_reader.fps:.2f} FPS]"
-                )
+                self._update_window_title()
                 self.statusBar().showMessage(
                     f"Loaded Video: {base} ({vid_reader.total_frames} frames @ {vid_reader.fps:.2f} fps)",
                     6000,
@@ -4018,17 +4434,12 @@ class MainWindow(QMainWindow):
             self.clock.set_frame(seq_info.start_frame)
             self.audio_engine.set_sequence_context(seq_info.start_frame, self.clock.fps)
 
-            # Auto-configure colorspace: EXR/HDR -> ACEScg / SDR Video; DPX -> Cineon Log; standard -> sRGB
-            if seq_info.extension.lower() in (".exr", ".hdr"):
-                self.top_bar.set_color_spaces(1, 1)
-            elif seq_info.extension.lower() in (".dpx", ".cin"):
-                self.top_bar.set_color_spaces(3, 1)
-            else:
-                self.top_bar.set_color_spaces(0, 0)
+            # Auto-configure colorspace from sequence metadata
+            self._auto_configure_media_colorspace(path, source_item=src if 'src' in locals() else None)
 
             gaps_info = f" ({len(seq_info.missing_frames)} gaps)" if seq_info.missing_frames else ""
             seq_display = f"{seq_info.prefix}{seq_info.separator}####{seq_info.extension}"
-            self.setWindowTitle(f"OpenReview - {seq_display} [{seq_info.start_frame}-{seq_info.end_frame}]")
+            self._update_window_title()
             self.statusBar().showMessage(
                 f"Loaded Sequence: {seq_display} [{seq_info.start_frame}-{seq_info.end_frame}]{gaps_info}",
                 6000,
@@ -4043,16 +4454,11 @@ class MainWindow(QMainWindow):
             self._current_media_path = str(path)
             self._current_media_type = "image"
 
-            ext = os.path.splitext(path)[1].lower()
-            if ext in (".exr", ".hdr"):
-                self.top_bar.set_color_spaces(1, 1)
-            elif ext in (".dpx", ".cin"):
-                self.top_bar.set_color_spaces(3, 1)
-            else:
-                self.top_bar.set_color_spaces(0, 0)
+            # Auto-configure colorspace from image metadata
+            self._auto_configure_media_colorspace(path, source_item=src if 'src' in locals() else None)
 
             self._on_frame_changed(self.clock.current_frame)
-            self.setWindowTitle(f"OpenReview - {os.path.basename(path)}")
+            self._update_window_title()
             self.statusBar().showMessage(f"Loaded Media: {os.path.basename(path)}", 5000)
 
         # 4. Multi-Channel EXR Layer Discovery
@@ -4380,6 +4786,21 @@ class MainWindow(QMainWindow):
             else:
                 self._apply_windows_fullscreen_taskbar_hint(True)
 
+    def _on_toggle_premultiplied_alpha(self, checked: bool) -> None:
+        """Toggle canvas alpha compositing between Premultiplied (GL_ONE) and Straight (GL_SRC_ALPHA)."""
+        self.viewport.set_premultiplied_alpha(checked)
+        if hasattr(self, "session_graph"):
+            viewable = self.session_graph.get_active_viewable()
+            from openreview.models.session_graph import SourceItem
+            if isinstance(viewable, SourceItem):
+                viewable.premultiplied = checked
+                self.session_graph.source_properties_changed.emit(viewable.id)
+        if hasattr(self, "sources_dock") and hasattr(self.sources_dock, "panel") and hasattr(self.sources_dock.panel, "chk_premultiplied"):
+            self.sources_dock.panel.chk_premultiplied.blockSignals(True)
+            self.sources_dock.panel.chk_premultiplied.setChecked(checked)
+            self.sources_dock.panel.chk_premultiplied.blockSignals(False)
+        self.statusBar().showMessage(f"Alpha Compositing: {'Premultiplied (GL_ONE)' if checked else 'Straight (GL_SRC_ALPHA)'}", 3000)
+
     def _on_toggle_texture_filtering(self) -> None:
         """Toggle texture filtering between Linear and Nearest (Shift+N)."""
         self.viewport.toggle_texture_filtering()
@@ -4459,13 +4880,94 @@ class MainWindow(QMainWindow):
         if hasattr(self, "markup_palette") and hasattr(self.markup_palette, "set_hud_opacity"):
             self.markup_palette.set_hud_opacity(opacity)
 
+    def _auto_configure_media_colorspace(self, file_path: str, source_item: Optional[SourceItem] = None) -> None:
+        """Auto-configure input colorspace based on media metadata if preference is enabled."""
+        prefs = self.pref_mgr.prefs
+        cm_mode = getattr(prefs, "color_management_mode", "standard")
+
+        if source_item is None and hasattr(self, "session_graph"):
+            viewable = self.session_graph.get_active_viewable()
+            if isinstance(viewable, SourceItem) and (viewable.path == file_path or not file_path):
+                source_item = viewable
+
+        if not getattr(prefs, "auto_detect_input_colorspace", True):
+            if cm_mode == "standard":
+                in_name = getattr(prefs, "standard_input_space", "linear")
+                cs_info = COLORSPACE_BY_NAME.get(in_name.lower(), COLORSPACE_BY_ID[0])
+                view_id = self.viewport.view_transform if hasattr(self.viewport, "view_transform") else 1
+                if source_item:
+                    source_item.input_space = cs_info.id
+                    source_item.colorspace = cs_info.name
+                self.top_bar.set_color_spaces(cs_info.id, view_id)
+            return
+
+        from openreview.core.metadata import extract_media_metadata
+        meta = extract_media_metadata(file_path)
+        detected_cs = detect_media_input_colorspace(file_path, meta)
+
+        if source_item:
+            source_item.input_space = detected_cs.id
+            source_item.colorspace = detected_cs.name
+
+        if cm_mode == "standard":
+            view_id = getattr(self.viewport, "view_transform", 1)
+            if view_id is None:
+                view_id = 1
+            self.top_bar.set_color_spaces(detected_cs.id, view_id)
+            self.statusBar().showMessage(
+                f"Input Colorspace: {detected_cs.label} (auto-detected)",
+                4000
+            )
+        else:
+            ocio_space = map_standard_to_ocio_space(detected_cs.id, self.ocio_manager)
+            if ocio_space:
+                if source_item:
+                    source_item.ocio_colorspace = ocio_space
+                    source_item.colorspace = ocio_space
+                self.ocio_manager.input_space = ocio_space
+                cb_idx = self.top_bar.input_combo.findText(ocio_space)
+                if cb_idx >= 0:
+                    self.top_bar.input_combo.blockSignals(True)
+                    self.top_bar.input_combo.setCurrentIndex(cb_idx)
+                    self.top_bar.input_combo.blockSignals(False)
+                    self.top_bar._on_color_transform_changed()
+                self.statusBar().showMessage(
+                    f"Input Colorspace: {ocio_space} (auto-mapped to OCIO)",
+                    4000
+                )
+
+    def _update_color_menus(self) -> None:
+        """Populate Display Transform and Input Colorspace menus matching active mode."""
+        if not hasattr(self, "disp_sub") or not hasattr(self, "input_sub"):
+            return
+        self.disp_sub.clear()
+        self.input_sub.clear()
+
+        cm_mode = getattr(self.pref_mgr.prefs, "color_management_mode", "standard")
+        if cm_mode == "standard":
+            for cs in STANDARD_COLORSPACES:
+                action_d = self.disp_sub.addAction(cs.label)
+                action_d.setToolTip(cs.description)
+                action_d.triggered.connect(lambda checked=False, i=cs.id: self._on_set_view_transform(i))
+
+                action_i = self.input_sub.addAction(cs.label)
+                action_i.setToolTip(cs.description)
+                action_i.triggered.connect(lambda checked=False, i=cs.id: self._on_set_input_space(i))
+        else:
+            views = self.ocio_manager.get_views()
+            for idx, vw in enumerate(views):
+                self.disp_sub.addAction(vw).triggered.connect(lambda checked=False, i=idx: self._on_set_view_transform(i))
+            spaces = self.ocio_manager.get_color_spaces()
+            for idx, sp in enumerate(spaces):
+                self.input_sub.addAction(sp).triggered.connect(lambda checked=False, i=idx: self._on_set_input_space(i))
+
     def _on_open_preferences(self) -> None:
-        dlg = PreferencesDialog(self.pref_mgr, self)
+        dlg = PreferencesDialog(self.pref_mgr, self, ocio_manager=self.ocio_manager)
         dlg.hud_opacity_changed.connect(self._apply_hud_opacity)
         dlg.exec()
 
     def _on_open_preferences_tab(self, tab_name: str) -> None:
-        dlg = PreferencesDialog(self.pref_mgr, self)
+        dlg = PreferencesDialog(self.pref_mgr, self, ocio_manager=self.ocio_manager)
         dlg.hud_opacity_changed.connect(self._apply_hud_opacity)
         dlg.open_tab(tab_name)
         dlg.exec()
@@ -4489,7 +4991,10 @@ class MainWindow(QMainWindow):
             self.cache.set_max_memory_mb(target_mb, auto=False)
             if hasattr(self, "budget_actions") and target_mb in self.budget_actions:
                 self.budget_actions[target_mb].setChecked(True)
-        self._on_set_cache_mode(CacheMode(getattr(prefs, "default_cache_mode", "off")))
+        new_default = getattr(prefs, "default_cache_mode", None)
+        if new_default and getattr(self, "_last_pref_default_cache_mode", None) != new_default:
+            self._last_pref_default_cache_mode = new_default
+            self._on_set_cache_mode(CacheMode(new_default))
         buf_size = getattr(prefs, "prefetch_buffer_size", 48)
         behind_pct = getattr(prefs, "lookahead_behind_pct", 20.0)
         self.cache.set_prefetch_range(
@@ -4509,6 +5014,15 @@ class MainWindow(QMainWindow):
         if hasattr(prefs, "vsync_enabled"):
             self.viewport.set_vsync_enabled(prefs.vsync_enabled)
 
+        # Update Color Management Mode
+        cm_mode = getattr(prefs, "color_management_mode", "standard")
+        std_view = getattr(prefs, "standard_view_transform", "sRGB")
+        std_input = getattr(prefs, "standard_input_space", "linear")
+        self.top_bar.set_color_management_mode(cm_mode, std_view, std_input)
+        if hasattr(self, "sources_dock") and self.sources_dock:
+            self.sources_dock.panel.set_color_management_mode(cm_mode, self.ocio_manager.get_color_spaces() if cm_mode == "ocio" else None)
+        self._update_color_menus()
+
         self.shortcut_mgr.load_from_preferences()
         self.viewport.update()
 
@@ -4516,6 +5030,14 @@ class MainWindow(QMainWindow):
     # Session Management (.ovr)
     # --------------------------------------------------------------------------
     def _build_current_session(self) -> OpenReviewSession:
+        cur_vid = getattr(self, "_current_active_view_id", None)
+        cur_path = getattr(self, "_current_media_path", None)
+        if hasattr(self, "per_media_annotations") and hasattr(self, "annotation_store"):
+            if cur_vid:
+                self.per_media_annotations.stash(cur_vid, self.annotation_store)
+            if cur_path:
+                self.per_media_annotations.stash(cur_path, self.annotation_store)
+
         return OpenReviewSession(
             media_path=self._current_media_path,
             media_type=self._current_media_type,
@@ -4551,6 +5073,7 @@ class MainWindow(QMainWindow):
                 opacity=self.viewport.matte_opacity,
             ),
             annotations=self.annotation_store.to_dict(),
+            per_media_annotations=self.per_media_annotations.to_dict() if hasattr(self, "per_media_annotations") else {},
             session_graph=self.session_graph.to_dict() if hasattr(self, "session_graph") else {},
         )
 
@@ -4594,6 +5117,8 @@ class MainWindow(QMainWindow):
         self.viewport.set_matte(sess.matte.ratio, sess.matte.opacity)
 
         # Annotations
+        if getattr(sess, "per_media_annotations", None) and hasattr(self, "per_media_annotations"):
+            self.per_media_annotations.from_dict(sess.per_media_annotations)
         self.annotation_store.from_dict(sess.annotations)
         self.viewport.update()
         self.timeline.update()
@@ -4632,6 +5157,7 @@ class MainWindow(QMainWindow):
             sess = self._build_current_session()
             sess.save_to_file(filepath)
             self._current_session_file = filepath
+            self._update_window_title()
             self.statusBar().showMessage(f"Session saved to {filepath.name}", 4000)
         except Exception as e:
             QMessageBox.critical(self, "Save Error", f"Failed to save session: {e}")
@@ -4654,6 +5180,7 @@ class MainWindow(QMainWindow):
             sess = OpenReviewSession.load_from_file(path)
             self._apply_session(sess)
             self._current_session_file = Path(path)
+            self._update_window_title()
             self.pref_mgr.add_recent_file(str(path))
             self._update_recent_menu()
             self.statusBar().showMessage(f"Loaded Session: {Path(path).name}", 5000)
@@ -4729,26 +5256,43 @@ class MainWindow(QMainWindow):
         frames = export_data["frames"]
         burn_in = export_data.get("burn_in", True)
         fps = export_data.get("fps", self.clock.fps)
+        downscale_gt_fhd = export_data.get(
+            "downscale_gt_fhd",
+            getattr(self.pref_mgr.prefs, "export_downscale_greater_than_fhd", True) if hasattr(self, "pref_mgr") else True,
+        )
+        is_custom_res = export_data.get("is_custom_res", False)
 
         def _frame_provider(frame_num: int) -> np.ndarray:
             if burn_in:
-                return self._render_frame_for_export(frame_num)
+                arr = self._render_frame_for_export(frame_num)
             else:
                 raw = self.reader.read_frame(frame_num) if self.reader else None
                 if isinstance(raw, (tuple, list)):
                     raw = self._resolve_frame_from_tuple(raw)
                 if raw is None:
-                    return np.zeros((1080, 1920, 3), dtype=np.uint8)
-                if raw.dtype in (np.float32, np.float64):
+                    arr = np.zeros((1080, 1920, 3), dtype=np.uint8)
+                elif raw.dtype in (np.float32, np.float64):
                     arr = np.clip(raw[:, :, :3] * 255.0, 0, 255).astype(np.uint8)
                 else:
                     arr = raw[:, :, :3].astype(np.uint8)
-                return arr
+
+            if not is_custom_res and downscale_gt_fhd and (arr.shape[1] > 1920 or arr.shape[0] > 1080):
+                arr = MediaExporter.resize_frame(arr, max(1, arr.shape[1] // 2), max(1, arr.shape[0] // 2))
+
+            return arr
 
         try:
             if fmt == "single":
                 img = _frame_provider(frames[0] if frames else self.clock.current_frame)
-                MediaExporter.save_image_file(img, dest)
+                MediaExporter.save_image_file(
+                    img,
+                    dest,
+                    compression=export_data.get("compression", "4"),
+                    bit_depth=export_data.get("bit_depth", "8"),
+                    quality=int(export_data.get("quality", 95)),
+                    dither=bool(export_data.get("dither", True)),
+                    png_mode=export_data.get("png_mode", "png8"),
+                )
                 self.statusBar().showMessage(f"Exported current frame to {dest}", 5000)
             elif fmt in ("mov", "mp4"):
                 codec = export_data.get("codec", "Apple ProRes 422 HQ")
@@ -4756,7 +5300,26 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(f"Exported video ({len(frames)} frames) to {dest}", 5000)
             else:
                 ext = export_data.get("ext", "png")
-                MediaExporter.export_sequence(_frame_provider, frames, dest, file_ext=ext)
+                prefix = export_data.get("prefix", "frame")
+                pad = int(export_data.get("pad", 4))
+                bd = export_data.get("bit_depth", "8")
+                comp = export_data.get("compression", "4")
+                quality = int(export_data.get("quality", 95))
+                dither = bool(export_data.get("dither", True))
+                png_mode = export_data.get("png_mode", "png8")
+                MediaExporter.export_sequence(
+                    _frame_provider,
+                    frames,
+                    dest,
+                    filename_prefix=prefix,
+                    file_ext=ext,
+                    pad=pad,
+                    compression=comp,
+                    bit_depth=bd,
+                    quality=quality,
+                    dither=dither,
+                    png_mode=png_mode,
+                )
                 self.statusBar().showMessage(f"Exported sequence ({len(frames)} frames) to {dest}", 5000)
         except Exception as e:
             QMessageBox.critical(self, "Export Failed", f"Export error: {e}")
@@ -4764,6 +5327,61 @@ class MainWindow(QMainWindow):
     # --------------------------------------------------------------------------
     # Color & LUT Engine Handlers
     # --------------------------------------------------------------------------
+    def _on_top_bar_color_transforms_changed(self, in_idx: int, view_idx: int) -> None:
+        """Handle color transform changes from top bar, syncing to viewport and active source."""
+        self.viewport.set_color_transforms(in_idx, view_idx)
+        if getattr(self, "_suppress_colorspace_sync", False):
+            return
+
+        viewable = self.session_graph.get_active_viewable()
+        if isinstance(viewable, SourceItem):
+            viewable.input_space = in_idx
+            cm_mode = getattr(self.pref_mgr.prefs, "color_management_mode", "standard")
+            if cm_mode == "standard":
+                cs_info = COLORSPACE_BY_ID.get(in_idx)
+                if cs_info:
+                    viewable.colorspace = cs_info.name
+            else:
+                ocio_text = self.top_bar.input_combo.currentText()
+                viewable.ocio_colorspace = ocio_text
+                viewable.colorspace = ocio_text
+
+            self._suppress_colorspace_sync = True
+            try:
+                self.session_graph.source_properties_changed.emit(viewable.id)
+                if hasattr(self, "sources_dock") and self.sources_dock:
+                    self.sources_dock.panel.refresh_properties()
+            finally:
+                self._suppress_colorspace_sync = False
+
+    def _on_source_properties_changed(self, source_id: str) -> None:
+        """Handle source property changes, synchronizing top bar if active source updated."""
+        if getattr(self, "_suppress_colorspace_sync", False):
+            return
+        if self.session_graph.active_view_id == source_id and self.session_graph.active_view_type == ViewType.SOURCE:
+            source = self.session_graph.sources.get(source_id)
+            if source:
+                cm_mode = getattr(self.pref_mgr.prefs, "color_management_mode", "standard")
+                self._suppress_colorspace_sync = True
+                try:
+                    if cm_mode == "standard":
+                        cur_view = getattr(self.viewport, "view_transform", 1)
+                        if cur_view is None:
+                            cur_view = 1
+                        self.top_bar.set_color_spaces(source.input_space, cur_view)
+                        self.viewport.set_color_transforms(source.input_space, cur_view)
+                    else:
+                        if source.ocio_colorspace:
+                            self.ocio_manager.input_space = source.ocio_colorspace
+                            cb_idx = self.top_bar.input_combo.findText(source.ocio_colorspace)
+                            if cb_idx >= 0:
+                                self.top_bar.input_combo.blockSignals(True)
+                                self.top_bar.input_combo.setCurrentIndex(cb_idx)
+                                self.top_bar.input_combo.blockSignals(False)
+                        self.viewport.update()
+                finally:
+                    self._suppress_colorspace_sync = False
+
     def _on_set_input_space(self, idx: int) -> None:
         self.top_bar.set_color_spaces(idx, self.viewport.view_transform)
         item_text = self.top_bar.input_combo.itemText(idx)
@@ -4885,6 +5503,10 @@ class MainWindow(QMainWindow):
             if active_src:
                 self._current_media_path = active_src.path
                 self._current_media_type = active_src.media_type
+                is_premult = getattr(active_src, "premultiplied", True)
+                self.viewport.set_premultiplied_alpha(is_premult)
+                if hasattr(self, "premult_act"):
+                    self.premult_act.setChecked(is_premult)
                 if hasattr(self.viewport, "info_strip_data"):
                     self.viewport.info_strip_data["media_name"] = active_src.name
                     self.viewport.info_strip_data["file_path"] = active_src.path
@@ -5012,6 +5634,8 @@ class MainWindow(QMainWindow):
     def _get_all_hud_cards(self) -> list[FloatingHUDCard]:
         cards = [
             self.hud_hist,
+            self.hud_waveform,
+            self.hud_vectorscope,
             self.hud_wipe,
             self.hud_inspector,
             self.hud_color_adj,
@@ -5181,6 +5805,7 @@ class MainWindow(QMainWindow):
             sess = OpenReviewSession.load_from_file(path)
             self._apply_session(sess)
             self._current_session_file = Path(path)
+            self._update_window_title()
             self.statusBar().showMessage(f"Imported Session: {Path(path).name}", 5000)
         except Exception as e:
             QMessageBox.critical(self, "Session Import Error", f"Failed to import session: {e}")
@@ -5229,6 +5854,50 @@ class MainWindow(QMainWindow):
     def _on_sources_media_load_requested(self, paths: list[str]) -> None:
         self._on_files_dropped(paths)
 
+    def _update_window_title(self) -> None:
+        """Dynamically update main window title based on saved session and active viewable/media."""
+        session_name = self._current_session_file.name if getattr(self, "_current_session_file", None) else None
+
+        viewable = self.session_graph.get_active_viewable() if hasattr(self, "session_graph") else None
+        item_details = None
+
+        if viewable is not None:
+            if isinstance(viewable, SourceItem):
+                item_details = f"{viewable.name} [{viewable.frame_in}-{viewable.frame_out} @ {viewable.fps:.2f} FPS]"
+            elif isinstance(viewable, SequenceView):
+                item_details = f"Sequence: {viewable.name} [{viewable.start_frame}-{viewable.end_frame}, {len(viewable.clips)} clips]"
+            elif isinstance(viewable, StackView):
+                item_details = f"Stack: {viewable.name} [{viewable.compare_mode.upper()} mode]"
+            elif isinstance(viewable, LayoutView):
+                item_details = f"Layout: {viewable.name} [{viewable.layout_type}, {viewable.scale_pct}% scale]"
+            else:
+                item_details = getattr(viewable, "name", str(viewable))
+        elif getattr(self, "_current_media_path", None):
+            media_path = self._current_media_path
+            media_type = getattr(self, "_current_media_type", "image")
+            base = os.path.basename(media_path)
+            if media_type == "video" and hasattr(self, "reader") and hasattr(self.reader, "total_frames"):
+                vr = self.reader
+                item_details = f"{base} [{getattr(vr, 'width', '')}x{getattr(vr, 'height', '')}, {vr.total_frames} frames @ {getattr(vr, 'fps', 24.0):.2f} FPS]"
+            elif media_type == "sequence" and hasattr(self, "reader") and hasattr(self.reader, "seq"):
+                seq = self.reader.seq
+                item_details = f"{seq.prefix}{seq.separator}####{seq.extension} [{seq.start_frame}-{seq.end_frame}]"
+            else:
+                item_details = base
+
+        if session_name:
+            if item_details:
+                title = f"OpenReview - {session_name} - {item_details}"
+            else:
+                title = f"OpenReview - {session_name}"
+        else:
+            if item_details:
+                title = f"OpenReview - {item_details}"
+            else:
+                title = "OpenReview - Professional VFX Review & Playback [ACEScg / OCIO v2]"
+
+        self.setWindowTitle(title)
+
     def _on_source_renamed_update_title(self, source_id: Optional[str] = None) -> None:
         """Update main window title if the currently active viewable was renamed."""
         viewable = self.session_graph.get_active_viewable() if hasattr(self, "session_graph") else None
@@ -5236,14 +5905,7 @@ class MainWindow(QMainWindow):
             return
         if source_id and getattr(viewable, "id", None) != source_id:
             return
-        if isinstance(viewable, SourceItem):
-            self.setWindowTitle(f"OpenReview - {viewable.name} [{viewable.frame_in}-{viewable.frame_out} @ {viewable.fps:.2f} FPS]")
-        elif isinstance(viewable, SequenceView):
-            self.setWindowTitle(f"OpenReview - Sequence: {viewable.name} [{viewable.start_frame}-{viewable.end_frame}, {len(viewable.clips)} clips]")
-        elif isinstance(viewable, StackView):
-            self.setWindowTitle(f"OpenReview - Stack: {viewable.name} [{viewable.compare_mode.upper()} mode]")
-        elif isinstance(viewable, LayoutView):
-            self.setWindowTitle(f"OpenReview - Layout: {viewable.name} [{viewable.layout_type}, {viewable.scale_pct}% scale]")
+        self._update_window_title()
 
     def _on_active_view_changed(self, view_type: str, view_id: str) -> None:
         """Handle active view switch between Source, Sequence, Stack, and Layout."""
@@ -5264,6 +5926,12 @@ class MainWindow(QMainWindow):
         end_f = 100
 
         prev_vid = getattr(self, "_current_active_view_id", None)
+        prev_path = getattr(self, "_current_media_path", None)
+        if prev_vid and prev_vid != view_id:
+            if hasattr(self, "per_media_annotations") and hasattr(self, "annotation_store"):
+                self.per_media_annotations.stash(prev_vid, self.annotation_store)
+                if prev_path:
+                    self.per_media_annotations.stash(prev_path, self.annotation_store)
         self._current_active_view_id = view_id
 
         if isinstance(viewable, SourceItem):
@@ -5287,8 +5955,39 @@ class MainWindow(QMainWindow):
             self.comparison_state.mode = ComparisonMode.OFF
             self.viewport.comparison_state.mode = ComparisonMode.OFF
             self.viewport.set_reference_frame(None)
-            self.setWindowTitle(f"OpenReview - {viewable.name} [{viewable.frame_in}-{viewable.frame_out} @ {viewable.fps:.2f} FPS]")
-            self.statusBar().showMessage(f"Active View: Source '{viewable.name}'", 3000)
+            # Restore per-clip input colorspace
+            self._suppress_colorspace_sync = True
+            try:
+                cm_mode = getattr(self.pref_mgr.prefs, "color_management_mode", "standard")
+                if cm_mode == "standard":
+                    in_idx = getattr(viewable, "input_space", None)
+                    if in_idx is None:
+                        cs_info = COLORSPACE_BY_NAME.get(str(viewable.colorspace).lower(), COLORSPACE_BY_ID[0])
+                        in_idx = cs_info.id
+                        viewable.input_space = in_idx
+                    vw_idx = getattr(self.viewport, "view_transform", 1)
+                    if vw_idx is None:
+                        vw_idx = 1
+                    self.top_bar.set_color_spaces(in_idx, vw_idx)
+                    self.viewport.set_color_transforms(in_idx, vw_idx)
+                else:
+                    ocio_sp = getattr(viewable, "ocio_colorspace", None)
+                    if not ocio_sp:
+                        ocio_sp = map_standard_to_ocio_space(getattr(viewable, "input_space", 0), self.ocio_manager)
+                        viewable.ocio_colorspace = ocio_sp
+                    if ocio_sp:
+                        self.ocio_manager.input_space = ocio_sp
+                        cb_idx = self.top_bar.input_combo.findText(ocio_sp)
+                        if cb_idx >= 0:
+                            self.top_bar.input_combo.blockSignals(True)
+                            self.top_bar.input_combo.setCurrentIndex(cb_idx)
+                            self.top_bar.input_combo.blockSignals(False)
+                        self.viewport.update()
+            finally:
+                self._suppress_colorspace_sync = False
+
+            self._update_window_title()
+            self.statusBar().showMessage(f"Active View: Source '{viewable.name}' [Input: {viewable.colorspace}]", 3000)
 
         elif isinstance(viewable, SequenceView):
             self.cache.set_active_source(None)
@@ -5313,7 +6012,7 @@ class MainWindow(QMainWindow):
                 return None
             self.reader = CallableVirtualReader(_fetch_seq)
             self.reader_engine.set_reader(self.reader)
-            self.setWindowTitle(f"OpenReview - Sequence: {viewable.name} [{viewable.start_frame}-{viewable.end_frame}, {len(viewable.clips)} clips]")
+            self._update_window_title()
             self.statusBar().showMessage(f"Active View: Sequence '{viewable.name}' ({len(viewable.clips)} clips)", 3000)
 
         elif isinstance(viewable, StackView):
@@ -5395,7 +6094,7 @@ class MainWindow(QMainWindow):
             self.reader = CallableVirtualReader(_fetch_stack)
             self.reader_engine.set_reader(self.reader)
 
-            self.setWindowTitle(f"OpenReview - Stack: {viewable.name} [{viewable.compare_mode.upper()} mode]")
+            self._update_window_title()
             self.statusBar().showMessage(f"Active View: Stack '{viewable.name}' ({viewable.compare_mode.upper()})", 3000)
 
         elif isinstance(viewable, LayoutView):
@@ -5426,7 +6125,7 @@ class MainWindow(QMainWindow):
             self.reader = CallableVirtualReader(_fetch_layout)
             self.reader_engine.set_reader(self.reader)
 
-            self.setWindowTitle(f"OpenReview - Layout: {viewable.name} [{viewable.layout_type}, {viewable.scale_pct}% scale]")
+            self._update_window_title()
             self.statusBar().showMessage(f"Active View: Layout '{viewable.name}' ({viewable.scale_pct}% scale)", 3000)
 
         # Set range & restore or auto-expand In/Out marks
@@ -5476,6 +6175,18 @@ class MainWindow(QMainWindow):
             if self.cache.mode != CacheMode.OFF and getattr(self, "_cache_started", False):
                 self._trigger_prefetch()
 
+        # Restore annotations for incoming media
+        view_path = getattr(viewable, "path", None)
+        if hasattr(self, "per_media_annotations") and hasattr(self, "annotation_store"):
+            if self.per_media_annotations.has_annotations(view_id):
+                self.per_media_annotations.restore(view_id, self.annotation_store)
+            elif view_path and self.per_media_annotations.has_annotations(view_path):
+                self.per_media_annotations.restore(view_path, self.annotation_store)
+            else:
+                self.annotation_store.clear_all()
+            if hasattr(self, "timeline"):
+                self.timeline.update()
+
         self._on_frame_changed(self.clock.current_frame)
         self._on_cache_updated()
         self.viewport.update()
@@ -5519,7 +6230,7 @@ class MainWindow(QMainWindow):
                         self.wipe_widget.btn_split.setChecked(comp_mode == ComparisonMode.SPLIT)
                         self.wipe_widget.btn_diff.setChecked(comp_mode == ComparisonMode.DIFFERENCE)
                         self.wipe_widget.btn_off.setChecked(comp_mode in (ComparisonMode.OFF, ComparisonMode.OVER))
-                    self.setWindowTitle(f"OpenReview - Stack: {viewable.name} [{viewable.compare_mode.upper()} mode]")
+                    self._update_window_title()
                 else:
                     self._on_active_view_changed(self.session_graph.active_view_type.value, viewable.id)
                 self._refresh_active_source_details()

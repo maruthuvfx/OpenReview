@@ -204,6 +204,7 @@ class ViewportCanvas(QOpenGLWidget):
         self.pixel_aspect_ratio: float = 1.0
         self.downsample_ratio: float = 1.0
         self.texture_filtering: str = "linear"  # "linear" or "nearest"
+        self.premultiplied_alpha: bool = True
 
         # Matte Overlay
         self.matte_ratio: Optional[float] = None  # None = No matte, e.g. 1.33, 1.85, 2.35
@@ -428,7 +429,10 @@ class ViewportCanvas(QOpenGLWidget):
         if self._texture_a is not None:
             # Enable standard alpha blending for transparent media over background
             gl.glEnable(0x0BE2)  # GL_BLEND
-            gl.glBlendFunc(0x0302, 0x0303)  # GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA
+            if getattr(self, "premultiplied_alpha", True):
+                gl.glBlendFunc(0x0001, 0x0303)  # GL_ONE, GL_ONE_MINUS_SRC_ALPHA (Premultiplied)
+            else:
+                gl.glBlendFunc(0x0302, 0x0303)  # GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA (Straight Alpha)
 
             self._shader_program.bind()
 
@@ -1119,7 +1123,8 @@ class ViewportCanvas(QOpenGLWidget):
             return
 
         h, w = self._image_a.shape[:2]
-        self._img_width, self._img_height = w, h
+        if not getattr(self, "_is_proxy", False):
+            self._img_width, self._img_height = w, h
 
         mode = PreferencesManager.instance().get_effective_texture_mode()
 
@@ -1305,7 +1310,14 @@ class ViewportCanvas(QOpenGLWidget):
     # --------------------------------------------------------------------------
     # Media & Frame Setting
     # --------------------------------------------------------------------------
-    def set_primary_frame(self, frame_number: int, image_data: Optional[np.ndarray]) -> None:
+    def set_primary_frame(
+        self,
+        frame_number: int,
+        image_data: Optional[np.ndarray],
+        logical_size: Optional[Tuple[int, int]] = None,
+        is_proxy: bool = False,
+    ) -> None:
+        self._is_proxy = bool(is_proxy)
         if frame_number != self.current_frame and hasattr(self, "_text_editor") and self._text_editor.is_active():
             self._text_editor.commit()
         self.current_frame = frame_number
@@ -1318,8 +1330,14 @@ class ViewportCanvas(QOpenGLWidget):
         if image_data is not None and hasattr(image_data, "shape") and len(image_data.shape) >= 2:
             self.has_active_media = True
             self.is_bad_frame = False
-            new_w = int(image_data.shape[1])
-            new_h = int(image_data.shape[0])
+            if logical_size is not None and logical_size[0] > 0 and logical_size[1] > 0:
+                new_w, new_h = int(logical_size[0]), int(logical_size[1])
+            elif is_proxy and self._img_width > 0 and self._img_height > 0:
+                new_w, new_h = self._img_width, self._img_height
+            else:
+                new_w = int(image_data.shape[1])
+                new_h = int(image_data.shape[0])
+
             if new_w != self._img_width or new_h != self._img_height:
                 self._img_width = new_w
                 self._img_height = new_h
@@ -1627,6 +1645,11 @@ class ViewportCanvas(QOpenGLWidget):
             self._texture_b.setMinMagFilters(gl_flt, gl_flt)
         self.update()
 
+    def set_premultiplied_alpha(self, val: bool) -> None:
+        """Set whether active media alpha is premultiplied (GL_ONE) or straight (GL_SRC_ALPHA)."""
+        self.premultiplied_alpha = bool(val)
+        self.update()
+
     def toggle_texture_filtering(self) -> None:
         """Toggle texture filtering between Linear and Nearest (Shift+N)."""
         new_mode = "nearest" if self.texture_filtering == "linear" else "linear"
@@ -1889,20 +1912,28 @@ class ViewportCanvas(QOpenGLWidget):
         if self._image_a is None or self._img_width <= 0 or self._img_height <= 0:
             return (0.0, 0.0, 0.0, 1.0)
 
+        actual_h, actual_w = self._image_a.shape[:2]
+        scale_x = actual_w / float(self._img_width)
+        scale_y = actual_h / float(self._img_height)
+        eff_ix = int(round(ix * scale_x))
+        eff_iy = int(round(iy * scale_y))
+        eff_w = max(1, int(round(w * scale_x)))
+        eff_h = max(1, int(round(h * scale_y)))
+
         scale = 255.0 if self._image_a.dtype == np.uint8 else 1.0
-        if w > 1 or h > 1:
-            x0 = max(0, min(self._img_width - 1, ix))
-            y0 = max(0, min(self._img_height - 1, iy))
-            x1 = max(x0 + 1, min(self._img_width, ix + w))
-            y1 = max(y0 + 1, min(self._img_height, iy + h))
+        if eff_w > 1 or eff_h > 1:
+            x0 = max(0, min(actual_w - 1, eff_ix))
+            y0 = max(0, min(actual_h - 1, eff_iy))
+            x1 = max(x0 + 1, min(actual_w, eff_ix + eff_w))
+            y1 = max(y0 + 1, min(actual_h, eff_iy + eff_h))
         else:
             half = max(0, int(aperture) // 2)
-            cx = max(0, min(self._img_width - 1, ix))
-            cy = max(0, min(self._img_height - 1, iy))
+            cx = max(0, min(actual_w - 1, eff_ix))
+            cy = max(0, min(actual_h - 1, eff_iy))
             x0 = max(0, cx - half)
             y0 = max(0, cy - half)
-            x1 = min(self._img_width, cx + half + 1)
-            y1 = min(self._img_height, cy + half + 1)
+            x1 = min(actual_w, cx + half + 1)
+            y1 = min(actual_h, cy + half + 1)
 
         patch = self._image_a[y0:y1, x0:x1]
         if patch.size == 0:
@@ -2660,7 +2691,20 @@ class ViewportCanvas(QOpenGLWidget):
         super().leaveEvent(event)
 
     def wheelEvent(self, event) -> None:
-        """Smooth exponential zoom centered on mouse cursor position."""
+        """Smooth exponential zoom centered on mouse cursor position, protected against accidental zooming over opened widgets."""
+        # Check accidental zoom scroll protection over any opened widget / HUD card
+        pos_local = event.position().toPoint()
+        if self.childAt(pos_local) is not None:
+            event.ignore()
+            return
+
+        from PySide6.QtWidgets import QApplication
+        pos_global = event.globalPosition().toPoint() if hasattr(event, "globalPosition") else self.mapToGlobal(pos_local)
+        w_at_cursor = QApplication.widgetAt(pos_global)
+        if w_at_cursor is not None and w_at_cursor != self and self.isAncestorOf(w_at_cursor):
+            event.ignore()
+            return
+
         angle = event.angleDelta().y()
         if angle == 0:
             return
@@ -3429,12 +3473,7 @@ class ViewportCanvas(QOpenGLWidget):
     # --------------------------------------------------------------------------
     # Right-Click Context Menu
     # --------------------------------------------------------------------------
-    def _show_context_menu(self, global_pos: Optional[QPoint] = None) -> None:
-        now = time.perf_counter()
-        if now - getattr(self, "_last_context_menu_time", 0.0) < 0.35:
-            return
-        self._last_context_menu_time = now
-
+    def _create_context_menu(self) -> QMenu:
         parent_w = self.window() if self.window() else self
         is_fullscreen = (
             self.isFullScreen()
@@ -3462,7 +3501,7 @@ class ViewportCanvas(QOpenGLWidget):
         act_fit.triggered.connect(self.fit_image)
         act_100 = menu.addAction("Actual Size (100% / 1)")
         act_100.triggered.connect(self.set_zoom_100)
-        act_fit_w = menu.addAction("Fit Width (Alt+F)")
+        act_fit_w = menu.addAction("Fit Width (ctrl+f)")
         act_fit_w.triggered.connect(self.fit_width)
 
         # Scale Presets
@@ -3551,14 +3590,23 @@ class ViewportCanvas(QOpenGLWidget):
         elif is_fullscreen:
             act_fs = menu.addAction("Exit Fullscreen (F12 / Esc)")
             act_fs.triggered.connect(self.exit_fullscreen_requested.emit)
-            act_pres = menu.addAction("Enter Presentation Mode (Tab)")
+            act_pres = menu.addAction("Presentation Mode (ctrl+p)")
             act_pres.triggered.connect(self.toggle_presentation_requested.emit)
         else:
             act_fs = menu.addAction("Fullscreen (F12)")
             act_fs.triggered.connect(self.toggle_fullscreen_requested.emit)
-            act_pres = menu.addAction("Presentation Mode (Tab)")
+            act_pres = menu.addAction("Presentation Mode (ctrl+p)")
             act_pres.triggered.connect(self.toggle_presentation_requested.emit)
 
+        return menu
+
+    def _show_context_menu(self, global_pos: Optional[QPoint] = None) -> None:
+        now = time.perf_counter()
+        if now - getattr(self, "_last_context_menu_time", 0.0) < 0.35:
+            return
+        self._last_context_menu_time = now
+
+        menu = self._create_context_menu()
         pos_to_use = (
             global_pos
             if (isinstance(global_pos, QPoint) and not global_pos.isNull())

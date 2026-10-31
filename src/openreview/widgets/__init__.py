@@ -4,6 +4,8 @@ Custom OpenReview VFX Widgets.
 from openreview.widgets.viewport import ViewportCanvas
 from openreview.widgets.floating_hud import FloatingHUDCard
 from openreview.widgets.hud_histogram import HistogramHUD
+from openreview.widgets.hud_waveform import WaveformHUD
+from openreview.widgets.hud_vectorscope import VectorscopeHUD
 from openreview.widgets.hud_wipe import WipeComparisonHUD
 from openreview.widgets.markup_tools import MarkupToolPalette
 from openreview.widgets.timeline import TimelineWidget
@@ -15,6 +17,8 @@ __all__ = [
     "ViewportCanvas",
     "FloatingHUDCard",
     "HistogramHUD",
+    "WaveformHUD",
+    "VectorscopeHUD",
     "WipeComparisonHUD",
     "MarkupToolPalette",
     "TimelineWidget",

@@ -9,7 +9,9 @@ import os
 from typing import List, Optional
 from PySide6.QtCore import QObject, Signal, QRunnable, QThreadPool
 
-from openreview.models.session_graph import SourceItem, build_source_item_from_path, create_proxy_source_item
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from openreview.models.session_graph import SourceItem
 
 
 class _SourceLoaderSignals(QObject):
@@ -48,6 +50,7 @@ class _SourceProbeTask(QRunnable):
             f"Probing source {self.index + 1}/{self.total}: {base_name}"
         )
         try:
+            from openreview.models.session_graph import build_source_item_from_path
             item = build_source_item_from_path(self.path, self.parent_folder_id)
             if self.is_cancelled_fn and self.is_cancelled_fn():
                 return
@@ -125,6 +128,7 @@ class AsyncSourceLoader(QObject):
         for idx, path in enumerate(paths):
             proxy_id = None
             if use_progressive_proxies:
+                from openreview.models.session_graph import create_proxy_source_item
                 proxy_item = create_proxy_source_item(path, parent_folder_id)
                 proxy_id = proxy_item.id
                 self.source_proxy_created.emit(proxy_item, idx + 1, self._total_count)

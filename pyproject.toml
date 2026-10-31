@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openreview"
-version = "1.2.0"
+version = "1.3.0"
 description = "Studio-grade VFX sequence playback, HDR color inspection, compositing comparison, and collaborative dailies review desktop workstation"
 readme = "README.md"
 license = { text = "MIT" }

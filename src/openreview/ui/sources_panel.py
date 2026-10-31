@@ -632,18 +632,16 @@ class SourcesPanelWidget(QWidget):
         form_clip.addRow("FPS:", fps_box)
 
         self.combo_colorspace = QComboBox(self.frame_clip_edit)
-        self.combo_colorspace.addItems([
-            "ACEScg",
-            "Linear sRGB",
-            "sRGB (Texture/Video)",
-            "ARRI LogC v3",
-            "Rec.709",
-            "Cineon Log",
-            "Gamma 2.2",
-            "Raw / Unmanaged",
-        ])
+        from openreview.color.standard_colorspaces import STANDARD_COLORSPACES
+        for cs in STANDARD_COLORSPACES:
+            self.combo_colorspace.addItem(cs.label, cs.id)
         self.combo_colorspace.currentIndexChanged.connect(self._on_clip_colorspace_changed)
         form_clip.addRow("Colorspace:", self.combo_colorspace)
+
+        self.chk_premultiplied = QCheckBox("Premultiplied", self.frame_clip_edit)
+        self.chk_premultiplied.setToolTip("Enable Premultiplied alpha composite (GL_ONE) or uncheck for Straight alpha (GL_SRC_ALPHA).")
+        self.chk_premultiplied.toggled.connect(self._on_clip_premultiplied_changed)
+        form_clip.addRow("Alpha:", self.chk_premultiplied)
 
         self.lbl_res_info = QLabel("Resolution: -", self.frame_clip_edit)
         self.lbl_res_info.setStyleSheet("color: #aaaaaa; font-size: 11px;")
@@ -1404,10 +1402,12 @@ class SourcesPanelWidget(QWidget):
                 item.setData(Qt.ItemDataRole.UserRole, idx)
                 self.list_inputs.addItem(item)
 
-            if viewable.compare_mode == "switch":
+            if 0 <= prev_input_row < self.list_inputs.count():
+                target_row = prev_input_row
+            elif viewable.compare_mode == "switch":
                 target_row = viewable.current_layer_index
             else:
-                target_row = prev_input_row if (0 <= prev_input_row < self.list_inputs.count()) else viewable.index_a
+                target_row = viewable.index_a
 
             if 0 <= target_row < self.list_inputs.count():
                 self.list_inputs.setCurrentRow(target_row)
@@ -1516,6 +1516,12 @@ class SourcesPanelWidget(QWidget):
         if w and hasattr(w, "_on_show_source_details"):
             w._on_show_source_details()
 
+    def refresh_properties(self) -> None:
+        """Refresh clip / viewable edit inspector for current selection or active viewable."""
+        s = self._get_target_source()
+        if s:
+            self._populate_clip_edit(s)
+
     def _populate_clip_edit(self, target_source: SourceItem) -> None:
         self.frame_layout_edit.hide()
         self.frame_clip_edit.show()
@@ -1527,13 +1533,20 @@ class SourcesPanelWidget(QWidget):
         self.spin_start_at.blockSignals(True)
         self.spin_fps.blockSignals(True)
         self.combo_colorspace.blockSignals(True)
+        if hasattr(self, "chk_premultiplied"):
+            self.chk_premultiplied.blockSignals(True)
 
         self.spin_in.setValue(target_source.start_frame)
         self.spin_out.setValue(target_source.end_frame)
         self.spin_start_at.setValue(target_source.start_frame)
         self._sync_start_at_combo_preset(target_source.start_frame)
         self.spin_fps.setValue(target_source.fps)
-        c_idx = self.combo_colorspace.findText(target_source.colorspace, Qt.MatchFlag.MatchContains)
+        in_id = getattr(target_source, "input_space", None)
+        c_idx = -1
+        if in_id is not None:
+            c_idx = self.combo_colorspace.findData(in_id)
+        if c_idx < 0:
+            c_idx = self.combo_colorspace.findText(target_source.colorspace, Qt.MatchFlag.MatchContains)
         if c_idx >= 0:
             self.combo_colorspace.setCurrentIndex(c_idx)
         self.lbl_res_info.setText(f"Resolution: {target_source.resolution_str} | {target_source.fps:.2f} fps")
@@ -1544,6 +1557,9 @@ class SourcesPanelWidget(QWidget):
         self.spin_start_at.blockSignals(False)
         self.spin_fps.blockSignals(False)
         self.combo_colorspace.blockSignals(False)
+        if hasattr(self, "chk_premultiplied"):
+            self.chk_premultiplied.setChecked(getattr(target_source, "premultiplied", True))
+            self.chk_premultiplied.blockSignals(False)
 
         # Dynamic EXR Properties Bar visibility
         exr_path = None
@@ -1859,11 +1875,40 @@ class SourcesPanelWidget(QWidget):
             s.fps = val
             self.view_updated.emit()
 
+    def _on_clip_premultiplied_changed(self, checked: bool) -> None:
+        s = self._get_target_source()
+        if s:
+            s.premultiplied = checked
+            self.graph.source_properties_changed.emit(s.id)
+            self.view_updated.emit()
+
     def _on_clip_colorspace_changed(self) -> None:
         s = self._get_target_source()
         if s:
-            s.colorspace = self.combo_colorspace.currentText()
+            cs_id = self.combo_colorspace.currentData()
+            if cs_id is not None:
+                s.input_space = int(cs_id)
+                from openreview.color.standard_colorspaces import COLORSPACE_BY_ID
+                if cs_id in COLORSPACE_BY_ID:
+                    s.colorspace = COLORSPACE_BY_ID[cs_id].name
+            else:
+                s.colorspace = self.combo_colorspace.currentText()
+            self.graph.source_properties_changed.emit(s.id)
             self.view_updated.emit()
+
+    def set_color_management_mode(self, mode: str, ocio_spaces: Optional[List[str]] = None) -> None:
+        """Switch sources panel colorspace combo between standard spaces and OCIO spaces."""
+        self.combo_colorspace.blockSignals(True)
+        self.combo_colorspace.clear()
+        if mode == "standard":
+            from openreview.color.standard_colorspaces import STANDARD_COLORSPACES
+            for cs in STANDARD_COLORSPACES:
+                self.combo_colorspace.addItem(cs.label, cs.id)
+        else:
+            spaces = ocio_spaces or []
+            for idx, sp in enumerate(spaces):
+                self.combo_colorspace.addItem(sp, idx)
+        self.combo_colorspace.blockSignals(False)
 
     def _on_layout_scale_changed(self) -> None:
         text = self.combo_scale_pct.currentText().replace("%", "")

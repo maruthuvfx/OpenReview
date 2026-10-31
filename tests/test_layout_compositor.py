@@ -107,8 +107,8 @@ def test_composite_layout_grid_preserves_aspect_ratio():
     # fit_scale = min(1920/4096, 1080/2160) = min(0.46875, 0.5) = 0.46875
     # scaled_w = 1920, scaled_h = 1012
     # pad_y = (1080 - 1012) // 2 = 34
-    # Rows 0..33 should be letterbox background (0.05)
-    assert np.allclose(comp[5, 960, :3], 0.05, atol=0.01)
+    # Rows 0..33 should be letterbox background (pure black 0.0)
+    assert np.allclose(comp[5, 960, :3], 0.0, atol=0.01)
     # Center pixel should be white (1.0)
     assert np.allclose(comp[540, 960, :3], 1.0, atol=0.01)
 

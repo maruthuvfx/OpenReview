@@ -55,6 +55,8 @@ class AnnotationExportWorker(QThread):
         seq_start_frame: int = 1001,
         seq_end_frame: int = 1100,
         source_path: str = "",
+        export_image_frames: Optional[bool] = None,
+        image_format: Optional[str] = None,
         parent: Optional[QObject] = None,
     ):
         super().__init__(parent)
@@ -64,7 +66,14 @@ class AnnotationExportWorker(QThread):
         self.store = store
         self.fps = fps
         self.render_frame_callback = render_frame_callback
-        self.export_png_frames = export_png_frames
+        self.export_png_frames = export_png_frames if export_image_frames is None else export_image_frames
+        self.export_image_frames = self.export_png_frames
+        if image_format is not None:
+            self.image_format = image_format.lower().lstrip(".")
+        elif export_png_frames and export_image_frames is None:
+            self.image_format = "png"
+        else:
+            self.image_format = "jpg"
         self.seq_start_frame = seq_start_frame
         self.seq_end_frame = seq_end_frame
         self.source_path = source_path
@@ -94,14 +103,23 @@ class AnnotationExportWorker(QThread):
         if not p.suffix:
             p = p.with_suffix(".pdf")
 
+        from openreview.core.preferences import PreferencesManager
+        prefs = PreferencesManager.instance().prefs
+        fmt = (self.image_format or getattr(prefs, "default_export_image_format", "jpg")).lower()
+        downscale_gt_fhd = getattr(prefs, "export_downscale_greater_than_fhd", True)
+        jpg_quality = getattr(prefs, "export_jpg_quality", 85)
+        png_mode = getattr(prefs, "export_png_mode", "png8")
+        png_dither = getattr(prefs, "export_png_dither", True)
+        png_comp = getattr(prefs, "export_png_compression", 4)
+
         entries = []
         render_steps = len(self.frames)
         total_steps = render_steps * 2 + 1
-        png_dir = None
-        saved_png_count = 0
-        if self.export_png_frames:
-            png_dir = p.parent / f"{p.stem}_frames"
-            png_dir.mkdir(parents=True, exist_ok=True)
+        img_dir = None
+        saved_img_count = 0
+        if self.export_image_frames:
+            img_dir = p.parent / f"{p.stem}_frames"
+            img_dir.mkdir(parents=True, exist_ok=True)
 
         for idx, f in enumerate(self.frames):
             if self._is_cancelled:
@@ -112,10 +130,23 @@ class AnnotationExportWorker(QThread):
             if isinstance(img, (tuple, list)):
                 img = next((x for x in img if isinstance(x, np.ndarray)), None)
 
-            if self.export_png_frames and png_dir and img is not None:
-                png_file = png_dir / f"frame_{f:04d}.png"
-                MediaExporter.save_image_file(img, png_file)
-                saved_png_count += 1
+            if self.export_image_frames and img_dir and img is not None:
+                save_img = img
+                if downscale_gt_fhd and (save_img.shape[1] > 1920 or save_img.shape[0] > 1080):
+                    half_w = max(1, save_img.shape[1] // 2)
+                    half_h = max(1, save_img.shape[0] // 2)
+                    save_img = MediaExporter.resize_frame(save_img, half_w, half_h)
+
+                frame_file = img_dir / f"frame_{f:04d}.{fmt}"
+                MediaExporter.save_image_file(
+                    save_img,
+                    frame_file,
+                    quality=jpg_quality,
+                    png_mode=png_mode,
+                    dither=png_dither,
+                    compression=str(png_comp),
+                )
+                saved_img_count += 1
 
             note = self.store.get_frame_note(f)
             tc = frame_to_timecode(f, self.fps)
@@ -146,13 +177,13 @@ class AnnotationExportWorker(QThread):
         )
         self.progress_updated.emit(total_steps, total_steps, "Done")
 
-        exported_png_msg = ""
-        if self.export_png_frames and png_dir:
-            exported_png_msg = f"\n\nAlso exported {saved_png_count} annotated PNG frames to:\n{png_dir}"
+        exported_img_msg = ""
+        if self.export_image_frames and img_dir:
+            exported_img_msg = f"\n\nAlso exported {saved_img_count} annotated {fmt.upper()} frames to:\n{img_dir}"
 
         self.result_success = True
         self.result_title = "Export Successful"
-        self.result_message = f"Exported structured PDF review sheet to:\n{pdf_path}{exported_png_msg}"
+        self.result_message = f"Exported structured PDF review sheet to:\n{pdf_path}{exported_img_msg}"
 
     def _run_sequence_export(self) -> None:
         if not self.render_frame_callback:
@@ -161,12 +192,21 @@ class AnnotationExportWorker(QThread):
             self.result_message = "Direct frame render callback not available."
             return
 
+        from openreview.core.preferences import PreferencesManager
+        prefs = PreferencesManager.instance().prefs
+        downscale_gt_fhd = getattr(prefs, "export_downscale_greater_than_fhd", True)
+        jpg_quality = getattr(prefs, "export_jpg_quality", 85)
+        png_mode = getattr(prefs, "export_png_mode", "png8")
+        png_dither = getattr(prefs, "export_png_dither", True)
+        png_comp = getattr(prefs, "export_png_compression", 4)
+
         p = self.target_path
         out_dir = p.parent / (p.stem + "_sequence")
         out_dir.mkdir(parents=True, exist_ok=True)
         seq_frames = list(range(self.seq_start_frame, self.seq_end_frame + 1))
         total = len(seq_frames)
         count = 0
+        ext = p.suffix.lstrip(".").lower() or self.image_format or "png"
 
         for idx, f in enumerate(seq_frames):
             if self._is_cancelled:
@@ -175,9 +215,20 @@ class AnnotationExportWorker(QThread):
             img = self.render_frame_callback(f)
             if isinstance(img, (tuple, list)):
                 img = next((x for x in img if isinstance(x, np.ndarray)), None)
-            out_file = out_dir / f"{p.stem}.{f:04d}.png"
-            MediaExporter.save_image_file(img, out_file)
-            count += 1
+
+            if img is not None:
+                if downscale_gt_fhd and (img.shape[1] > 1920 or img.shape[0] > 1080):
+                    img = MediaExporter.resize_frame(img, max(1, img.shape[1] // 2), max(1, img.shape[0] // 2))
+                out_file = out_dir / f"{p.stem}.{f:04d}.{ext}"
+                MediaExporter.save_image_file(
+                    img,
+                    out_file,
+                    quality=jpg_quality,
+                    png_mode=png_mode,
+                    dither=png_dither,
+                    compression=str(png_comp),
+                )
+                count += 1
 
         self.progress_updated.emit(total, total, "Done")
         self.result_success = True
@@ -191,15 +242,35 @@ class AnnotationExportWorker(QThread):
             self.result_message = "Direct viewport render callback not available."
             return
 
+        from openreview.core.preferences import PreferencesManager
+        prefs = PreferencesManager.instance().prefs
+        downscale_gt_fhd = getattr(prefs, "export_downscale_greater_than_fhd", True)
+        jpg_quality = getattr(prefs, "export_jpg_quality", 85)
+        png_mode = getattr(prefs, "export_png_mode", "png8")
+        png_dither = getattr(prefs, "export_png_dither", True)
+        png_comp = getattr(prefs, "export_png_compression", 4)
+
         p = self.target_path
+        ext = p.suffix.lstrip(".").lower() or self.image_format or "png"
+
         if len(self.frames) == 1:
             f = self.frames[0]
             self.progress_updated.emit(0, 1, f"Rendering frame {f}...")
             img = self.render_frame_callback(f)
             if isinstance(img, (tuple, list)):
                 img = next((x for x in img if isinstance(x, np.ndarray)), None)
-            out_file = p if p.suffix.lower() == ".png" else p.with_suffix(".png")
-            MediaExporter.save_image_file(img, out_file)
+            if img is not None and downscale_gt_fhd and (img.shape[1] > 1920 or img.shape[0] > 1080):
+                img = MediaExporter.resize_frame(img, max(1, img.shape[1] // 2), max(1, img.shape[0] // 2))
+
+            out_file = p if p.suffix else p.with_suffix(f".{ext}")
+            MediaExporter.save_image_file(
+                img,
+                out_file,
+                quality=jpg_quality,
+                png_mode=png_mode,
+                dither=png_dither,
+                compression=str(png_comp),
+            )
             self.progress_updated.emit(1, 1, "Done")
             self.result_success = True
             self.result_title = "Export Successful"
@@ -216,8 +287,17 @@ class AnnotationExportWorker(QThread):
                 img = self.render_frame_callback(f)
                 if isinstance(img, (tuple, list)):
                     img = next((x for x in img if isinstance(x, np.ndarray)), None)
-                out_file = out_dir / f"annotated.{f:04d}.png"
-                MediaExporter.save_image_file(img, out_file)
+                if img is not None and downscale_gt_fhd and (img.shape[1] > 1920 or img.shape[0] > 1080):
+                    img = MediaExporter.resize_frame(img, max(1, img.shape[1] // 2), max(1, img.shape[0] // 2))
+                out_file = out_dir / f"annotated.{f:04d}.{ext}"
+                MediaExporter.save_image_file(
+                    img,
+                    out_file,
+                    quality=jpg_quality,
+                    png_mode=png_mode,
+                    dither=png_dither,
+                    compression=str(png_comp),
+                )
                 count += 1
 
             self.progress_updated.emit(total, total, "Done")
@@ -612,16 +692,23 @@ class AnnotationManagerWidget(QWidget):
             self.refresh_table()
 
     def _on_export_clicked(self) -> None:
-        """Handle comprehensive export (PNG frames default, structured PDF report, sequences, JSON, Markdown, CSV)."""
+        """Handle comprehensive export (JPEG/PNG frames default, structured PDF report, sequences, JSON, Markdown, CSV)."""
         frames = self.store.get_annotated_frames()
         if not frames:
             QMessageBox.information(self, "No Annotations", "There are no annotations or notes to export.")
             return
 
+        from openreview.core.preferences import PreferencesManager
+        prefs = PreferencesManager.instance().prefs
+        default_fmt = getattr(prefs, "default_export_image_format", "jpg").lower()
+        fmt_upper = default_fmt.upper()
+
         file_types = (
-            "Burned-in PNG Frames (*.png);;"
+            f"Burned-in {fmt_upper} Frames (*.{default_fmt});;"
             "PDF Review Sheet (*.pdf);;"
-            "Annotated Image Sequence (*.png);;"
+            f"Annotated Image Sequence (*.{default_fmt});;"
+            "Burned-in JPEG Frames (*.jpg);;"
+            "Burned-in PNG Frames (*.png);;"
             "JSON Vector Annotations (*.json);;"
             "Markdown Review Report (*.md);;"
             "CSV Review Notes (*.csv)"
@@ -629,7 +716,7 @@ class AnnotationManagerWidget(QWidget):
         path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "Export Annotations & Review Notes",
-            "annotated_frame.png",
+            f"annotated_frame.{default_fmt}",
             file_types,
         )
         if not path:
@@ -642,12 +729,12 @@ class AnnotationManagerWidget(QWidget):
                     p = p.with_suffix(".pdf")
                 reply = QMessageBox.question(
                     self,
-                    "Export PNG Frames?",
-                    "Do you also want to export the individual annotated frames as PNG images?",
+                    f"Export {fmt_upper} Frames?",
+                    f"Do you also want to export the individual annotated frames as {fmt_upper} images?",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.Yes,
                 )
-                export_png = (reply == QMessageBox.StandardButton.Yes)
+                export_images = (reply == QMessageBox.StandardButton.Yes)
                 active_src = self.source_path
                 if not active_src:
                     win = self.window()
@@ -661,7 +748,9 @@ class AnnotationManagerWidget(QWidget):
                     store=self.store,
                     fps=self.clock.fps,
                     render_frame_callback=self.render_frame_callback,
-                    export_png_frames=export_png,
+                    export_png_frames=export_images,
+                    export_image_frames=export_images,
+                    image_format=default_fmt,
                     source_path=active_src,
                     parent=self,
                 )
@@ -679,13 +768,14 @@ class AnnotationManagerWidget(QWidget):
                     store=self.store,
                     fps=self.clock.fps,
                     render_frame_callback=self.render_frame_callback,
+                    image_format=p.suffix.lstrip(".").lower() or default_fmt,
                     seq_start_frame=self.clock.start_frame,
                     seq_end_frame=self.clock.end_frame,
                     parent=self,
                 )
                 self._run_export_worker(worker, "Exporting Image Sequence", "Rendering sequence frames...", seq_frames_count)
 
-            elif "Burned-in" in selected_filter or p.suffix.lower() == ".png":
+            elif "Burned-in" in selected_filter or p.suffix.lower() in (".png", ".jpg", ".jpeg"):
                 if not self.render_frame_callback:
                     QMessageBox.warning(self, "Renderer Unavailable", "Direct viewport render callback not available.")
                     return
@@ -696,9 +786,11 @@ class AnnotationManagerWidget(QWidget):
                     store=self.store,
                     fps=self.clock.fps,
                     render_frame_callback=self.render_frame_callback,
+                    image_format=p.suffix.lstrip(".").lower() or default_fmt,
                     parent=self,
                 )
-                self._run_export_worker(worker, "Exporting PNG Frames", "Rendering frames...", len(frames))
+                target_fmt_str = p.suffix.lstrip(".").upper() or fmt_upper
+                self._run_export_worker(worker, f"Exporting {target_fmt_str} Frames", "Rendering frames...", len(frames))
 
             elif "JSON" in selected_filter or p.suffix.lower() == ".json":
                 self.store.export_to_json(p)

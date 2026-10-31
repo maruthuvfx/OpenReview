@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QMenu,
 )
 from openreview.color.ocio_manager import OCIOManager
+from openreview.color.standard_colorspaces import STANDARD_COLORSPACES
 
 
 def gain_to_fstop_label(gain: float) -> str:
@@ -80,7 +81,7 @@ class NukeSlider(QSlider):
         self._default_value: int = default_val
         self._ticks = ticks or []
         self.setFixedHeight(34)
-        self.setMinimumWidth(45)
+        self.setMinimumWidth(75)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setTracking(True)
         self.setMouseTracking(True)
@@ -193,6 +194,7 @@ class TopControlBar(QFrame):
     def __init__(self, ocio_manager: OCIOManager, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.ocio = ocio_manager
+        self._color_management_mode: str = "standard"
         self._current_channel_mode: int = 0
         self._gain: float = 1.0
         self._saturation: float = 1.0
@@ -390,7 +392,7 @@ class TopControlBar(QFrame):
         )
         self.gain_slider.setToolTip("Gain (Logarithmic 0.015625 to 64.0) | Ctrl+Click to reset to 1.0")
         self.gain_slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.gain_slider.setMinimumWidth(45)
+        self.gain_slider.setMinimumWidth(75)
         self.gain_slider.valueChanged.connect(self._on_gain_slider_changed)
         self.gain_slider.sliderMoved.connect(self._on_gain_slider_changed)
         layout.addWidget(self.gain_slider, 1)
@@ -430,7 +432,7 @@ class TopControlBar(QFrame):
         )
         self.gam_slider.setToolTip("Gamma (0.0 to 4.0, Center = 1.0) | Ctrl+Click to reset to 1.0")
         self.gam_slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.gam_slider.setMinimumWidth(45)
+        self.gam_slider.setMinimumWidth(75)
         self.gam_slider.valueChanged.connect(self._on_gam_slider_changed)
         self.gam_slider.sliderMoved.connect(self._on_gam_slider_changed)
         layout.addWidget(self.gam_slider, 1)
@@ -470,7 +472,7 @@ class TopControlBar(QFrame):
         )
         self.sat_slider.setToolTip("Saturation (0.0 to 4.0, Center = 1.0) | Ctrl+Click to reset to 1.0")
         self.sat_slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.sat_slider.setMinimumWidth(45)
+        self.sat_slider.setMinimumWidth(75)
         self.sat_slider.valueChanged.connect(self._on_sat_slider_changed)
         self.sat_slider.sliderMoved.connect(self._on_sat_slider_changed)
         layout.addWidget(self.sat_slider, 1)
@@ -556,15 +558,10 @@ class TopControlBar(QFrame):
 
         self.input_combo = QComboBox(self)
         self.input_combo.setToolTip("Source Input Colorspace")
-        self.input_combo.addItem("sRGB (Texture/Video)", 0)
-        self.input_combo.addItem("ACEScg / Linear", 1)
-        self.input_combo.addItem("Raw / Unmanaged", 2)
-        self.input_combo.addItem("Cineon / DPX Log", 3)
-        self.input_combo.addItem("ALEXA LogC", 4)
-        self.input_combo.addItem("ALEXA LogC Film", 5)
-        self.input_combo.addItem("Rec.709", 6)
-        self.input_combo.addItem("File Gamma 2.2", 7)
-        self.input_combo.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.input_combo.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.input_combo.setMinimumWidth(125)
+        self.input_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.input_combo.setMinimumContentsLength(12)
         self.input_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.input_combo.currentIndexChanged.connect(self._on_color_transform_changed)
         layout.addWidget(self.input_combo)
@@ -576,15 +573,15 @@ class TopControlBar(QFrame):
 
         self.view_combo = QComboBox(self)
         self.view_combo.setToolTip("Display View Transform")
-        self.view_combo.addItem("sRGB - Display", 0)
-        self.view_combo.addItem("ACES 1.0 - SDR Video", 1)
-        self.view_combo.addItem("Raw / Pass-Through", 2)
-        self.view_combo.addItem("Rec.709 - Display", 3)
-        self.view_combo.addItem("File Gamma 2.2", 4)
-        self.view_combo.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.view_combo.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.view_combo.setMinimumWidth(85)
+        self.view_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.view_combo.setMinimumContentsLength(7)
         self.view_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.view_combo.currentIndexChanged.connect(self._on_color_transform_changed)
         layout.addWidget(self.view_combo)
+
+        self.setup_standard_spaces(default_view="sRGB", default_input="linear")
 
         layout.addSpacing(6)
 
@@ -998,10 +995,62 @@ class TopControlBar(QFrame):
     # --------------------------------------------------------------------------
     # Colorspace Handlers
     # --------------------------------------------------------------------------
+    def setup_standard_spaces(self, default_view: str = "sRGB", default_input: str = "linear") -> None:
+        """Populate input and view combos with standard colorspaces."""
+        self._color_management_mode = "standard"
+        if hasattr(self.ocio, "color_management_mode"):
+            self.ocio.color_management_mode = "standard"
+
+        self.input_combo.blockSignals(True)
+        self.input_combo.clear()
+        for cs in STANDARD_COLORSPACES:
+            self.input_combo.addItem(cs.label, cs.id)
+            self.input_combo.setItemData(self.input_combo.count() - 1, cs.description, Qt.ItemDataRole.ToolTipRole)
+
+        in_item = next((cs for cs in STANDARD_COLORSPACES if cs.name.lower() == default_input.lower()), STANDARD_COLORSPACES[0])
+        in_idx = self.input_combo.findData(in_item.id)
+        if in_idx >= 0:
+            self.input_combo.setCurrentIndex(in_idx)
+        self.input_combo.blockSignals(False)
+
+        self.view_combo.blockSignals(True)
+        self.view_combo.clear()
+        for cs in STANDARD_COLORSPACES:
+            self.view_combo.addItem(cs.label, cs.id)
+            self.view_combo.setItemData(self.view_combo.count() - 1, cs.description, Qt.ItemDataRole.ToolTipRole)
+
+        view_item = next((cs for cs in STANDARD_COLORSPACES if cs.name.lower() == default_view.lower()), STANDARD_COLORSPACES[1])
+        vw_idx = self.view_combo.findData(view_item.id)
+        if vw_idx >= 0:
+            self.view_combo.setCurrentIndex(vw_idx)
+        self.view_combo.blockSignals(False)
+
+        self._on_color_transform_changed()
+
+    def set_color_management_mode(self, mode: str, default_view: str = "sRGB", default_input: str = "linear") -> None:
+        """Switch top bar between Standard Colorspaces and OpenColorIO mode."""
+        self._color_management_mode = mode
+        if hasattr(self.ocio, "color_management_mode"):
+            self.ocio.color_management_mode = mode
+        if mode == "standard":
+            self.setup_standard_spaces(default_view, default_input)
+        else:
+            spaces = self.ocio.get_color_spaces()
+            views = self.ocio.get_views()
+            self.update_ocio_spaces(spaces, views)
+
     def _on_color_transform_changed(self) -> None:
         in_idx = self.input_combo.currentData()
         view_idx = self.view_combo.currentData()
-        self.color_transforms_changed.emit(in_idx, view_idx)
+        if in_idx is None:
+            in_idx = 0
+        if view_idx is None:
+            view_idx = 1
+        if hasattr(self.ocio, "standard_input_id"):
+            self.ocio.standard_input_id = int(in_idx)
+        if hasattr(self.ocio, "standard_view_id"):
+            self.ocio.standard_view_id = int(view_idx)
+        self.color_transforms_changed.emit(int(in_idx), int(view_idx))
 
     def set_color_spaces(self, input_space_idx: int, view_transform_idx: int) -> None:
         in_cb_idx = self.input_combo.findData(input_space_idx)
@@ -1016,31 +1065,27 @@ class TopControlBar(QFrame):
             self.view_combo.setCurrentIndex(vw_cb_idx)
             self.view_combo.blockSignals(False)
 
-        self.color_transforms_changed.emit(input_space_idx, view_transform_idx)
+        if hasattr(self.ocio, "standard_input_id"):
+            self.ocio.standard_input_id = int(input_space_idx)
+        if hasattr(self.ocio, "standard_view_id"):
+            self.ocio.standard_view_id = int(view_transform_idx)
+        self.color_transforms_changed.emit(int(input_space_idx), int(view_transform_idx))
 
     def set_ocio_context(self, display: str, view: str) -> None:
         """Update top bar combo boxes to reflect active OCIO display/view."""
-        vw_idx = 0
-        v_low = view.lower()
-        if "aces" in v_low:
-            vw_idx = 1
-        elif "raw" in v_low:
-            vw_idx = 2
-        elif "rec709" in v_low or "rec.709" in v_low:
-            vw_idx = 3
-        elif "gamma" in v_low:
-            vw_idx = 4
-
-        cb_idx = self.view_combo.findData(vw_idx)
-        if cb_idx >= 0:
+        vw_idx = self.view_combo.findText(view)
+        if vw_idx >= 0:
             self.view_combo.blockSignals(True)
-            self.view_combo.setCurrentIndex(cb_idx)
+            self.view_combo.setCurrentIndex(vw_idx)
             self.view_combo.blockSignals(False)
-
         self._on_color_transform_changed()
 
     def update_ocio_spaces(self, spaces: list[str], views: list[str]) -> None:
         """Update input and view combos with spaces and views from custom OCIO config."""
+        self._color_management_mode = "ocio"
+        if hasattr(self.ocio, "color_management_mode"):
+            self.ocio.color_management_mode = "ocio"
+
         if spaces:
             self.input_combo.blockSignals(True)
             self.input_combo.clear()

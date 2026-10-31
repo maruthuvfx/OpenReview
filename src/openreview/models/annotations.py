@@ -362,3 +362,64 @@ def frame_to_timecode(frame: int, fps: float = 24.0) -> str:
     minutes = (total_seconds % 3600) // 60
     seconds = total_seconds % 60
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}:{rem_frames:02d}"
+
+
+class PerMediaAnnotations(QObject):
+    """
+    Separates notes and annotations per media asset.
+    On a switch, stashes the store's contents under the media being left
+    and restores whatever was stashed for the media being opened.
+    """
+
+    def __init__(self, parent: Optional[QObject] = None):
+        super().__init__(parent)
+        self._stashes: Dict[str, Dict[str, Any]] = {}
+
+    def stash(self, media_key: str, store: AnnotationStore) -> None:
+        """Stash current annotation store state under media_key."""
+        if not media_key or not store:
+            return
+        self._stashes[str(media_key)] = store.to_dict()
+
+    def restore(self, media_key: str, store: AnnotationStore) -> None:
+        """Restore stashed annotations for media_key, or clear if none exist."""
+        if not store:
+            return
+        if not media_key:
+            store.clear_all()
+            return
+        key_str = str(media_key)
+        if key_str in self._stashes:
+            store.from_dict(self._stashes[key_str])
+        else:
+            store.clear_all()
+
+    def has_annotations(self, media_key: str) -> bool:
+        """Check if annotations exist in stash for media_key."""
+        key_str = str(media_key)
+        data = self._stashes.get(key_str)
+        if not data:
+            return False
+        for k, v in data.items():
+            if k == "__notes__" and isinstance(v, dict) and any(v.values()):
+                return True
+            if isinstance(v, list) and len(v) > 0:
+                return True
+        return False
+
+    def clear(self) -> None:
+        """Clear all media stashes."""
+        self._stashes.clear()
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize all media stashes for session persistence."""
+        return dict(self._stashes)
+
+    def from_dict(self, data: Dict[str, Any]) -> None:
+        """Restore all media stashes from serialized dictionary."""
+        self._stashes.clear()
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if isinstance(v, dict):
+                    self._stashes[str(k)] = v
+

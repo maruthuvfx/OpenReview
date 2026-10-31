@@ -39,7 +39,9 @@ class SourceItem:
     fps: float = 24.0
     width: int = 1920
     height: int = 1080
-    colorspace: str = "ACEScg"
+    colorspace: str = "linear"
+    input_space: int = 0
+    ocio_colorspace: Optional[str] = None
     codec: str = "Raw"
     parent_folder_id: Optional[str] = None
     orig_start_frame: Optional[int] = None
@@ -48,12 +50,47 @@ class SourceItem:
     manual_out: Optional[int] = None
     is_proxy: bool = False
     proxy_resolved: bool = True
+    premultiplied: Optional[bool] = None
 
     def __post_init__(self):
+        if self.colorspace:
+            from openreview.color.standard_colorspaces import COLORSPACE_BY_NAME, COLORSPACE_BY_ID
+            cs_lower = str(self.colorspace).lower().strip()
+            if cs_lower in COLORSPACE_BY_NAME:
+                self.input_space = COLORSPACE_BY_NAME[cs_lower].id
+                self.colorspace = COLORSPACE_BY_NAME[cs_lower].name
+            elif "aces" in cs_lower:
+                self.input_space = 0
+                self.colorspace = "linear"
+            elif "cineon" in cs_lower:
+                self.input_space = 3
+                self.colorspace = "Cineon"
+            elif "709" in cs_lower:
+                self.input_space = 2
+                self.colorspace = "rec709"
+            elif "raw" in cs_lower:
+                self.input_space = 10
+                self.colorspace = "Raw"
+            elif "srgb" in cs_lower:
+                self.input_space = 1
+                self.colorspace = "sRGB"
+            elif self.input_space is not None and self.input_space in COLORSPACE_BY_ID:
+                self.colorspace = COLORSPACE_BY_ID[self.input_space].name
+        elif self.input_space is not None:
+            from openreview.color.standard_colorspaces import COLORSPACE_BY_ID
+            if self.input_space in COLORSPACE_BY_ID:
+                self.colorspace = COLORSPACE_BY_ID[self.input_space].name
+
         if self.orig_start_frame is None:
             self.orig_start_frame = self.start_frame
         if self.orig_end_frame is None:
             self.orig_end_frame = self.end_frame
+        if self.premultiplied is None:
+            ext = os.path.splitext(self.path)[1].lower() if self.path else ""
+            if ext in (".png", ".jpg", ".jpeg", ".bmp"):
+                self.premultiplied = False
+            else:
+                self.premultiplied = True
 
     def reset_in_out(self) -> None:
         """Reset clip in/out range back to original full media duration."""
@@ -109,10 +146,13 @@ class SourceItem:
             "width": self.width,
             "height": self.height,
             "colorspace": self.colorspace,
+            "input_space": int(self.input_space),
+            "ocio_colorspace": self.ocio_colorspace,
             "codec": self.codec,
             "parent_folder_id": self.parent_folder_id,
             "is_proxy": self.is_proxy,
             "proxy_resolved": self.proxy_resolved,
+            "premultiplied": bool(self.premultiplied),
         }
 
     @classmethod
@@ -131,7 +171,9 @@ class SourceItem:
             fps=float(data.get("fps", 24.0)),
             width=int(data.get("width", 1920)),
             height=int(data.get("height", 1080)),
-            colorspace=data.get("colorspace", "ACEScg"),
+            colorspace=data.get("colorspace", "linear"),
+            input_space=int(data.get("input_space", 0)),
+            ocio_colorspace=data.get("ocio_colorspace"),
             codec=data.get("codec", "Raw"),
             parent_folder_id=data.get("parent_folder_id"),
             orig_start_frame=int(data.get("orig_start_frame", sf)),
@@ -140,6 +182,7 @@ class SourceItem:
             manual_out=int(m_out) if m_out is not None else None,
             is_proxy=bool(data.get("is_proxy", False)),
             proxy_resolved=bool(data.get("proxy_resolved", True)),
+            premultiplied=data.get("premultiplied"),
         )
 
 
@@ -522,45 +565,19 @@ class LayoutView:
 
 
 def detect_media_colorspace(file_path: str, ext: str) -> str:
-    """
-    Auto-detect appropriate input colorspace using multi-tier strategy:
-    1. File format rules (.exr, .hdr -> ACEScg; .dpx, .cin -> Cineon Log)
-    2. Video container / EXR metadata probe via extract_media_metadata
-    3. Fallback to sRGB (Texture/Video)
-    """
-    ext_lower = ext.lower()
-    if ext_lower in (".exr", ".hdr"):
-        return "ACEScg"
-    if ext_lower in (".dpx", ".cin"):
-        return "Cineon Log"
-
-    # Metadata probe for video containers & still images
+    """Auto-detect appropriate input colorspace using standard colorspaces engine."""
     try:
-        meta = extract_media_metadata(file_path)
-        cs_tag = (meta.get("color_space") or "").lower()
-        cp_tag = (meta.get("color_primaries") or "").lower()
-        ct_tag = (meta.get("color_transfer") or "").lower()
-
-        # Check for Rec.709 / BT.709
-        if "709" in cs_tag or "709" in cp_tag or "709" in ct_tag or "bt709" in cs_tag:
-            return "Rec.709"
-        # Check for Log curves
-        if "log" in cs_tag or "log" in ct_tag:
-            if "arri" in cs_tag or "arri" in ct_tag or "alexa" in cs_tag:
-                return "ARRI LogC v3"
-            return "Cineon Log"
-        # Check for Linear / ACES
-        if "aces" in cs_tag or "acescg" in cs_tag:
-            return "ACEScg"
-        if "linear" in cs_tag or "linear" in ct_tag:
-            return "Linear sRGB"
-        # Check for Gamma 2.2
-        if "2.2" in ct_tag or "gamma" in ct_tag:
-            return "Gamma 2.2"
+        from openreview.color.standard_colorspaces import detect_media_input_colorspace
+        meta = {}
+        if file_path and os.path.exists(file_path):
+            try:
+                meta = extract_media_metadata(file_path)
+            except Exception:
+                meta = {}
+        cs_info = detect_media_input_colorspace(file_path, meta)
+        return cs_info.name
     except Exception:
-        pass
-
-    return "sRGB (Texture/Video)"
+        return "sRGB"
 
 
 def create_proxy_source_item(path: str, parent_folder_id: Optional[str] = None) -> SourceItem:
@@ -578,7 +595,8 @@ def create_proxy_source_item(path: str, parent_folder_id: Optional[str] = None) 
         fps=24.0,
         width=1920,
         height=1080,
-        colorspace="sRGB (Texture/Video)",
+        colorspace="linear",
+        input_space=0,
         codec="Probing...",
         parent_folder_id=parent_folder_id,
         is_proxy=True,
@@ -589,10 +607,13 @@ def create_proxy_source_item(path: str, parent_folder_id: Optional[str] = None) 
 def build_source_item_from_path(path: str, parent_folder_id: Optional[str] = None) -> Optional[SourceItem]:
     """
     Inspect media file or sequence on disk and build a SourceItem.
+    Auto-detects and preserves per-clip colorspace from container/image metadata.
     Thread-safe function suitable for background worker execution.
     """
     if not path or not os.path.exists(path):
         return None
+
+    from openreview.color.standard_colorspaces import detect_media_input_colorspace
 
     name = os.path.basename(path)
     ext = os.path.splitext(path)[1].lower()
@@ -602,7 +623,11 @@ def build_source_item_from_path(path: str, parent_folder_id: Optional[str] = Non
     if seq_info and len(seq_info.available_frames) > 1:
         pat_name = f"{seq_info.prefix}{seq_info.separator}{'#' * seq_info.padding}{seq_info.extension}"
         first_frame_path = seq_info.frame_path(seq_info.start_frame) if hasattr(seq_info, "frame_path") else path
-        cs = detect_media_colorspace(first_frame_path, seq_info.extension)
+        try:
+            meta = extract_media_metadata(first_frame_path)
+        except Exception:
+            meta = {}
+        det_cs = detect_media_input_colorspace(first_frame_path, meta)
         return SourceItem(
             name=pat_name,
             path=path,
@@ -612,12 +637,17 @@ def build_source_item_from_path(path: str, parent_folder_id: Optional[str] = Non
             fps=24.0,
             width=1920,
             height=1080,
-            colorspace=cs,
+            colorspace=det_cs.name,
+            input_space=det_cs.id,
             codec="Image Sequence",
             parent_folder_id=parent_folder_id,
         )
     elif is_video_file(path):
-        cs = detect_media_colorspace(path, ext)
+        try:
+            meta = extract_media_metadata(path)
+        except Exception:
+            meta = {}
+        det_cs = detect_media_input_colorspace(path, meta)
         try:
             reader = VideoMediaReader(path)
             return SourceItem(
@@ -629,7 +659,8 @@ def build_source_item_from_path(path: str, parent_folder_id: Optional[str] = Non
                 fps=reader.fps,
                 width=reader.width,
                 height=reader.height,
-                colorspace=cs,
+                colorspace=det_cs.name,
+                input_space=det_cs.id,
                 codec="Video",
                 parent_folder_id=parent_folder_id,
             )
@@ -641,7 +672,8 @@ def build_source_item_from_path(path: str, parent_folder_id: Optional[str] = Non
                 start_frame=1,
                 end_frame=100,
                 fps=24.0,
-                colorspace=cs,
+                colorspace=det_cs.name,
+                input_space=det_cs.id,
                 parent_folder_id=parent_folder_id,
             )
     elif ext in (".wav", ".mp3", ".aac", ".flac", ".ogg", ".aiff", ".m4a"):
@@ -653,12 +685,17 @@ def build_source_item_from_path(path: str, parent_folder_id: Optional[str] = Non
             end_frame=1,
             fps=24.0,
             colorspace="Raw",
+            input_space=10,
             codec="Audio",
             parent_folder_id=parent_folder_id,
         )
     else:
         # Still image or general file
-        cs = detect_media_colorspace(path, ext)
+        try:
+            meta = extract_media_metadata(path)
+        except Exception:
+            meta = {}
+        det_cs = detect_media_input_colorspace(path, meta)
         return SourceItem(
             name=name,
             path=path,
@@ -666,7 +703,8 @@ def build_source_item_from_path(path: str, parent_folder_id: Optional[str] = Non
             start_frame=1001,
             end_frame=1001,
             fps=24.0,
-            colorspace=cs,
+            colorspace=det_cs.name,
+            input_space=det_cs.id,
             codec="Still Image",
             parent_folder_id=parent_folder_id,
         )

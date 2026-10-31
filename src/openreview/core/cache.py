@@ -425,6 +425,9 @@ class RingBufferCache(QObject):
 
         self._lock = threading.Lock()
         self._active_source_id: Optional[str] = None
+        self._pinned_keys: set[Any] = set()
+        self._proxy_keys: set[Any] = set()  # (source_id, frame) or int frame -> proxy tag
+        self._last_emit_ts: float = 0.0
         # Tier 1 Storage: Primary display RGBA textures for real-time playback
         # Storage: (source_id, frame) or int frame -> np.ndarray
         self._frames: Dict[Any, Any] = {}
@@ -463,12 +466,30 @@ class RingBufferCache(QObject):
         with self._lock:
             return self._max_memory_bytes / (1024.0 * 1024.0)
 
+    def pin_frame(self, source_id: Optional[str], frame: int) -> None:
+        """Pin a frame in the cache to prevent eviction while it is actively being displayed/streamed."""
+        key = (source_id, frame) if source_id else frame
+        with self._lock:
+            self._pinned_keys.add(key)
+
+    def unpin_frame(self, source_id: Optional[str], frame: int) -> None:
+        """Unpin a previously pinned frame."""
+        key = (source_id, frame) if source_id else frame
+        with self._lock:
+            self._pinned_keys.discard(key)
+
+    def is_pinned(self, source_id: Optional[str], frame: int) -> bool:
+        """Check if a frame is currently pinned."""
+        key = (source_id, frame) if source_id else frame
+        with self._lock:
+            return key in self._pinned_keys
+
     def _refresh_auto_budget_locked(self, force: bool = False) -> None:
         """Recalculate memory budget from live available system RAM while lock is held."""
         if not self._auto_memory_budget:
             return
         now = time.monotonic()
-        if not force and (now - self._last_auto_refresh_ts) < 1.0:
+        if not force and (now - self._last_auto_refresh_ts) < 2.5:
             return
         self._last_auto_refresh_ts = now
         new_mb = compute_dynamic_ram_budget_mb(self._used_bytes)
@@ -699,6 +720,7 @@ class RingBufferCache(QObject):
                 b = self._frame_bytes.pop(k, 0)
                 self._frames.pop(k, None)
                 self._frame_mtimes.pop(k, None)
+                self._proxy_keys.discard(k)
                 self._used_bytes -= b
         self._emit_status()
 
@@ -709,27 +731,46 @@ class RingBufferCache(QObject):
     # --------------------------------------------------------------------------
     # Source-Level Cache Access
     # --------------------------------------------------------------------------
-    def get_source_frame(self, source_id: str, frame: int) -> Optional[np.ndarray]:
+    def is_source_frame_proxy(self, source_id: str, frame: int) -> bool:
+        """Check if a specific source frame in RAM is a downsampled proxy."""
+        if not source_id:
+            return False
+        with self._lock:
+            return (source_id, frame) in self._proxy_keys
+
+    def is_frame_proxy(self, frame: int, source_id: Optional[str] = None) -> bool:
+        """Check if a cached frame is a downsampled proxy."""
+        with self._lock:
+            sid = source_id or self._active_source_id
+            if sid and (sid, frame) in self._proxy_keys:
+                return True
+            return frame in self._proxy_keys
+
+    def get_source_frame(self, source_id: str, frame: int, allow_proxy: bool = True) -> Optional[np.ndarray]:
         """Retrieve a cached frame for a specific input source (RAM first, then Temp Disk)."""
         if not source_id:
             return None
         with self._lock:
-            ram_res = self._frames.get((source_id, frame))
-            if ram_res is not None:
-                return ram_res
+            key = (source_id, frame)
+            if not (not allow_proxy and key in self._proxy_keys):
+                ram_res = self._frames.get(key)
+                if ram_res is not None:
+                    return ram_res
         if self._disk_cache_enabled and self._disk_cache:
             disk_res = self._disk_cache.get(source_id, frame)
             if disk_res is not None:
                 return disk_res
         return None
 
-    def has_source_frame(self, source_id: str, frame: int) -> bool:
+    def has_source_frame(self, source_id: str, frame: int, allow_proxy: bool = True) -> bool:
         """Check if a specific source frame is in RAM or Temp Disk cache."""
         if not source_id:
             return False
         with self._lock:
-            if (source_id, frame) in self._frames:
-                return True
+            key = (source_id, frame)
+            if key in self._frames:
+                if allow_proxy or (key not in self._proxy_keys):
+                    return True
         if self._disk_cache_enabled and self._disk_cache:
             return self._disk_cache.has(source_id, frame)
         return False
@@ -754,6 +795,7 @@ class RingBufferCache(QObject):
         image_data: np.ndarray,
         mtime: Optional[float] = None,
         write_to_disk: bool = False,
+        is_proxy: bool = False,
     ) -> None:
         """Store a frame for a specific source into the shared RAM pool (and optionally Temp Disk)."""
         if self._mode == CacheMode.OFF or not source_id or image_data is None:
@@ -776,12 +818,16 @@ class RingBufferCache(QObject):
             self._frames[key] = image_data
             self._frame_bytes[key] = byte_size
             self._frame_mtimes[key] = float(mtime) if mtime is not None else time.time()
+            if is_proxy:
+                self._proxy_keys.add(key)
+            else:
+                self._proxy_keys.discard(key)
             self._used_bytes += byte_size
 
             self._refresh_auto_budget_locked()
             self._evict_if_needed(self._current_playhead)
 
-        if write_to_disk and self._disk_cache_enabled and self._disk_cache:
+        if not is_proxy and write_to_disk and self._disk_cache_enabled and self._disk_cache:
             threading.Thread(
                 target=self._disk_cache.put,
                 args=(source_id, frame, image_data),
@@ -857,6 +903,7 @@ class RingBufferCache(QObject):
                 self._used_bytes -= self._frame_bytes.pop(k, 0)
                 self._frames.pop(k, None)
                 self._frame_mtimes.pop(k, None)
+                self._proxy_keys.discard(k)
 
             layer_keys = [k for k in self._layer_cache.keys() if k[0] == source_id]
             for k in layer_keys:
@@ -875,6 +922,7 @@ class RingBufferCache(QObject):
                 self._used_bytes -= self._frame_bytes.pop(key, 0)
                 self._frames.pop(key, None)
                 self._frame_mtimes.pop(key, None)
+                self._proxy_keys.discard(key)
         if self._disk_cache:
             self._disk_cache.delete(source_id, frame)
         self._emit_status()
@@ -885,12 +933,15 @@ class RingBufferCache(QObject):
         with self._lock:
             return self._frame_mtimes.get(key)
 
-    def get_source_cached_frames(self, source_id: str) -> Set[int]:
+    def get_source_cached_frames(self, source_id: str, allow_proxy: bool = True) -> Set[int]:
         """Return the set of RAM-cached frame numbers for a specific source."""
         if not source_id:
             return set()
         with self._lock:
-            return {k[1] for k in self._frames.keys() if isinstance(k, tuple) and k[0] == source_id}
+            return {
+                k[1] for k in self._frames.keys()
+                if isinstance(k, tuple) and k[0] == source_id and (allow_proxy or k not in self._proxy_keys)
+            }
 
     def get_source_disk_cached_frames(self, source_id: str) -> Set[int]:
         """Return the set of Temp-disk-cached frame numbers for a specific source."""
@@ -917,23 +968,31 @@ class RingBufferCache(QObject):
     # --------------------------------------------------------------------------
     # Timeline & Compatibility Cache Access
     # --------------------------------------------------------------------------
-    def get_frame(self, frame: int) -> Optional[Any]:
+    def get_frame(self, frame: int, allow_proxy: bool = True) -> Optional[Any]:
         """Retrieve a frame if present in RAM cache, else return None."""
         with self._lock:
             if self._active_source_id:
-                res = self._frames.get((self._active_source_id, frame))
-                if res is not None:
-                    return res
-            return self._frames.get(frame)
+                key = (self._active_source_id, frame)
+                if not (not allow_proxy and key in self._proxy_keys):
+                    res = self._frames.get(key)
+                    if res is not None:
+                        return res
+            if not (not allow_proxy and frame in self._proxy_keys):
+                return self._frames.get(frame)
+            return None
 
-    def has_frame(self, frame: int) -> bool:
+    def has_frame(self, frame: int, allow_proxy: bool = True) -> bool:
         """Check if frame exists in cache."""
         with self._lock:
-            if self._active_source_id and (self._active_source_id, frame) in self._frames:
-                return True
-            return frame in self._frames
+            if self._active_source_id:
+                key = (self._active_source_id, frame)
+                if key in self._frames:
+                    return allow_proxy or (key not in self._proxy_keys)
+            if frame in self._frames:
+                return allow_proxy or (frame not in self._proxy_keys)
+            return False
 
-    def put_frame(self, frame: int, image_data: Union[np.ndarray, tuple]) -> None:
+    def put_frame(self, frame: int, image_data: Union[np.ndarray, tuple], is_proxy: bool = False) -> None:
         """Store a frame array or (primary, reference) tuple into the cache."""
         if self._mode == CacheMode.OFF:
             return
@@ -957,6 +1016,10 @@ class RingBufferCache(QObject):
 
             self._frames[key] = image_data
             self._frame_bytes[key] = byte_size
+            if is_proxy:
+                self._proxy_keys.add(key)
+            else:
+                self._proxy_keys.discard(key)
             self._used_bytes += byte_size
 
             self._refresh_auto_budget_locked()
@@ -970,6 +1033,7 @@ class RingBufferCache(QObject):
             self._frames.clear()
             self._frame_bytes.clear()
             self._frame_mtimes.clear()
+            self._proxy_keys.clear()
             self._used_bytes = 0
             self._layer_cache.clear()
             self._layer_bytes.clear()
@@ -982,11 +1046,13 @@ class RingBufferCache(QObject):
         """Inform the cache of the current playhead position to prioritize prefetch/retention."""
         self._current_playhead = playhead
 
-    def get_cached_frames(self) -> Set[int]:
+    def get_cached_frames(self, allow_proxy: bool = True) -> Set[int]:
         """Return cached frame numbers for the active source context or flat keys."""
         with self._lock:
             out = set()
             for k in self._frames.keys():
+                if not allow_proxy and k in self._proxy_keys:
+                    continue
                 if isinstance(k, tuple):
                     if not self._active_source_id or k[0] == self._active_source_id:
                         out.add(k[1])
@@ -1085,13 +1151,18 @@ class RingBufferCache(QObject):
         for k in candidates:
             if self._used_bytes <= self._max_memory_bytes:
                 break
+            # Never evict pinned frames (e.g. actively rendered frame or working set)
+            if k in self._pinned_keys:
+                continue
+
             frame_num = _get_frame_num(k)
             # Do not evict the exact current playhead frame of active source if possible
             if frame_num == playhead and _is_active_source(k) and len(self._frames) > 1:
                 continue
 
-            # Spill to temp drive disk cache if enabled
-            if self._disk_cache_enabled and self._disk_cache is not None and isinstance(k, tuple):
+            # Spill to temp drive disk cache if enabled (never spill downsampled proxies)
+            is_proxy = k in self._proxy_keys
+            if not is_proxy and self._disk_cache_enabled and self._disk_cache is not None and isinstance(k, tuple):
                 sid = k[0]
                 frm = k[1]
                 frame_data = self._frames.get(k)
@@ -1103,9 +1174,16 @@ class RingBufferCache(QObject):
 
             b = self._frame_bytes.pop(k, 0)
             self._frames.pop(k, None)
+            self._frame_mtimes.pop(k, None)
+            self._proxy_keys.discard(k)
             self._used_bytes -= b
 
-    def _emit_status(self) -> None:
+    def _emit_status(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and (now - self._last_emit_ts) < 0.04:
+            return
+        self._last_emit_ts = now
+
         used_mb, max_mb, _ = self.get_memory_stats()
         self.cache_changed.emit()
         self.memory_usage_changed.emit(used_mb, max_mb)

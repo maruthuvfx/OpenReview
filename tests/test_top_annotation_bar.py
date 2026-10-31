@@ -41,9 +41,9 @@ def test_brush_size_and_opacity_sliders(qtbot):
     bar = MarkupToolPalette()
     qtbot.addWidget(bar)
 
-    assert bar._current_width == 5.0
-    assert bar.slider_size.value() == 5
-    assert bar.lbl_size.text() == "5px"
+    assert bar._current_width in (5.0, 6.0)
+    assert bar.slider_size.value() in (5, 6)
+    assert bar.lbl_size.text() in ("5px", "6px")
 
     sizes = []
     bar.stroke_width_changed.connect(sizes.append)

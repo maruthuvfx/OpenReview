@@ -46,18 +46,18 @@ def test_cache_dropdown_and_progress_bar(qtbot):
     timeline = TimelineWidget(clock)
     qtbot.addWidget(timeline)
 
-    # Default is In/Out Region
-    assert timeline.combo_cache_mode.currentText() == "In/Out Region"
+    # Default is Cache: OFF
+    assert timeline.combo_cache_mode.currentText() == "Cache: OFF"
 
     # Listen for cache mode signal
     modes_received = []
     timeline.cache_mode_selected.connect(modes_received.append)
 
-    # Change combo to Off then Region
-    timeline.combo_cache_mode.setCurrentIndex(0)  # Cache: OFF
-    assert "off" in modes_received
+    # Change combo to Region then Off
     timeline.combo_cache_mode.setCurrentIndex(2)  # In/Out Region
     assert "region" in modes_received
+    timeline.combo_cache_mode.setCurrentIndex(0)  # Cache: OFF
+    assert "off" in modes_received
 
     # Update cache display with data
     timeline.update_cache_display({1001, 1002, 1003}, 15.0, cache_mode="region")
@@ -131,6 +131,7 @@ def test_ctrl_delete_clears_all_cache(qtbot):
     """Test Ctrl+Delete clears all source caches and Shift+C starts Region cache."""
     window = MainWindow()
     qtbot.addWidget(window)
+    window._on_set_cache_mode(CacheMode.REGION, start_prefetch=False)
 
     # Initial state: default cache mode is REGION but dormant until Shift+C
     assert window.cache.mode == CacheMode.REGION

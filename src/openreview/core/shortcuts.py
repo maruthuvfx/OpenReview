@@ -109,6 +109,7 @@ class ShortcutManager(QObject):
             ("playback.shuttle_rev", "Shuttle Reverse (J)", "Playback & Transport", "J", "Shuttle playback backward (-1x, -2x, -4x)"),
             ("playback.shuttle_stop", "Shuttle Stop (K)", "Playback & Transport", "K", "Stop shuttle playback"),
             ("playback.shuttle_fwd", "Shuttle Forward (L)", "Playback & Transport", "L", "Shuttle playback forward (1x, 2x, 4x)"),
+            ("playback.set_fps", "Set Frame Rate...", "Playback & Transport", "Shift+F", "Choose playback frame rate via dialog"),
 
             # Channels
             ("channel.rgb", "Channel: Full RGB Color", "Channels", "C", "Display full color RGB buffer"),
@@ -121,7 +122,7 @@ class ShortcutManager(QObject):
             # View & Display
             ("view.fit", "Fit Image to Window", "View & Display", "F", "Fit current image framing inside viewport"),
             ("view.actual_size", "Actual Size (100%)", "View & Display", "1", "Zoom image to 100% 1:1 pixel scale"),
-            ("view.fit_width", "Fit Width", "View & Display", "Alt+F", "Fit image horizontally to viewport width"),
+            ("view.fit_width", "Fit Width", "View & Display", "Ctrl+F", "Fit image horizontally to viewport width"),
             ("view.zoom_100", "Zoom 100% Preset", "View & Display", "Ctrl+1", "Set 100% zoom"),
             ("view.zoom_200", "Zoom 200% Preset", "View & Display", "Ctrl+2", "Set 200% zoom"),
             ("view.zoom_400", "Zoom 400% Preset", "View & Display", "Ctrl+4", "Set 400% zoom"),
@@ -180,6 +181,8 @@ class ShortcutManager(QObject):
 
             # HUDs & Floating Panels
             ("hud.histogram", "Toggle Live RGB Histogram", "HUDs & Panels", "H", "Show/hide real-time color histogram"),
+            ("hud.waveform", "Toggle Waveform Monitor", "HUDs & Panels", "V", "Show/hide real-time Waveform scope"),
+            ("hud.vectorscope", "Toggle Vectorscope Monitor", "HUDs & Panels", "Shift+V", "Show/hide real-time Vectorscope scope"),
             ("hud.color_inspector", "Toggle Color Inspector HUD", "HUDs & Panels", "F5", "Show/hide floating pixel color inspector"),
             ("hud.wipe", "Toggle A/B Wipe Controller", "HUDs & Panels", "W", "Show/hide interactive split wipe comparison"),
             ("hud.wipe_flip_orientation", "Flip Wipe Orientation", "HUDs & Panels", "Shift+W", "Flip wipe split between Horizontal and Vertical"),
@@ -202,6 +205,7 @@ class ShortcutManager(QObject):
             ("annot.prev_keyframe", "Previous Annotated Frame", "Annotations", ",", "Jump to previous frame containing drawing notes"),
             ("annot.toggle_palette", "Toggle Annotation Toolbox", "Annotations", "X", "Show/hide top annotation toolbox"),
             ("annot.manager", "Open Annotation Manager", "Annotations", "Ctrl+Shift+A", "Open review note and frame export dialog"),
+            ("annot.export", "Export Annotations...", "Annotations", "Ctrl+E", "Export annotation drawings and review notes"),
 
             # Sources & Session Manager
             ("playlist.toggle", "Toggle Sources & Session Manager", "Playlist & Dailies", "`", "Show/hide Sources & Session Manager dock"),
@@ -299,9 +303,15 @@ class ShortcutManager(QObject):
             "Ctrl+Shift+Num+-": "color.sat_down",
             "Shift+I": "color.invert_toggle",
             "Shift+i": "color.invert_toggle",
+            "Ctrl+F": "view.fit_width",
+            "Ctrl+f": "view.fit_width",
+            "Alt+F": "view.fit_width",
+            "Alt+f": "view.fit_width",
+            "Shift+F": "playback.set_fps",
+            "Shift+f": "playback.set_fps",
             "Ctrl+Alt+E": "color.exp_reset",
-            "Ctrl+E": "color.exp_reset",
-            "Ctrl+e": "color.exp_reset",
+            "Ctrl+E": "annot.export",
+            "Ctrl+e": "annot.export",
             "Ctrl+Alt+G": "color.gamma_reset",
             "Ctrl+Alt+R": "color.reset_all",
             "Shift+Home": "color.reset_all",
@@ -334,6 +344,10 @@ class ShortcutManager(QObject):
             "Ctrl+y": "annot.redo",
             "Ctrl+Shift+N": "session.close",
             "Ctrl+Shift+n": "session.close",
+            "V": "hud.waveform",
+            "v": "hud.waveform",
+            "Shift+V": "hud.vectorscope",
+            "Shift+v": "hud.vectorscope",
         }
 
     def _rebuild_key_map(self) -> None:

@@ -7,10 +7,122 @@ from __future__ import annotations
 import os
 import math
 import time
-from typing import Optional
+from typing import Optional, Callable, Any
 import numpy as np
 from PIL import Image
 from PySide6.QtCore import QObject, Signal, QRunnable, QThreadPool, QTimer
+
+from openreview.core.cancellation import CancellationToken, CancellationScopeGuard
+from openreview.core.cache import CacheMode
+
+
+def get_adaptive_downsample_factor(width: int, height: int) -> int:
+    """
+    Calculate the adaptive downsample factor for fast scrubbing.
+    - 4K or greater (>= 3840 wide or >= 2160 high): 4x downsample (1/4 resolution)
+    - 2K / HD (< 3840 wide and < 2160 high): 2x downsample (1/2 resolution)
+    """
+    if width >= 3840 or height >= 2160:
+        return 4
+    return 2
+
+
+def read_adaptive_frame(
+    reader: Any,
+    frame_number: int,
+    factor: Optional[int] = None,
+    normalize_fn: Optional[Callable[[Any], Any]] = None,
+) -> Optional[np.ndarray]:
+    """
+    Read and decode a single frame adaptively downsampled for real-time fluid playback and scrubbing.
+    - Factor 4 for 4K+ (>= 3840 wide or >= 2160 high)
+    - Factor 2 for HD/2K (< 3840 wide and < 2160 high)
+    - Ensures C-contiguous 4-channel RGBA memory layout.
+    """
+    if reader is None:
+        return None
+    w = getattr(reader, "width", 0)
+    h = getattr(reader, "height", 0)
+    if factor is None:
+        factor = get_adaptive_downsample_factor(w, h) if (w > 0 and h > 0) else 2
+
+    raw = reader.read_frame(frame_number)
+    if raw is None:
+        return None
+    if normalize_fn is not None:
+        raw = normalize_fn(raw)
+
+    if isinstance(raw, np.ndarray) and raw.ndim >= 2:
+        if factor > 1:
+            raw = np.ascontiguousarray(raw[::factor, ::factor])
+        return ensure_c_contiguous_rgba(raw)
+    elif isinstance(raw, (tuple, list)):
+        processed = []
+        for elem in raw:
+            if isinstance(elem, np.ndarray) and elem.ndim >= 2:
+                if factor > 1:
+                    elem = np.ascontiguousarray(elem[::factor, ::factor])
+                processed.append(ensure_c_contiguous_rgba(elem))
+            else:
+                processed.append(elem)
+        return tuple(processed)
+    return raw
+
+
+def ensure_c_contiguous_rgba(data: np.ndarray) -> np.ndarray:
+    """
+    Standardize frame array to C-contiguous 4-channel RGBA in background thread.
+    - Preserves float16 or uint8 (or converts float32 to float16).
+    - If 3-channel RGB: appends 1.0 (float) or 255 (uint8) alpha channel.
+    - If 1-channel or 2-channel: expands to 4-channel RGBA.
+    - Guarantees C-contiguous memory layout for zero-overhead PBO streaming.
+    """
+    if not isinstance(data, np.ndarray) or data.size == 0 or data.ndim < 2:
+        return data
+
+    h, w = data.shape[:2]
+
+    # 1D/2D grayscale/matte -> RGBA
+    if data.ndim == 2:
+        if data.dtype == np.uint8:
+            rgba = np.empty((h, w, 4), dtype=np.uint8)
+            rgba[:, :, 0] = data
+            rgba[:, :, 1] = data
+            rgba[:, :, 2] = data
+            rgba[:, :, 3] = 255
+            return np.ascontiguousarray(rgba)
+        else:
+            target_dtype = np.float16 if data.dtype in (np.float32, np.float16) else data.dtype
+            d = data.astype(target_dtype, copy=False)
+            rgba = np.empty((h, w, 4), dtype=target_dtype)
+            rgba[:, :, 0] = d
+            rgba[:, :, 1] = d
+            rgba[:, :, 2] = d
+            rgba[:, :, 3] = 1.0
+            return np.ascontiguousarray(rgba)
+
+    # 3-channel RGB -> 4-channel RGBA
+    if data.ndim == 3 and data.shape[2] == 3:
+        if data.dtype == np.uint8:
+            rgba = np.empty((h, w, 4), dtype=np.uint8)
+            rgba[:, :, :3] = data
+            rgba[:, :, 3] = 255
+            return np.ascontiguousarray(rgba)
+        else:
+            target_dtype = np.float16 if data.dtype in (np.float32, np.float16) else data.dtype
+            rgba = np.empty((h, w, 4), dtype=target_dtype)
+            rgba[:, :, :3] = data.astype(target_dtype, copy=False)
+            rgba[:, :, 3] = 1.0
+            return np.ascontiguousarray(rgba)
+
+    # 4-channel RGBA: convert float32 to float16 for GPU performance & memory efficiency
+    if data.dtype == np.float32:
+        data = data.astype(np.float16, copy=False)
+
+    if not data.flags.c_contiguous:
+        data = np.ascontiguousarray(data)
+
+    return data
 
 
 class MediaReader:
@@ -145,6 +257,98 @@ class TaskSignals(QObject):
     loaded = Signal(int, int, str, int, bool)  # timeline_frame, source_frame, source_id, generation, success
 
 
+class InteractiveDecodeTask(QRunnable):
+    """
+    High-priority decode task for the active playhead frame during uncached playback
+    or interactive timeline scrubbing. Runs on the dedicated interactive worker pool.
+    Supports adaptive resolution downsampling for fluid scrubbing without UI stalls.
+    """
+
+    def __init__(
+        self,
+        reader: Optional[MediaReader],
+        cache,
+        timeline_frame: int,
+        source_frame: int,
+        source_id: str,
+        token: CancellationToken,
+        downsample_factor: int = 1,
+        is_proxy: bool = False,
+        callback=None,
+    ):
+        super().__init__()
+        self.reader = reader
+        self.cache = cache
+        self.timeline_frame = timeline_frame
+        self.source_frame = source_frame
+        self.source_id = source_id
+        self.token = token
+        self.downsample_factor = max(0, int(downsample_factor))
+        self.is_proxy = bool(is_proxy)
+        self.callback = callback
+        self.signals = TaskSignals()
+
+    def run(self) -> None:
+        if self.reader is None or self.token.is_cancelled():
+            self._finish(False, None)
+            return
+
+        try:
+            raw = self.reader.read_frame(self.source_frame)
+            if raw is None or self.token.is_cancelled():
+                self._finish(False, None)
+                return
+
+            if self.is_proxy:
+                factor = self.downsample_factor
+                if factor <= 1 and raw.ndim >= 2:
+                    factor = get_adaptive_downsample_factor(raw.shape[1], raw.shape[0])
+                if factor > 1 and raw.ndim >= 2:
+                    raw = raw[::factor, ::factor]
+
+            data = ensure_c_contiguous_rgba(raw)
+            if self.token.is_cancelled():
+                self._finish(False, None)
+                return
+
+            # Store in cache if cache is active
+            if self.cache is not None and getattr(self.cache, "mode", None) != CacheMode.OFF:
+                if self.source_id:
+                    self.cache.put_source_frame(
+                        self.source_id,
+                        self.source_frame,
+                        data,
+                        is_proxy=self.is_proxy,
+                    )
+                else:
+                    self.cache.put_frame(
+                        self.timeline_frame,
+                        data,
+                        is_proxy=self.is_proxy,
+                    )
+
+            self._finish(True, data)
+        except Exception:
+            self._finish(False, None)
+
+    def _finish(self, success: bool, data: Optional[np.ndarray]) -> None:
+        try:
+            self.signals.loaded.emit(
+                self.timeline_frame,
+                self.source_frame,
+                self.source_id,
+                self.token.generation,
+                success,
+            )
+            if self.callback:
+                try:
+                    self.callback(self.timeline_frame, self.source_frame, self.source_id, success, data, self.is_proxy)
+                except TypeError:
+                    self.callback(self.timeline_frame, self.source_frame, self.source_id, success, data)
+        except Exception:
+            pass
+
+
 class PrefetchTask(QRunnable):
     """
     Thread-safe background prefetch task.
@@ -180,22 +384,14 @@ class PrefetchTask(QRunnable):
             self._finish(False)
             return
 
-        # Adaptive cooperative yield: guarantee main GUI thread & OpenGL event loop full CPU priority
-        time.sleep(0.005)
-
         try:
-            data = self.reader.read_frame(self.source_frame)
-            if data is not None:
+            raw = self.reader.read_frame(self.source_frame)
+            if raw is not None:
                 if self.is_cancelled_fn and self.is_cancelled_fn():
                     self._finish(False)
                     return
 
-                # Convert float32 frames to float16 in background worker thread if in auto/rgba16f mode
-                try:
-                    if isinstance(data, np.ndarray) and data.dtype == np.float32:
-                        data = data.astype(np.float16, copy=False)
-                except Exception:
-                    pass
+                data = ensure_c_contiguous_rgba(raw)
 
                 # Store directly into thread-safe cache from background thread
                 if self.cache is not None:
@@ -254,19 +450,18 @@ class BackgroundDiskCacheTask(QRunnable):
             self._finish(False)
             return
 
-        # Friendly cooperative sleep to guarantee UI thread and playback prefetch get full CPU priority
-        time.sleep(0.008)
-
         try:
             if self.is_cancelled_fn and self.is_cancelled_fn():
                 self._finish(False)
                 return
 
-            data = self.reader.read_frame(self.source_frame)
-            if data is not None:
+            raw = self.reader.read_frame(self.source_frame)
+            if raw is not None:
                 if self.is_cancelled_fn and self.is_cancelled_fn():
                     self._finish(False)
                     return
+
+                data = ensure_c_contiguous_rgba(raw)
 
                 # Write directly to Temp Disk in this worker thread!
                 # np.save and atomic os.replace happen HERE, NOT ON MAIN THREAD!
@@ -289,6 +484,8 @@ class BackgroundDiskCacheTask(QRunnable):
                 self.generation,
                 success,
             )
+        except Exception:
+            pass
         except Exception:
             pass
 
@@ -367,11 +564,22 @@ class ReaderEngine(QObject):
         super().__init__(parent)
         self.reader = reader
         self.cache = cache
-        self.thread_pool = QThreadPool(self)
+
+        # Dual-Queue Architecture:
+        # 1. Prefetch Pool: bounded background worker pool for lookahead & disk cache
+        self._prefetch_pool = QThreadPool(self)
+        self.thread_pool = self._prefetch_pool  # Backward-compatibility alias
+
+        # 2. Interactive Pool: high-priority dedicated worker pool for active playhead seeks
+        self._interactive_pool = QThreadPool(self)
+        self._interactive_pool.setMaxThreadCount(2)
+
         self._sync_thread_count()
         self._pending_keys: set[tuple[str, int]] = set()  # (source_id, source_frame)
         self._bg_pending_keys: set[tuple[str, int]] = set()  # (source_id, source_frame) for background caching
+        self._interactive_pending: set[tuple[str, int]] = set()
         self._generation = 0
+        self._active_token = CancellationToken(generation=0)
         self._is_paused: bool = False
         self._last_prefetch_params = None
         self._bg_cache_queue: list[list] = []  # [source_id, reader, start_frame, end_frame, cursor]
@@ -421,12 +629,71 @@ class ReaderEngine(QObject):
         self._schedule_next_background_cache_task()
 
     def cancel_pending(self) -> None:
-        """Invalidate all pending in-flight background prefetch jobs."""
+        """Invalidate all pending in-flight background prefetch and interactive decode jobs."""
+        self._active_token.request_cancellation()
         self._generation += 1
+        self._active_token = CancellationToken(generation=self._generation)
         self._pending_keys.clear()
         self._bg_pending_keys.clear()
+        self._interactive_pending.clear()
         if hasattr(self, "_prefetch_chain_timer"):
             self._prefetch_chain_timer.stop()
+
+    def request_immediate_frame(
+        self,
+        source_id: str,
+        source_frame: int,
+        timeline_frame: int,
+        reader: Optional[MediaReader] = None,
+        downsample: bool = False,
+        callback=None,
+    ) -> None:
+        """
+        Request immediate high-priority asynchronous decode of the active playhead frame.
+        Executes on the dedicated interactive worker pool without waiting for the prefetch queue.
+        When downsample=True, decodes at an adaptive proxy resolution for fluid scrubbing.
+        """
+        rdr = reader or self.reader
+        if rdr is None:
+            return
+
+        sid_str = source_id or ""
+        is_proxy = bool(downsample)
+        key = (sid_str, source_frame, is_proxy)
+        if key in self._interactive_pending:
+            return
+
+        self._interactive_pending.add(key)
+        token = self._active_token
+
+        factor = 1
+        if is_proxy:
+            w = getattr(rdr, "width", 0)
+            h = getattr(rdr, "height", 0)
+            factor = get_adaptive_downsample_factor(w, h) if (w > 0 and h > 0) else 0
+
+        def _on_done(tf, sf, sid, success, data, proxy_flag=False):
+            self._interactive_pending.discard(key)
+            if not token.is_cancelled() and success:
+                self.frame_ready.emit(tf)
+            if callback:
+                try:
+                    callback(tf, sf, sid, success, data, proxy_flag)
+                except TypeError:
+                    callback(tf, sf, sid, success, data)
+
+        task = InteractiveDecodeTask(
+            reader=rdr,
+            cache=self.cache,
+            timeline_frame=timeline_frame,
+            source_frame=source_frame,
+            source_id=sid_str,
+            token=token,
+            downsample_factor=factor,
+            is_proxy=is_proxy,
+            callback=_on_done,
+        )
+        self._interactive_pool.start(task, priority=10000)
 
     def set_reader(self, reader: Optional[MediaReader]) -> None:
         self.reader = reader
@@ -470,9 +737,9 @@ class ReaderEngine(QObject):
         if window_start > window_end:
             return  # Cache is OFF or empty target window
 
-        # Quick exit if all frames in the target window are already cached
+        # Quick exit if all frames in the target window are already cached in full resolution
         if hasattr(self.cache, "get_cached_frames"):
-            cached_set = self.cache.get_cached_frames()
+            cached_set = self.cache.get_cached_frames(allow_proxy=False)
             if all(f in cached_set for f in range(window_start, window_end + 1)):
                 return
 
@@ -506,12 +773,12 @@ class ReaderEngine(QObject):
                 sid_str = src_id or ""
                 cache_key = (sid_str, src_frame)
 
-                # Check if already cached
+                # Check if already cached in full resolution
                 if sid_str:
-                    if self.cache.has_source_frame(sid_str, src_frame):
+                    if self.cache.has_source_frame(sid_str, src_frame, allow_proxy=False):
                         continue
                 else:
-                    if self.cache.has_frame(src_frame):
+                    if self.cache.has_frame(src_frame, allow_proxy=False):
                         continue
 
                 if cache_key in self._pending_keys:
@@ -527,6 +794,7 @@ class ReaderEngine(QObject):
                 else:
                     prio = max(0, 500 - min(500, abs(dist)))
 
+                token = self._active_token
                 task = PrefetchTask(
                     reader=rdr,
                     cache=self.cache,
@@ -534,7 +802,7 @@ class ReaderEngine(QObject):
                     source_frame=src_frame,
                     source_id=sid_str,
                     generation=curr_gen,
-                    is_cancelled_fn=lambda g=curr_gen: g < self._generation,
+                    is_cancelled_fn=lambda g=curr_gen, tok=token: g < self._generation or tok.is_cancelled(),
                 )
                 task.signals.loaded.connect(self._on_frame_loaded)
                 self.thread_pool.start(task, priority=prio)
@@ -627,7 +895,7 @@ class ReaderEngine(QObject):
             curr_f = cursor
             while curr_f <= e_frame:
                 key = (src_id, curr_f)
-                if key not in self._bg_pending_keys and not self.cache.has_source_frame(src_id, curr_f):
+                if key not in self._bg_pending_keys and not self.cache.has_source_frame(src_id, curr_f, allow_proxy=False):
                     uncached_frame = curr_f
                     item[4] = curr_f + 1
                     break
@@ -643,13 +911,14 @@ class ReaderEngine(QObject):
             self._bg_pending_keys.add((src_id, uncached_frame))
             curr_gen = self._generation
 
+            token = self._active_token
             task = BackgroundDiskCacheTask(
                 reader=rdr,
                 disk_cache=disk_cache,
                 source_id=src_id,
                 source_frame=uncached_frame,
                 generation=curr_gen,
-                is_cancelled_fn=lambda g=curr_gen: g < self._generation or self._is_paused or len(self._pending_keys) > 0,
+                is_cancelled_fn=lambda g=curr_gen, tok=token: g < self._generation or tok.is_cancelled() or self._is_paused or len(self._pending_keys) > 0,
             )
             task.signals.loaded.connect(self._on_background_frame_loaded)
             self.thread_pool.start(task, priority=0)

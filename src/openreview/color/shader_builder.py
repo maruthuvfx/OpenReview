@@ -17,8 +17,8 @@ class ShaderUniforms:
     wipe_position: float = 0.5 # 0.0 to 1.0
     wipe_angle_rad: float = 1.5707963  # 90 degrees (vertical wipe line)
     diff_boost: float = 1.0
-    input_space: int = 0       # 0: sRGB, 1: ACEScg/Linear, 2: Raw, 3: Cineon Log, 4: ALEXA LogC, 5: ALEXA LogC Film, 6: Rec709, 7: Gamma 2.2
-    view_transform: int = 0    # 0: sRGB, 1: ACES Filmic, 2: Raw, 3: Rec709, 4: Gamma 2.2
+    input_space: int = 0       # 0: linear, 1: sRGB, 2: rec709, 3: Cineon, 4: Gamma 1.8, 5: Gamma 2.2, 6: Panalog, 7: REDLog, 8: ViperLog, 9: REDSpace, 10: Raw
+    view_transform: int = 1    # 0: linear, 1: sRGB, 2: rec709, 3: Cineon, 4: Gamma 1.8, 5: Gamma 2.2, 6: Panalog, 7: REDLog, 8: ViperLog, 9: REDSpace, 10: Raw
 
     # Comp QC Toolset Uniforms
     qc_mode: int = 0
@@ -91,9 +91,8 @@ uniform bool uApplyGamma;           // True if gamma != 1.0
 uniform int uChannelMode;           // 0: RGB, 1: R, 2: G, 3: B, 4: A, 5: Luma Y
 
 // Colorspace & Viewer Uniforms
-// 0: sRGB, 1: ACEScg/Linear, 2: Raw, 3: Cineon Log, 4: ALEXA LogC, 5: ALEXA LogC Film, 6: Rec709, 7: Gamma 2.2
+// Standard Colorspaces: 0: linear, 1: sRGB, 2: rec709, 3: Cineon, 4: Gamma 1.8, 5: Gamma 2.2, 6: Panalog, 7: REDLog, 8: ViperLog, 9: REDSpace, 10: Raw
 uniform int uInputSpace;
-// 0: sRGB Display, 1: ACES Filmic, 2: Raw, 3: Rec709, 4: Gamma 2.2
 uniform int uViewTransform;
 
 // Stereo 3D Uniforms: 0: Off, 1: Left, 2: Right, 3: Anaglyph, 4: Side-by-Side, 5: Difference
@@ -263,6 +262,16 @@ vec3 linear_to_rec709(vec3 c) {
     return mix(lower, higher, greaterThan(c, vec3(0.018)));
 }
 
+// Gamma 1.8 to Scene-Linear
+vec3 gamma18_to_linear(vec3 c) {
+    return pow(max(c, vec3(0.0)), vec3(1.8));
+}
+
+// Scene-Linear to Gamma 1.8 Display
+vec3 linear_to_gamma18(vec3 c) {
+    return pow(max(c, vec3(0.0)), vec3(1.0 / 1.8));
+}
+
 // Gamma 2.2 to Scene-Linear
 vec3 gamma22_to_linear(vec3 c) {
     return pow(max(c, vec3(0.0)), vec3(2.2));
@@ -271,6 +280,65 @@ vec3 gamma22_to_linear(vec3 c) {
 // Scene-Linear to Gamma 2.2 Display
 vec3 linear_to_gamma22(vec3 c) {
     return pow(max(c, vec3(0.0)), vec3(1.0 / 2.2));
+}
+
+// Panalog to Scene-Linear
+vec3 panalog_to_linear(vec3 c) {
+    vec3 x = (c * 1023.0 - 681.0) / 444.0;
+    return max(vec3(0.0), (pow(vec3(10.0), x) - 0.002) / 0.998);
+}
+
+// Scene-Linear to Panalog Display
+vec3 linear_to_panalog(vec3 lin) {
+    vec3 norm = max(lin * 0.998 + 0.002, vec3(1e-6));
+    vec3 x = log(norm) / 2.302585092994046;
+    return clamp((x * 444.0 + 681.0) / 1023.0, 0.0, 1.0);
+}
+
+// REDLog to Scene-Linear
+vec3 redlog_to_linear(vec3 c) {
+    return max(vec3(0.0), (pow(vec3(10.0), c * 3.0 - 3.0) - 0.00001) / 0.99999);
+}
+
+// Scene-Linear to REDLog Display
+vec3 linear_to_redlog(vec3 lin) {
+    vec3 norm = max(lin * 0.99999 + 0.00001, vec3(1e-6));
+    vec3 x = log(norm) / 2.302585092994046;
+    return clamp((x + 3.0) / 3.0, 0.0, 1.0);
+}
+
+// ViperLog to Scene-Linear
+vec3 viperlog_to_linear(vec3 c) {
+    vec3 x = (c * 1023.0 - 1023.0) / 500.0;
+    return max(vec3(0.0), (pow(vec3(10.0), x) - 0.01) / 0.99);
+}
+
+// Scene-Linear to ViperLog Display
+vec3 linear_to_viperlog(vec3 lin) {
+    vec3 norm = max(lin * 0.99 + 0.01, vec3(1e-6));
+    vec3 x = log(norm) / 2.302585092994046;
+    return clamp((x * 500.0 + 1023.0) / 1023.0, 0.0, 1.0);
+}
+
+// REDSpace 3x3 Conversion Matrices (column-major in GLSL)
+const mat3 REDSPACE_TO_REC709_MAT = mat3(
+    1.478, -0.063, -0.010,
+    -0.389, 1.077, -0.168,
+    -0.089, -0.014, 1.178
+);
+
+const mat3 REC709_TO_REDSPACE_MAT = mat3(
+    0.6865, 0.0405, 0.0116,
+    0.2541, 0.9490, 0.1376,
+    0.0594, 0.0105, 0.8508
+);
+
+vec3 redspace_to_linear(vec3 c) {
+    return REDSPACE_TO_REC709_MAT * c;
+}
+
+vec3 linear_to_redspace(vec3 lin) {
+    return REC709_TO_REDSPACE_MAT * lin;
 }
 
 // Narkowicz ACES filmic tone mapping fit for HDR
@@ -302,37 +370,61 @@ vec3 hsv2rgb(vec3 c) {
 // Convert input color sample to scene-linear space
 vec3 to_linear_space(vec3 c) {
     if (uInputSpace == 0) {
-        return srgb_to_linear(c);
+        return c; // linear (working space)
     } else if (uInputSpace == 1) {
-        return c; // ACEScg / Linear
+        return srgb_to_linear(c);
     } else if (uInputSpace == 2) {
-        return c; // Raw / Unmanaged
+        return rec709_to_linear(c);
     } else if (uInputSpace == 3) {
         return cineon_to_linear(c);
     } else if (uInputSpace == 4) {
-        return alexa_logc_to_linear(c);
+        return gamma18_to_linear(c);
     } else if (uInputSpace == 5) {
-        return alexa_logc_film_to_linear(c);
-    } else if (uInputSpace == 6) {
-        return rec709_to_linear(c);
-    } else if (uInputSpace == 7) {
         return gamma22_to_linear(c);
+    } else if (uInputSpace == 6) {
+        return panalog_to_linear(c);
+    } else if (uInputSpace == 7) {
+        return redlog_to_linear(c);
+    } else if (uInputSpace == 8) {
+        return viperlog_to_linear(c);
+    } else if (uInputSpace == 9) {
+        return redspace_to_linear(c);
+    } else if (uInputSpace == 10) {
+        return c; // Raw / Pass-through
+    } else if (uInputSpace == 101) {
+        return alexa_logc_to_linear(c);
+    } else if (uInputSpace == 102) {
+        return alexa_logc_film_to_linear(c);
     }
     return c;
 }
 
 // Convert scene-linear color to display space
 vec3 to_display_space(vec3 lin) {
-    if (uViewTransform == 1) {
-        return linear_to_srgb(aces_filmic(lin));
-    } else if (uViewTransform == 0) {
+    if (uViewTransform == 0) {
+        return lin; // linear (identity)
+    } else if (uViewTransform == 1) {
         return linear_to_srgb(lin);
     } else if (uViewTransform == 2) {
-        return lin; // Raw / Pass-through
-    } else if (uViewTransform == 3) {
         return linear_to_rec709(lin);
+    } else if (uViewTransform == 3) {
+        return linear_to_cineon(lin);
     } else if (uViewTransform == 4) {
+        return linear_to_gamma18(lin);
+    } else if (uViewTransform == 5) {
         return linear_to_gamma22(lin);
+    } else if (uViewTransform == 6) {
+        return linear_to_panalog(lin);
+    } else if (uViewTransform == 7) {
+        return linear_to_redlog(lin);
+    } else if (uViewTransform == 8) {
+        return linear_to_viperlog(lin);
+    } else if (uViewTransform == 9) {
+        return linear_to_redspace(lin);
+    } else if (uViewTransform == 10) {
+        return lin; // Raw / Pass-through
+    } else if (uViewTransform == 100) {
+        return linear_to_srgb(aces_filmic(lin)); // ACES filmic
     }
     return lin;
 }
