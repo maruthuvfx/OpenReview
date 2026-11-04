@@ -14,6 +14,16 @@ QWidget {
     selection-color: #121212;
 }
 
+/* ToolTips */
+QToolTip {
+    background-color: #242426;
+    color: #e0e0e0;
+    border: 1px solid #444448;
+    border-radius: 3px;
+    padding: 4px 8px;
+    font-size: 11px;
+}
+
 /* Main Window & Menus */
 QMainWindow {
     background-color: #181818;
@@ -184,6 +194,16 @@ QComboBox QAbstractItemView {
     border: 1px solid #444444;
     selection-background-color: #e5a823;
     selection-color: #121212;
+}
+
+/* ToolTips */
+QToolTip {
+    background-color: #242426;
+    color: #e0e0e0;
+    border: 1px solid #444448;
+    border-radius: 3px;
+    padding: 4px 8px;
+    font-size: 11px;
 }
 
 /* Sliders */

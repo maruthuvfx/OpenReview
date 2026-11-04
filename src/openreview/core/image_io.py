@@ -13,10 +13,34 @@ import logging
 from typing import Optional, Tuple, Dict, Any
 import numpy as np
 
+from openreview.core.buffer_pool import FrameBufferPool
+
 logger = logging.getLogger(__name__)
 
 # Ensure OpenCV uses OpenEXR if supported
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
+
+# Multi-Threaded OpenEXR Global Decompression Engine:
+# OpenEXR C++ library defaults to 0 (single-threaded).
+# Enable parallel scanline/tile decompression across all available CPU cores.
+try:
+    import OpenEXR
+    HAS_OPENEXR = True
+    try:
+        _exr_threads = max(2, os.cpu_count() or 4)
+        OpenEXR.set_global_thread_count(_exr_threads)
+    except Exception as _ex:
+        logger.debug("Failed to set OpenEXR global thread count: %s", _ex)
+except ImportError:
+    HAS_OPENEXR = False
+
+def _is_rust_io_enabled() -> bool:
+    try:
+        from openreview.core.preferences import PreferencesManager
+        return getattr(PreferencesManager.instance().prefs, "enable_rust_engine", True)
+    except Exception:
+        return True
+
 
 
 # ==============================================================================
@@ -47,6 +71,21 @@ def get_exr_channels(path: str) -> Dict[str, Any]:
     norm_path = os.path.normpath(os.path.abspath(path))
     if norm_path in _EXR_CHANNELS_CACHE:
         return _EXR_CHANNELS_CACHE[norm_path]
+
+    # 0. Accelerated Rust Engine Inspection (Zero-GIL, high speed)
+    if _is_rust_io_enabled():
+        try:
+            import openreview_engine
+            rust_eng = getattr(get_exr_channels, "_rust_engine", None)
+            if rust_eng is None:
+                rust_eng = openreview_engine.OpenReviewEngine()
+                get_exr_channels._rust_engine = rust_eng
+            meta = rust_eng.inspect_exr(path)
+            if meta and meta.get("all_channels"):
+                _EXR_CHANNELS_CACHE[norm_path] = meta
+                return meta
+        except Exception as _re:
+            logger.debug("Rust inspect_exr failed: %s", _re)
 
     try:
         import OpenEXR
@@ -99,7 +138,12 @@ def get_exr_channels(path: str) -> Dict[str, Any]:
         return {"all_channels": [], "layers": {}, "cryptomatte_layers": [], "views": []}
 
 
-def read_exr(path: str, layer: Optional[str] = None) -> Optional[np.ndarray]:
+def read_exr(
+    path: str,
+    layer: Optional[str] = None,
+    as_f16: bool = False,
+    mapping: Optional[Any] = None,
+) -> Optional[np.ndarray]:
     """
     Read an OpenEXR image file into a Float32 RGBA NumPy array (H, W, 4).
     Supports 16-bit half, 32-bit float, and arbitrary multi-channel layers.
@@ -107,6 +151,27 @@ def read_exr(path: str, layer: Optional[str] = None) -> Optional[np.ndarray]:
     """
     if not os.path.exists(path):
         return None
+
+    if mapping is not None:
+        from openreview.core.exr_matrix import read_exr_matrix_mapped
+        return read_exr_matrix_mapped(path, mapping, as_f16=as_f16)
+
+    # 0. Accelerated Rust Engine: Zero-GIL, parallel multi-threaded Rayon decoder
+    if _is_rust_io_enabled():
+        try:
+            import openreview_engine
+            rust_eng = getattr(read_exr, "_rust_engine", None)
+            if rust_eng is None:
+                rust_eng = openreview_engine.OpenReviewEngine()
+                read_exr._rust_engine = rust_eng
+            native_frame = rust_eng.read_exr(path, as_f16, layer=layer)
+            dtype = np.float16 if as_f16 else np.float32
+            shape = (native_frame.height, native_frame.width, 4)
+            out = FrameBufferPool.instance().acquire(shape, dtype)
+            np.copyto(out, np.frombuffer(native_frame.as_memoryview(), dtype=dtype).reshape(shape))
+            return out
+        except Exception:
+            pass
 
     # 1. Primary: High-performance OpenEXR C++ binding
     try:
@@ -128,6 +193,8 @@ def read_exr(path: str, layer: Optional[str] = None) -> Optional[np.ndarray]:
         chan_lower = {k.lower(): k for k in chan_keys}
 
         pt_float = Imath.PixelType(Imath.PixelType.FLOAT)
+        pt_pixel = Imath.PixelType(Imath.PixelType.HALF) if as_f16 else pt_float
+        ch_dtype = np.float16 if as_f16 else np.float32
 
         # Handle Cryptomatte preview extraction if requested
         if layer and "crypto" in layer.lower():
@@ -191,42 +258,48 @@ def read_exr(path: str, layer: Optional[str] = None) -> Optional[np.ndarray]:
 
         # Decode Red/Luma
         if r_name:
-            r = np.frombuffer(inp.channel(r_name, pt_float), dtype=np.float32).reshape((h, w))
+            r = np.frombuffer(inp.channel(r_name, pt_pixel), dtype=ch_dtype).reshape((h, w))
         elif y_name:
-            r = np.frombuffer(inp.channel(y_name, pt_float), dtype=np.float32).reshape((h, w))
+            r = np.frombuffer(inp.channel(y_name, pt_pixel), dtype=ch_dtype).reshape((h, w))
         elif chan_keys:
-            r = np.frombuffer(inp.channel(chan_keys[0], pt_float), dtype=np.float32).reshape((h, w))
+            r = np.frombuffer(inp.channel(chan_keys[0], pt_pixel), dtype=ch_dtype).reshape((h, w))
         else:
-            r = np.zeros((h, w), dtype=np.float32)
+            r = np.zeros((h, w), dtype=ch_dtype)
 
         # Decode Green
         if g_name:
-            g = np.frombuffer(inp.channel(g_name, pt_float), dtype=np.float32).reshape((h, w))
+            g = np.frombuffer(inp.channel(g_name, pt_pixel), dtype=ch_dtype).reshape((h, w))
         elif y_name:
             g = r.copy()
         elif len(chan_keys) > 1:
-            g = np.frombuffer(inp.channel(chan_keys[1], pt_float), dtype=np.float32).reshape((h, w))
+            g = np.frombuffer(inp.channel(chan_keys[1], pt_pixel), dtype=ch_dtype).reshape((h, w))
         else:
             g = r.copy()
 
         # Decode Blue
         if b_name:
-            b = np.frombuffer(inp.channel(b_name, pt_float), dtype=np.float32).reshape((h, w))
+            b = np.frombuffer(inp.channel(b_name, pt_pixel), dtype=ch_dtype).reshape((h, w))
         elif y_name:
             b = r.copy()
         elif len(chan_keys) > 2:
-            b = np.frombuffer(inp.channel(chan_keys[2], pt_float), dtype=np.float32).reshape((h, w))
+            b = np.frombuffer(inp.channel(chan_keys[2], pt_pixel), dtype=ch_dtype).reshape((h, w))
         else:
             b = r.copy()
 
         # Decode Alpha
         if a_name:
-            a = np.frombuffer(inp.channel(a_name, pt_float), dtype=np.float32).reshape((h, w))
+            a = np.frombuffer(inp.channel(a_name, pt_pixel), dtype=ch_dtype).reshape((h, w))
         else:
-            a = np.ones((h, w), dtype=np.float32)
+            a = np.ones((h, w), dtype=ch_dtype)
 
         inp.close()
-        return np.ascontiguousarray(np.stack([r, g, b, a], axis=-1), dtype=np.float32)
+        target_dtype = np.float16 if as_f16 else np.float32
+        out = FrameBufferPool.instance().acquire((h, w, 4), target_dtype)
+        out[:, :, 0] = r
+        out[:, :, 1] = g
+        out[:, :, 2] = b
+        out[:, :, 3] = a
+        return out
 
     except Exception as e:
         logger.debug("OpenEXR native reader failed on %s: %s; trying fallback", path, e)
@@ -236,7 +309,7 @@ def read_exr(path: str, layer: Optional[str] = None) -> Optional[np.ndarray]:
         import cv2
         mat = cv2.imread(path, cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
         if mat is not None:
-            return _standardize_to_rgba_float(mat)
+            return _standardize_to_rgba_float(mat, as_f16=as_f16)
     except Exception as e:
         logger.debug("OpenCV EXR read failed on %s: %s", path, e)
 
@@ -300,7 +373,7 @@ def _find_channel_name(targets: list[str], chan_lower: dict[str, str], chan_keys
 # SMPTE DPX Reader & Writer (Pure Python + NumPy Vectorized)
 # ==============================================================================
 
-def read_dpx(path: str) -> Optional[np.ndarray]:
+def read_dpx(path: str, as_f16: bool = False) -> Optional[np.ndarray]:
     """
     Read an ANSI/SMPTE 268M DPX file into a Float32 RGBA NumPy array.
     Supports:
@@ -312,6 +385,23 @@ def read_dpx(path: str) -> Optional[np.ndarray]:
     """
     if not os.path.exists(path):
         return None
+
+    # 0. Accelerated Rust Engine: Multi-threaded zero-GIL DPX decoder
+    if _is_rust_io_enabled():
+        try:
+            import openreview_engine
+            rust_eng = getattr(read_dpx, "_rust_engine", None)
+            if rust_eng is None:
+                rust_eng = openreview_engine.OpenReviewEngine()
+                read_dpx._rust_engine = rust_eng
+            native_frame = rust_eng.read_dpx(path, as_f16)
+            dtype = np.float16 if as_f16 else np.float32
+            shape = (native_frame.height, native_frame.width, 4)
+            out = FrameBufferPool.instance().acquire(shape, dtype)
+            np.copyto(out, np.frombuffer(native_frame.as_memoryview(), dtype=dtype).reshape(shape))
+            return out
+        except Exception:
+            pass
 
     try:
         with open(path, "rb") as f:
@@ -381,19 +471,21 @@ def read_dpx(path: str) -> Optional[np.ndarray]:
 
                 words = words[:total_pixels]
 
-                rgba = np.empty((total_pixels, 4), dtype=np.float32)
+                target_dt = np.float16 if as_f16 else np.float32
+                out = FrameBufferPool.instance().acquire((height, width, 4), target_dt)
+                flat_out = out.reshape((total_pixels, 4))
                 scale = np.float32(1.0 / 1023.0)
                 if packing == 2:  # Method B (Least significant bit aligned)
-                    np.multiply(words & 0x3FF, scale, out=rgba[:, 0], casting="unsafe")
-                    np.multiply((words >> 10) & 0x3FF, scale, out=rgba[:, 1], casting="unsafe")
-                    np.multiply((words >> 20) & 0x3FF, scale, out=rgba[:, 2], casting="unsafe")
+                    np.multiply(words & 0x3FF, scale, out=flat_out[:, 0], casting="unsafe")
+                    np.multiply((words >> 10) & 0x3FF, scale, out=flat_out[:, 1], casting="unsafe")
+                    np.multiply((words >> 20) & 0x3FF, scale, out=flat_out[:, 2], casting="unsafe")
                 else:  # Method A (Standard SMPTE 268M MSB aligned: bits 31..22, 21..12, 11..2)
-                    np.multiply((words >> 22) & 0x3FF, scale, out=rgba[:, 0], casting="unsafe")
-                    np.multiply((words >> 12) & 0x3FF, scale, out=rgba[:, 1], casting="unsafe")
-                    np.multiply((words >> 2) & 0x3FF, scale, out=rgba[:, 2], casting="unsafe")
+                    np.multiply((words >> 22) & 0x3FF, scale, out=flat_out[:, 0], casting="unsafe")
+                    np.multiply((words >> 12) & 0x3FF, scale, out=flat_out[:, 1], casting="unsafe")
+                    np.multiply((words >> 2) & 0x3FF, scale, out=flat_out[:, 2], casting="unsafe")
 
-                rgba[:, 3] = 1.0
-                return np.ascontiguousarray(rgba.reshape((height, width, 4)), dtype=np.float32)
+                flat_out[:, 3] = 1.0
+                return out
 
             # ------------------------------------------------------------------
             # 16-Bit DPX
@@ -457,7 +549,7 @@ def read_dpx(path: str) -> Optional[np.ndarray]:
         import cv2
         mat = cv2.imread(path, cv2.IMREAD_UNCHANGED)
         if mat is not None:
-            return _standardize_to_rgba_float(mat)
+            return _standardize_to_rgba_float(mat, as_f16=as_f16)
     except Exception:
         pass
 
@@ -591,7 +683,7 @@ def is_image_file(path: str) -> bool:
 # Specialized TIFF, Targa (TGA), Cineon, PFM/PNM, Radiance HDR, SGI, PIX, SVG/Qt
 # ==============================================================================
 
-def read_tiff(path: str) -> Optional[np.ndarray]:
+def read_tiff(path: str, as_f16: bool = False) -> Optional[np.ndarray]:
     """
     Read TIFF (.tif, .tiff) preserving full bit depth (8-bit, 16-bit uint, 32-bit float).
     Prefers OpenCV for direct uncompressed / LZW 16-bit/float buffers, falling back to Pillow.
@@ -599,11 +691,28 @@ def read_tiff(path: str) -> Optional[np.ndarray]:
     if not os.path.exists(path):
         return None
 
+    # 0. Accelerated Rust Engine: Multi-threaded zero-GIL TIFF decoder
+    if _is_rust_io_enabled():
+        try:
+            import openreview_engine
+            rust_eng = getattr(read_tiff, "_rust_engine", None)
+            if rust_eng is None:
+                rust_eng = openreview_engine.OpenReviewEngine()
+                read_tiff._rust_engine = rust_eng
+            native_frame = rust_eng.read_tiff(path, as_f16)
+            dtype = np.float16 if as_f16 else np.float32
+            shape = (native_frame.height, native_frame.width, 4)
+            out = FrameBufferPool.instance().acquire(shape, dtype)
+            np.copyto(out, np.frombuffer(native_frame.as_memoryview(), dtype=dtype).reshape(shape))
+            return out
+        except Exception:
+            pass
+
     try:
         import cv2
         mat = cv2.imread(path, cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
         if mat is not None:
-            return _standardize_to_rgba_float(mat)
+            return _standardize_to_rgba_float(mat, as_f16=as_f16)
     except Exception as e:
         logger.debug("OpenCV TIFF read failed on %s: %s", path, e)
 
@@ -646,7 +755,7 @@ def read_tga(path: str) -> Optional[np.ndarray]:
         import cv2
         mat = cv2.imread(path, cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
         if mat is not None:
-            return _standardize_to_rgba_float(mat)
+            return _standardize_to_rgba_float(mat, as_f16=as_f16)
     except Exception as e:
         logger.debug("OpenCV TGA read failed on %s: %s", path, e)
 
@@ -769,7 +878,7 @@ def read_rgbe_hdr(path: str) -> Optional[np.ndarray]:
         import cv2
         mat = cv2.imread(path, cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
         if mat is not None:
-            return _standardize_to_rgba_float(mat)
+            return _standardize_to_rgba_float(mat, as_f16=as_f16)
     except Exception:
         pass
 
@@ -992,7 +1101,12 @@ def read_ffmpeg_single_frame(path: str) -> Optional[np.ndarray]:
 # General Image Loader Dispatcher
 # ==============================================================================
 
-def read_image_file(path: str, layer: Optional[str] = None) -> Optional[np.ndarray]:
+def read_image_file(
+    path: str,
+    layer: Optional[str] = None,
+    as_f16: bool = False,
+    mapping: Optional[Any] = None,
+) -> Optional[np.ndarray]:
     """
     Unified, rock-solid image reader for OpenReview.
     Automatically identifies file type and decodes into a normalized Float32 RGBA array (H, W, 4).
@@ -1005,13 +1119,13 @@ def read_image_file(path: str, layer: Optional[str] = None) -> Optional[np.ndarr
 
     # 1. Specialized EXR handler
     if ext == ".exr":
-        result = read_exr(path, layer=layer)
+        result = read_exr(path, layer=layer, as_f16=as_f16, mapping=mapping)
         if result is not None:
             return result
 
     # 2. Specialized DPX handler
     if ext == ".dpx":
-        result = read_dpx(path)
+        result = read_dpx(path, as_f16=as_f16)
         if result is not None:
             return result
 
@@ -1023,7 +1137,7 @@ def read_image_file(path: str, layer: Optional[str] = None) -> Optional[np.ndarr
 
     # 4. Specialized TIFF / Camera RAW-TIFF handler
     if ext in (".tif", ".tiff", ".fax", ".g3", ".g4", ".dng"):
-        result = read_tiff(path)
+        result = read_tiff(path, as_f16=as_f16)
         if result is not None:
             return result
 
@@ -1084,7 +1198,7 @@ def read_image_file(path: str, layer: Optional[str] = None) -> Optional[np.ndarr
         import cv2
         mat = cv2.imread(path, cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
         if mat is not None:
-            return _standardize_to_rgba_float(mat)
+            return _standardize_to_rgba_float(mat, as_f16=as_f16)
     except Exception as e:
         logger.debug("OpenCV open failed for %s: %s", path, e)
 
@@ -1102,8 +1216,8 @@ def read_image_file(path: str, layer: Optional[str] = None) -> Optional[np.ndarr
     return None
 
 
-def _standardize_to_rgba_float(mat: np.ndarray) -> np.ndarray:
-    """Normalize arbitrary OpenCV matrix into a (H, W, 4) Float32 array."""
+def _standardize_to_rgba_float(mat: np.ndarray, as_f16: bool = False) -> np.ndarray:
+    """Normalize arbitrary OpenCV matrix into a (H, W, 4) Float32/Float16 array via FrameBufferPool."""
     import cv2
 
     # Scale to 0.0 .. 1.0 based on data type
@@ -1117,15 +1231,22 @@ def _standardize_to_rgba_float(mat: np.ndarray) -> np.ndarray:
     mat_float = mat.astype(np.float32, copy=False) if scale == 1.0 else (mat.astype(np.float32) / scale)
 
     if mat_float.ndim == 2:
-        # Monochrome / grayscale
-        return cv2.cvtColor(mat_float, cv2.COLOR_GRAY2RGBA)
+        res = cv2.cvtColor(mat_float, cv2.COLOR_GRAY2RGBA)
     elif mat_float.ndim == 3:
         channels = mat_float.shape[2]
         if channels == 3:
-            return cv2.cvtColor(mat_float, cv2.COLOR_BGR2RGBA)
+            res = cv2.cvtColor(mat_float, cv2.COLOR_BGR2RGBA)
         elif channels == 4:
-            return cv2.cvtColor(mat_float, cv2.COLOR_BGRA2RGBA)
+            res = cv2.cvtColor(mat_float, cv2.COLOR_BGRA2RGBA)
         elif channels > 4:
-            return cv2.cvtColor(mat_float[:, :, :4], cv2.COLOR_BGRA2RGBA)
+            res = cv2.cvtColor(mat_float[:, :, :4], cv2.COLOR_BGRA2RGBA)
+        else:
+            res = mat_float
+    else:
+        res = mat_float
 
-    return mat_float
+    target_dt = np.float16 if as_f16 else np.float32
+    h, w = res.shape[:2]
+    out = FrameBufferPool.instance().acquire((h, w, 4), target_dt)
+    np.copyto(out, res.astype(target_dt, copy=False))
+    return out

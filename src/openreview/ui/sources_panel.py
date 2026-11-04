@@ -1567,16 +1567,8 @@ class SourcesPanelWidget(QWidget):
         if target_p and str(target_p).lower().endswith(".exr"):
             exr_path = str(target_p)
 
-        if exr_path and hasattr(self, "exr_properties_bar"):
-            try:
-                from openreview.core.image_io import get_exr_channels
-                ch_info = get_exr_channels(str(exr_path))
-                num_layers = len(ch_info.get("layers", {}))
-                self.lbl_exr_badge.setText(f"EXR ({num_layers} AOVs)" if num_layers > 1 else "EXR")
-            except Exception:
-                self.lbl_exr_badge.setText("EXR")
-            self.exr_properties_bar.show()
-        elif hasattr(self, "exr_properties_bar"):
+        # Unify in dedicated VFX EXR dock; keep redundant mini-bar hidden
+        if hasattr(self, "exr_properties_bar"):
             self.exr_properties_bar.hide()
 
     def _on_input_selected(self) -> None:

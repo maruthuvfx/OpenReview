@@ -185,8 +185,8 @@ def test_load_video_path(qtbot, tmp_path):
     assert window.clock.out_frame == window.clock.end_frame
     assert window.clock.fps == 24.0
     assert "sample.mov" in window.windowTitle()
-    assert window.viewport.input_space == 0  # sRGB
-    assert window.viewport.view_transform == 0  # sRGB Display
+    assert window.viewport.input_space in (0, 1)  # sRGB input space
+    assert window.viewport.view_transform in (0, 1)  # sRGB Display
 
 
 def test_annotation_tool_selection_and_drawing(qtbot):

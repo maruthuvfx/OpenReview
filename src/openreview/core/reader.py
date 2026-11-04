@@ -72,6 +72,7 @@ def read_adaptive_frame(
 def ensure_c_contiguous_rgba(data: np.ndarray) -> np.ndarray:
     """
     Standardize frame array to C-contiguous 4-channel RGBA in background thread.
+    - Utilizes FrameBufferPool to recycle pre-allocated buffers and avoid GC pressure.
     - Preserves float16 or uint8 (or converts float32 to float16).
     - If 3-channel RGB: appends 1.0 (float) or 255 (uint8) alpha channel.
     - If 1-channel or 2-channel: expands to 4-channel RGBA.
@@ -80,47 +81,46 @@ def ensure_c_contiguous_rgba(data: np.ndarray) -> np.ndarray:
     if not isinstance(data, np.ndarray) or data.size == 0 or data.ndim < 2:
         return data
 
+    from openreview.core.buffer_pool import FrameBufferPool
+    pool = FrameBufferPool.instance()
     h, w = data.shape[:2]
 
     # 1D/2D grayscale/matte -> RGBA
     if data.ndim == 2:
-        if data.dtype == np.uint8:
-            rgba = np.empty((h, w, 4), dtype=np.uint8)
-            rgba[:, :, 0] = data
-            rgba[:, :, 1] = data
-            rgba[:, :, 2] = data
-            rgba[:, :, 3] = 255
-            return np.ascontiguousarray(rgba)
-        else:
-            target_dtype = np.float16 if data.dtype in (np.float32, np.float16) else data.dtype
-            d = data.astype(target_dtype, copy=False)
-            rgba = np.empty((h, w, 4), dtype=target_dtype)
-            rgba[:, :, 0] = d
-            rgba[:, :, 1] = d
-            rgba[:, :, 2] = d
-            rgba[:, :, 3] = 1.0
-            return np.ascontiguousarray(rgba)
+        target_dtype = np.uint8 if data.dtype == np.uint8 else (
+            np.float16 if data.dtype in (np.float32, np.float16) else data.dtype
+        )
+        rgba = pool.acquire((h, w, 4), dtype=target_dtype)
+        d = data if data.dtype == target_dtype else data.astype(target_dtype, copy=False)
+        rgba[:, :, 0] = d
+        rgba[:, :, 1] = d
+        rgba[:, :, 2] = d
+        rgba[:, :, 3] = 255 if target_dtype == np.uint8 else 1.0
+        return rgba
 
     # 3-channel RGB -> 4-channel RGBA
     if data.ndim == 3 and data.shape[2] == 3:
-        if data.dtype == np.uint8:
-            rgba = np.empty((h, w, 4), dtype=np.uint8)
-            rgba[:, :, :3] = data
-            rgba[:, :, 3] = 255
-            return np.ascontiguousarray(rgba)
+        target_dtype = np.uint8 if data.dtype == np.uint8 else (
+            np.float16 if data.dtype in (np.float32, np.float16) else data.dtype
+        )
+        rgba = pool.acquire((h, w, 4), dtype=target_dtype)
+        if data.dtype == target_dtype:
+            np.copyto(rgba[:, :, :3], data)
         else:
-            target_dtype = np.float16 if data.dtype in (np.float32, np.float16) else data.dtype
-            rgba = np.empty((h, w, 4), dtype=target_dtype)
             rgba[:, :, :3] = data.astype(target_dtype, copy=False)
-            rgba[:, :, 3] = 1.0
-            return np.ascontiguousarray(rgba)
+        rgba[:, :, 3] = 255 if target_dtype == np.uint8 else 1.0
+        return rgba
 
     # 4-channel RGBA: convert float32 to float16 for GPU performance & memory efficiency
-    if data.dtype == np.float32:
-        data = data.astype(np.float16, copy=False)
+    if data.ndim == 3 and data.shape[2] == 4 and data.dtype == np.float32:
+        rgba = pool.acquire((h, w, 4), dtype=np.float16)
+        np.copyto(rgba, data, casting="same_kind")
+        return rgba
 
     if not data.flags.c_contiguous:
-        data = np.ascontiguousarray(data)
+        rgba = pool.acquire(data.shape, dtype=data.dtype)
+        np.copyto(rgba, data)
+        return rgba
 
     return data
 
@@ -228,6 +228,10 @@ class DiskMediaReader(MediaReader):
     def __init__(self, file_pattern: str, active_layer: Optional[str] = None):
         self.file_pattern = file_pattern
         self.active_layer = active_layer
+        self.active_mapping = None
+
+    def set_matrix_mapping(self, mapping: Optional[Any]) -> None:
+        self.active_mapping = mapping
 
     def set_layer(self, layer: Optional[str]) -> None:
         self.active_layer = layer
@@ -246,7 +250,7 @@ class DiskMediaReader(MediaReader):
             return None
 
         from openreview.core.image_io import read_image_file
-        arr = read_image_file(path, layer=self.active_layer)
+        arr = read_image_file(path, layer=self.active_layer, as_f16=True, mapping=self.active_mapping)
         if arr is not None:
             return arr
 
@@ -446,6 +450,13 @@ class BackgroundDiskCacheTask(QRunnable):
         self.signals = TaskSignals()
 
     def run(self) -> None:
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                ctypes.windll.kernel32.SetThreadPriority(ctypes.windll.kernel32.GetCurrentThread(), -1)
+            except Exception:
+                pass
+
         if self.reader is None or (self.is_cancelled_fn and self.is_cancelled_fn()):
             self._finish(False)
             return
@@ -589,6 +600,19 @@ class ReaderEngine(QObject):
         self._prefetch_chain_timer.setInterval(60)
         self._prefetch_chain_timer.timeout.connect(self._prefetch_next_batch)
 
+        # Native Rust Prefetch Accelerator
+        self._rust_engine = getattr(cache, "_rust_engine", None)
+        if self._rust_engine is None:
+            try:
+                import openreview_engine
+                self._rust_engine = openreview_engine.OpenReviewEngine()
+            except Exception:
+                self._rust_engine = None
+
+        self._rust_notify_timer = QTimer(self)
+        self._rust_notify_timer.setInterval(33)  # 30 Hz throttled UI update
+        self._rust_notify_timer.timeout.connect(self._on_rust_prefetch_tick)
+
         try:
             from openreview.core.preferences import PreferencesManager
             PreferencesManager.instance().preferences_changed.connect(self._on_preferences_changed)
@@ -638,6 +662,13 @@ class ReaderEngine(QObject):
         self._interactive_pending.clear()
         if hasattr(self, "_prefetch_chain_timer"):
             self._prefetch_chain_timer.stop()
+        if hasattr(self, "_rust_notify_timer"):
+            self._rust_notify_timer.stop()
+        if getattr(self, "_rust_engine", None) is not None:
+            try:
+                self._rust_engine.cancel_prefetch()
+            except Exception:
+                pass
 
     def request_immediate_frame(
         self,
@@ -707,7 +738,7 @@ class ReaderEngine(QObject):
         out_frame: Optional[int] = None,
         current_frame: Optional[int] = None,
         resolver_fn=None,
-        max_batch: int = 16,
+        max_batch: int = 64,
     ) -> None:
         if self._is_paused:
             return
@@ -737,9 +768,16 @@ class ReaderEngine(QObject):
         if window_start > window_end:
             return  # Cache is OFF or empty target window
 
-        # Quick exit if all frames in the target window are already cached in full resolution
+        # Quick exit if all frames in the target window are already cached
+        prefer_proxy_cache = True
+        try:
+            from openreview.core.preferences import PreferencesManager
+            prefer_proxy_cache = getattr(PreferencesManager.instance().prefs, "enable_proxy_caching", True)
+        except Exception:
+            pass
+
         if hasattr(self.cache, "get_cached_frames"):
-            cached_set = self.cache.get_cached_frames(allow_proxy=False)
+            cached_set = self.cache.get_cached_frames(allow_proxy=prefer_proxy_cache)
             if all(f in cached_set for f in range(window_start, window_end + 1)):
                 return
 
@@ -750,6 +788,7 @@ class ReaderEngine(QObject):
         behind_frames = list(range(cur_f - 1, window_start - 1, -1))
         ordered_timeline_frames = ahead_frames + behind_frames
 
+        rust_items: list[tuple[str, int, str]] = []
         queued_count = 0
         for tf in ordered_timeline_frames:
             if queued_count >= max_batch:
@@ -773,15 +812,41 @@ class ReaderEngine(QObject):
                 sid_str = src_id or ""
                 cache_key = (sid_str, src_frame)
 
-                # Check if already cached in full resolution
+                # Check if already cached (respecting proxy mode)
                 if sid_str:
-                    if self.cache.has_source_frame(sid_str, src_frame, allow_proxy=False):
+                    if self.cache.has_source_frame(sid_str, src_frame, allow_proxy=prefer_proxy_cache):
                         continue
                 else:
-                    if self.cache.has_frame(src_frame, allow_proxy=False):
+                    if self.cache.has_frame(src_frame, allow_proxy=prefer_proxy_cache):
                         continue
 
                 if cache_key in self._pending_keys:
+                    continue
+
+                # Native Rust fast prefetch path for VFX sequences (EXR, DPX, TIFF)
+                file_path = None
+                if hasattr(rdr, "seq") and hasattr(rdr.seq, "frame_path"):
+                    file_path = rdr.seq.frame_path(src_frame)
+                elif hasattr(rdr, "path") and isinstance(rdr.path, str):
+                    file_path = rdr.path
+
+                rust_enabled = True
+                try:
+                    from openreview.core.preferences import PreferencesManager
+                    rust_enabled = getattr(PreferencesManager.instance().prefs, "enable_rust_engine", True)
+                except Exception:
+                    rust_enabled = True
+
+                if (
+                    rust_enabled
+                    and self._rust_engine is not None
+                    and file_path
+                    and any(file_path.lower().endswith(ext) for ext in (".exr", ".dpx", ".tif", ".tiff"))
+                    and os.path.exists(file_path)
+                ):
+                    self._pending_keys.add(cache_key)
+                    queued_count += 1
+                    rust_items.append((sid_str, src_frame, file_path))
                     continue
 
                 self._pending_keys.add(cache_key)
@@ -806,6 +871,51 @@ class ReaderEngine(QObject):
                 )
                 task.signals.loaded.connect(self._on_frame_loaded)
                 self.thread_pool.start(task, priority=prio)
+
+        if rust_items and self._rust_engine is not None:
+            try:
+                from openreview.core.preferences import PreferencesManager
+                prefs = PreferencesManager.instance().prefs
+                proxy_scale = 0
+                if getattr(prefs, "enable_proxy_caching", True):
+                    proxy_scale = int(getattr(prefs, "proxy_resolution_scale", 2))
+                self._rust_engine.prefetch_batch(rust_items, proxy_scale)
+                if hasattr(self, "_rust_notify_timer") and not self._rust_notify_timer.isActive():
+                    self._rust_notify_timer.start()
+            except Exception:
+                pass
+
+    def _on_rust_prefetch_tick(self) -> None:
+        """Throttled 30 Hz tick checking completed frames from native Rust prefetch worker pool."""
+        if self._is_paused or self._rust_engine is None:
+            if hasattr(self, "_rust_notify_timer"):
+                self._rust_notify_timer.stop()
+            return
+
+        sid = getattr(self.cache, "_active_source_id", "") or ""
+        try:
+            cached_full = set(self._rust_engine.get_cached_frames(sid))
+            cached_proxy = set(self._rust_engine.get_cached_proxy_frames(sid))
+            all_cached = cached_full | cached_proxy
+        except Exception:
+            all_cached = set()
+
+        resolved = [k for k in self._pending_keys if k[0] == sid and k[1] in all_cached]
+        if resolved:
+            for k in resolved:
+                self._pending_keys.discard(k)
+                self.frame_ready.emit(k[1])
+            if hasattr(self.cache, "_emit_status"):
+                self.cache._emit_status(force=True)
+
+        if len(self._pending_keys) <= 4:
+            if hasattr(self, "_rust_notify_timer") and len(self._pending_keys) == 0:
+                self._rust_notify_timer.stop()
+            if not self._is_paused:
+                if self._last_prefetch_params and hasattr(self, "_prefetch_chain_timer") and not self._prefetch_chain_timer.isActive():
+                    self._prefetch_chain_timer.start(20)
+                elif len(self._pending_keys) == 0:
+                    self._schedule_next_background_cache_task()
 
     def _on_frame_loaded(
         self,

@@ -11,6 +11,8 @@ from typing import Optional
 from PySide6.QtCore import QObject, Signal, QUrl, QTimer
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 
+from openreview.audio.micro_scrubber import MicroBufferAudioScrubber
+
 
 class AudioEngine(QObject):
     """
@@ -47,7 +49,12 @@ class AudioEngine(QObject):
         self._audio_output: Optional[QAudioOutput] = None
         self._init_multimedia()
 
-        # Scrubbing burst timer
+        # Ultra-low latency micro-buffer audio scrubbing engine
+        self._micro_scrubber = MicroBufferAudioScrubber(sample_rate=48000, parent=self)
+        self._micro_scrubber.set_volume(self._volume)
+        self._micro_scrubber.set_muted(self._is_muted)
+
+        # Scrubbing burst timer (fallback)
         self._scrub_timer = QTimer(self)
         self._scrub_timer.setSingleShot(True)
         self._scrub_timer.timeout.connect(self._stop_scrub_burst)
@@ -84,6 +91,9 @@ class AudioEngine(QObject):
             self._player.stop()
             self._player.setSource(QUrl.fromLocalFile(self._media_path))
 
+        if self._micro_scrubber:
+            self._micro_scrubber.load_audio(self._media_path)
+
         self.track_loaded.emit(self._media_path)
         return True
 
@@ -94,6 +104,8 @@ class AudioEngine(QObject):
         if self._player:
             self._player.stop()
             self._player.setSource(QUrl())
+        if self._micro_scrubber:
+            self._micro_scrubber.unload()
         self._media_path = None
         self.track_unloaded.emit()
 
@@ -116,6 +128,8 @@ class AudioEngine(QObject):
         self._volume = max(0.0, min(1.0, float(volume)))
         if self._audio_output:
             self._audio_output.setVolume(self._volume)
+        if hasattr(self, "_micro_scrubber") and self._micro_scrubber:
+            self._micro_scrubber.set_volume(self._volume)
         self.volume_changed.emit(self._volume)
 
     def is_muted(self) -> bool:
@@ -126,6 +140,8 @@ class AudioEngine(QObject):
         self._is_muted = bool(muted)
         if self._audio_output:
             self._audio_output.setMuted(self._is_muted)
+        if hasattr(self, "_micro_scrubber") and self._micro_scrubber:
+            self._micro_scrubber.set_muted(self._is_muted)
         self.mute_changed.emit(self._is_muted)
 
     def toggle_mute(self) -> bool:
@@ -196,6 +212,8 @@ class AudioEngine(QObject):
     def pause(self, frame: Optional[int] = None) -> None:
         """Immediately pause audio playback and cancel any active scrub burst."""
         self._scrub_timer.stop()
+        if hasattr(self, "_micro_scrubber") and self._micro_scrubber:
+            self._micro_scrubber.stop()
         if not self.has_audio() or not self._player:
             return
         if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
@@ -218,6 +236,8 @@ class AudioEngine(QObject):
 
         if is_playing and 0.1 <= shuttle_speed <= 2.0:
             self._scrub_timer.stop()
+            if hasattr(self, "_micro_scrubber") and self._micro_scrubber:
+                self._micro_scrubber.stop()
             if abs(self._player.playbackRate() - shuttle_speed) > 0.01:
                 self._player.setPlaybackRate(float(shuttle_speed))
 
@@ -244,20 +264,32 @@ class AudioEngine(QObject):
 
     def scrub_frame(self, frame: int) -> None:
         """
-        Scrub audio at given frame: plays a short burst (60ms) if scrubbing is enabled.
+        Scrub audio at given frame: uses low-latency micro-buffer engine with smooth de-clicking.
+        Falls back to short QMediaPlayer burst if PCM data is still decoding.
         """
-        if not self.has_audio() or not self._player or not self._scrubbing_enabled:
+        if not self.has_audio() or not self._scrubbing_enabled or self._is_muted:
             return
 
         target_ms = self.frame_to_ms(frame)
-        self._player.setPosition(target_ms)
         self._last_synced_frame = frame
 
-        if not self._is_muted:
-            if abs(self._player.playbackRate() - 1.0) > 0.01:
-                self._player.setPlaybackRate(1.0)
-            self._player.play()
-            self._scrub_timer.start(60)
+        # 1. Ultra-Low Latency Micro-Buffer Engine (Sub-millisecond, anti-click, reverse scrub)
+        if hasattr(self, "_micro_scrubber") and self._micro_scrubber and self._micro_scrubber.has_pcm():
+            self._scrub_timer.stop()
+            if self._player and self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                self._player.pause()
+            if self._micro_scrubber.scrub(target_ms, frame, self._fps):
+                return
+
+        # 2. Fallback to QMediaPlayer burst
+        if not self._player:
+            return
+
+        self._player.setPosition(target_ms)
+        if abs(self._player.playbackRate() - 1.0) > 0.01:
+            self._player.setPlaybackRate(1.0)
+        self._player.play()
+        self._scrub_timer.start(60)
 
     def _stop_scrub_burst(self) -> None:
         if self._player and self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:

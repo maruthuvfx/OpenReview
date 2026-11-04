@@ -48,7 +48,7 @@ class UserPreferences:
     default_brush_width: float = 6.0
 
     # Caching
-    default_cache_mode: str = "off"  # "off", "play_ahead", "region", "all"
+    default_cache_mode: str = "play_ahead"  # "off", "play_ahead", "region", "all"
     cache_toggle_mode: str = "region"  # "region", "play_ahead", "all", "last_active"
     auto_ram_budget: bool = True
     lookahead_cache_gb: float = 4.0
@@ -64,12 +64,21 @@ class UserPreferences:
     prefetch_worker_threads: int = 6
     fast_playback_laptop_mode: bool = False
 
+    # Native Rust Engine Acceleration
+    enable_rust_engine: bool = True
+    rust_worker_threads: int = 0  # 0 = auto (CPU - 2)
+    enable_proxy_caching: bool = True
+    proxy_resolution_scale: int = 2  # 2 = 1/2 res, 4 = 1/4 res
+
     # GPU Performance & Playback Engines
     playback_engine: str = "opengl_core"  # "opengl_core", "async_pbo", "software_safe"
     selected_gpu_device: str = "auto"     # "auto" or specific GPU name
     hardware_video_decoding: bool = True
+    enable_pyav_engine: bool = True
     enable_opencl_acceleration: bool = True
     enable_pbo_streaming: bool = True
+    enable_buffer_pooling: bool = True
+    buffer_pool_max_buffers: int = 16
     vsync_enabled: bool = False
     gpu_vram_limit_mb: float = 2048.0
 
@@ -84,6 +93,8 @@ class UserPreferences:
     safe_guides_enabled: bool = False
     safe_guides_matte_constrained: bool = True
     hud_opacity: float = 0.85  # 0.30 to 1.00 (30% to 100%)
+    active_workspace: str = "review"
+    custom_workspaces: dict[str, str] = field(default_factory=dict)
 
     # Color Management Configuration
     color_management_mode: str = "standard"
@@ -131,6 +142,9 @@ class UserPreferences:
     export_png_mode: str = "png8"  # "png8", "png24_opt", "16"
     export_png_dither: bool = True
     export_png_compression: int = 4  # 0..9
+
+    # Metadata & Pipeline Inspection
+    exiftool_path: str = ""
 
 
 class PreferencesManager(QObject):
@@ -183,7 +197,7 @@ class PreferencesManager(QObject):
                     canvas_scrub_enabled=bool(data.get("canvas_scrub_enabled", True)),
                     auto_retime_mismatched_fps=bool(data.get("auto_retime_mismatched_fps", True)),
                     play_all_frames=bool(data.get("play_all_frames", True)),
-                    default_cache_mode=str(data.get("default_cache_mode", "off")),
+                    default_cache_mode=str(data.get("default_cache_mode", "play_ahead")),
                     cache_toggle_mode=str(data.get("cache_toggle_mode", "region")),
                     auto_ram_budget=bool(data.get("auto_ram_budget", True)),
                     lookahead_cache_gb=float(data.get("lookahead_cache_gb", 4.0)),
@@ -193,11 +207,18 @@ class PreferencesManager(QObject):
                     prefetch_buffer_size=int(data.get("prefetch_buffer_size", 48)),
                     prefetch_worker_threads=int(data.get("prefetch_worker_threads", max(2, min(os.cpu_count() or 4, 8)))),
                     fast_playback_laptop_mode=bool(data.get("fast_playback_laptop_mode", False)),
-                    playback_engine=str(data.get("playback_engine", "opengl_core")),
+                    enable_rust_engine=bool(data.get("enable_rust_engine", True)),
+                    rust_worker_threads=int(data.get("rust_worker_threads", 0)),
+                    enable_proxy_caching=bool(data.get("enable_proxy_caching", True)),
+                    proxy_resolution_scale=int(data.get("proxy_resolution_scale", 2)),
+                    playback_engine=str(data.get("playback_engine", "async_pbo")),
                     selected_gpu_device=str(data.get("selected_gpu_device", "auto")),
                     hardware_video_decoding=bool(data.get("hardware_video_decoding", True)),
+                    enable_pyav_engine=bool(data.get("enable_pyav_engine", True)),
                     enable_opencl_acceleration=bool(data.get("enable_opencl_acceleration", True)),
                     enable_pbo_streaming=bool(data.get("enable_pbo_streaming", True)),
+                    enable_buffer_pooling=bool(data.get("enable_buffer_pooling", True)),
+                    buffer_pool_max_buffers=int(data.get("buffer_pool_max_buffers", 16)),
                     vsync_enabled=bool(data.get("vsync_enabled", False)),
                     gpu_vram_limit_mb=float(data.get("gpu_vram_limit_mb", 2048.0)),
                     shortcuts=dict(data.get("shortcuts", {})),
@@ -208,6 +229,8 @@ class PreferencesManager(QObject):
                     safe_guides_enabled=bool(data.get("safe_guides_enabled", False)),
                     safe_guides_matte_constrained=bool(data.get("safe_guides_matte_constrained", True)),
                     hud_opacity=float(data.get("hud_opacity", 0.85)),
+                    active_workspace=str(data.get("active_workspace", "review")),
+                    custom_workspaces=dict(data.get("custom_workspaces", {})),
                     color_management_mode=str(data.get("color_management_mode", "standard")),
                     standard_view_transform=str(data.get("standard_view_transform", "sRGB")),
                     standard_input_space=str(data.get("standard_input_space", "linear")),
@@ -258,7 +281,7 @@ class PreferencesManager(QObject):
                 self._prefs.start_fullscreen = settings.value("start_fullscreen", False, type=bool)
                 self._prefs.canvas_scrub_enabled = settings.value("canvas_scrub_enabled", True, type=bool)
                 self._prefs.auto_retime_mismatched_fps = settings.value("auto_retime_mismatched_fps", True, type=bool)
-                self._prefs.default_cache_mode = str(settings.value("default_cache_mode", "off"))
+                self._prefs.default_cache_mode = str(settings.value("default_cache_mode", "play_ahead"))
                 self._prefs.cache_toggle_mode = str(settings.value("cache_toggle_mode", "region"))
                 self._prefs.auto_ram_budget = settings.value("auto_ram_budget", True, type=bool)
                 self._prefs.lookahead_cache_gb = float(settings.value("lookahead_cache_gb", 4.0))
@@ -267,6 +290,10 @@ class PreferencesManager(QObject):
                 self._prefs.playback_texture_mode = str(settings.value("playback_texture_mode", "auto"))
                 self._prefs.prefetch_buffer_size = int(settings.value("prefetch_buffer_size", 48))
                 self._prefs.fast_playback_laptop_mode = settings.value("fast_playback_laptop_mode", False, type=bool)
+                self._prefs.enable_rust_engine = settings.value("enable_rust_engine", True, type=bool)
+                self._prefs.rust_worker_threads = int(settings.value("rust_worker_threads", 0))
+                self._prefs.enable_proxy_caching = settings.value("enable_proxy_caching", True, type=bool)
+                self._prefs.proxy_resolution_scale = int(settings.value("proxy_resolution_scale", 2))
                 self._prefs.console_auto_open_on_error = settings.value("console_auto_open_on_error", True, type=bool)
                 self._prefs.default_brush_width = float(settings.value("default_brush_width", 6.0))
                 self._prefs.hud_opacity = float(settings.value("hud_opacity", 0.85))

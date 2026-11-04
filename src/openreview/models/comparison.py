@@ -17,6 +17,10 @@ class ComparisonMode(IntEnum):
     ADD = 5
     DIFFERENCE_INVERTED = 6
     SEQUENCE = 7
+    SPOTLIGHT = 8
+    MULTIPLY = 9
+    SCREEN = 10
+    OVERLAY = 11
 
 
 @dataclass
@@ -26,6 +30,9 @@ class ComparisonState:
     wipe_angle_deg: float = 0.0  # 0.0 = vertical line (left/right split), 90.0 = horizontal line (top/bottom split)
     wipe_center: tuple = (0.5, 0.5)  # Normalized (x, y) center pivot of the wipe control
     diff_boost: float = 1.0
+    diff_heatmap: bool = False  # Perceptual false-color Turbo difference heatmap
+    wipe_show_line: bool = True  # In-shader anti-aliased divider overlay line
+    spotlight_radius: float = 0.25  # Normalized radius for spotlight inspection
     stack_mix: float = 1.0  # 0.0 to 1.0
     channels_a: tuple = (True, True, True, True)  # R, G, B, A
     primary_clip: Optional[MediaClip] = None
@@ -38,12 +45,21 @@ class ComparisonState:
         else:
             self.mode = ComparisonMode.WIPE
 
+    def toggle_diff_heatmap(self) -> None:
+        """Toggle perceptual Turbo false-color difference heatmap."""
+        self.diff_heatmap = not self.diff_heatmap
+
+    def toggle_wipe_line(self) -> None:
+        """Toggle in-shader anti-aliased wipe divider line."""
+        self.wipe_show_line = not self.wipe_show_line
+
     def reset_wipe(self) -> None:
         """Reset wipe parameters to default 50% split and vertical orientation."""
         self.wipe_position = 0.5
         self.wipe_angle_deg = 0.0
         self.wipe_center = (0.5, 0.5)
         self.diff_boost = 1.0
+        self.spotlight_radius = 0.25
 
     def flip_orientation(self) -> None:
         """Flip wipe orientation between Vertical (0°) and Horizontal (90°)."""
@@ -61,6 +77,9 @@ class ComparisonState:
         self.wipe_angle_deg = 0.0
         self.wipe_center = (0.5, 0.5)
         self.diff_boost = 1.0
+        self.diff_heatmap = False
+        self.wipe_show_line = True
+        self.spotlight_radius = 0.25
         self.stack_mix = 1.0
         self.channels_a = (True, True, True, True)
         self.primary_clip = None

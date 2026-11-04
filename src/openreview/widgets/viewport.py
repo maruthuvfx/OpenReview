@@ -45,6 +45,47 @@ from openreview.models.comparison import ComparisonState, ComparisonMode
 from openreview.core.preferences import PreferencesManager
 from openreview.widgets.canvas_text_editor import CanvasTextEditor
 
+_gl_tex_sub_image_2d = None
+_gl_tex_sub_image_2d_failed = False
+
+
+def _get_gl_tex_sub_image_2d():
+    global _gl_tex_sub_image_2d, _gl_tex_sub_image_2d_failed
+    if _gl_tex_sub_image_2d is not None:
+        return _gl_tex_sub_image_2d
+    if _gl_tex_sub_image_2d_failed:
+        return None
+    try:
+        import ctypes
+        if sys.platform == "win32":
+            lib = ctypes.windll.opengl32
+        elif sys.platform == "darwin":
+            lib = ctypes.CDLL("/System/Library/Frameworks/OpenGL.framework/OpenGL")
+        else:
+            try:
+                lib = ctypes.CDLL("libGL.so.1")
+            except Exception:
+                lib = ctypes.CDLL("libGL.so")
+        fn = lib.glTexSubImage2D
+        fn.argtypes = [
+            ctypes.c_uint,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint,
+            ctypes.c_uint,
+            ctypes.c_void_p,
+        ]
+        fn.restype = None
+        _gl_tex_sub_image_2d = fn
+        return _gl_tex_sub_image_2d
+    except Exception:
+        _gl_tex_sub_image_2d_failed = True
+        return None
+
+
 
 @dataclass
 class ColorSampler:
@@ -185,6 +226,7 @@ class ViewportCanvas(QOpenGLWidget):
         self._text_editor = CanvasTextEditor(self)
         self._text_editor.committed.connect(self._on_text_editor_committed)
         self._text_editor.cancelled.connect(self._on_text_editor_cancelled)
+        self._editing_text_stroke_idx: Optional[int] = None
 
         # Color & Shader Uniforms
         self.exposure_ev: float = 0.0
@@ -192,6 +234,9 @@ class ViewportCanvas(QOpenGLWidget):
         self.gamma: float = 1.0
         self.saturation: float = 1.0
         self.channel_mode: int = 0  # 0: RGB, 1: R, 2: G, 3: B, 4: A, 5: Y
+        self.channel_matrix: np.ndarray = np.eye(4, dtype=np.float32)
+        self.channel_enable: tuple = (1.0, 1.0, 1.0, 1.0)
+        self.channel_solo_mode: int = 1  # 0: Color Solo, 1: Greyscale Solo, 2: Normals Remap
         self.input_space: int = 0   # 0: sRGB, 1: ACEScg/Linear, 2: Raw
         self.view_transform: int = 0 # 0: sRGB Display, 1: ACES Filmic, 2: Raw
         self.stereo_mode: int = 0   # 0: Off, 1: Left, 2: Right, 3: Anaglyph, 4: SBS, 5: Diff
@@ -226,8 +271,12 @@ class ViewportCanvas(QOpenGLWidget):
         # Playback Engine & GPU PBO State
         self.playback_engine: PlaybackEngineMode = PlaybackEngineMode.OPENGL_CORE
         self.vsync_enabled: bool = False
-        self._pbo_index: int = 0
-        self._pbo_ids: list[int] = [0, 0]
+        self._pbo_a: list[Optional[QOpenGLBuffer]] = [None, None]
+        self._pbo_b: list[Optional[QOpenGLBuffer]] = [None, None]
+        self._pbo_a_index: int = 0
+        self._pbo_b_index: int = 0
+        self._pbo_a_nbytes: int = 0
+        self._pbo_b_nbytes: int = 0
 
         # OpenGL Objects
         self._shader_program: Optional[QOpenGLShaderProgram] = None
@@ -248,6 +297,9 @@ class ViewportCanvas(QOpenGLWidget):
         self._pending_upload_lut = False
         self._image_matte: Optional[np.ndarray] = None
         self._texture_matte: Optional[QOpenGLTexture] = None
+        self._ocio_lut_texture: Optional[QOpenGLTexture] = None
+        self._pending_upload_ocio_lut = False
+        self._active_ocio_lut_bake: Optional[Any] = None
 
         # Info Strip State
         self.show_info_strip: bool = False
@@ -377,6 +429,27 @@ class ViewportCanvas(QOpenGLWidget):
             elif hasattr(child, "auto_center_in_parent"):
                 child.auto_center_in_parent()
 
+    def set_channel_matrix(self, mat: np.ndarray) -> None:
+        """Apply a 4x4 color transform / swizzling matrix to viewport rendering."""
+        self.channel_matrix = np.asarray(mat, dtype=np.float32)
+        self.update()
+
+    def set_channel_enable(self, r: bool, g: bool, b: bool, a: bool) -> None:
+        """Enable or disable individual color channels."""
+        self.channel_enable = (1.0 if r else 0.0, 1.0 if g else 0.0, 1.0 if b else 0.0, 1.0 if a else 0.0)
+        self.update()
+
+    def set_channel_solo_mode(self, mode: int) -> None:
+        """0: Color Solo, 1: Greyscale Solo, 2: Normals Remap [-1, 1]->[0, 1]."""
+        self.channel_solo_mode = int(mode)
+        self.update()
+
+    def solo_channel(self, mode: int, greyscale: bool = True) -> None:
+        """Convenience method to solo a channel (0: RGB, 1: R, 2: G, 3: B, 4: A, 5: Y)."""
+        self.channel_mode = int(mode)
+        self.channel_solo_mode = 1 if greyscale else 0
+        self.update()
+
     def paintGL(self) -> None:
         if not self._shader_program or not self._shader_program.isLinked():
             return
@@ -397,6 +470,10 @@ class ViewportCanvas(QOpenGLWidget):
         if self._pending_upload_lut:
             self._upload_lut_texture()
             self._pending_upload_lut = False
+
+        if getattr(self, "_pending_upload_ocio_lut", False):
+            self._upload_ocio_lut_texture()
+            self._pending_upload_ocio_lut = False
 
         ctx = self.context()
         if not ctx:
@@ -484,6 +561,17 @@ class ViewportCanvas(QOpenGLWidget):
             self._set_uniform("uGammaPower", 1.0 / max(0.0001, abs(gamma_val)))
             self._set_uniform("uApplyGamma", abs(gamma_val - 1.0) > 0.0001)
             self._set_uniform("uChannelMode", int(self.channel_mode))
+            from PySide6.QtGui import QMatrix4x4
+            c_mat = getattr(self, "channel_matrix", None)
+            if c_mat is not None and len(c_mat.flatten()) == 16:
+                q_mat = QMatrix4x4(*c_mat.flatten().tolist())
+                self._shader_program.setUniformValue("uChannelMatrix", q_mat)
+            else:
+                self._shader_program.setUniformValue("uChannelMatrix", QMatrix4x4())
+
+            ce = getattr(self, "channel_enable", (1.0, 1.0, 1.0, 1.0))
+            self._shader_program.setUniformValue("uChannelEnable", float(ce[0]), float(ce[1]), float(ce[2]), float(ce[3]))
+            self._set_uniform("uChannelSoloMode", int(getattr(self, "channel_solo_mode", 1)))
             self._set_uniform("uInputSpace", int(self.input_space))
             self._set_uniform("uViewTransform", int(self.view_transform))
 
@@ -498,6 +586,12 @@ class ViewportCanvas(QOpenGLWidget):
             self._set_uniform("uAspect", float(img_aspect))
             self._set_uniform("uDiffBoost", float(self.comparison_state.diff_boost))
             self._set_uniform("uStackMix", float(getattr(self.comparison_state, "stack_mix", 1.0)))
+            show_wipe_line = bool(getattr(self.comparison_state, "wipe_show_line", True))
+            self._set_uniform("uWipeShowLine", 1 if show_wipe_line else 0)
+            diff_heatmap = bool(getattr(self.comparison_state, "diff_heatmap", False))
+            self._set_uniform("uDiffHeatmap", 1 if diff_heatmap else 0)
+            spotlight_radius = float(getattr(self.comparison_state, "spotlight_radius", 0.25))
+            self._set_uniform("uSpotlightRadius", spotlight_radius)
             ch_a = getattr(self.comparison_state, "channels_a", (True, True, True, True))
             self._shader_program.setUniformValue(
                 "uLayerAChannels",
@@ -618,6 +712,21 @@ class ViewportCanvas(QOpenGLWidget):
             if has_lut and self._lut_texture:
                 self._lut_texture.bind(2)
                 self._set_uniform("uLut3D", 2)
+
+            # Pass OCIO v2 3D LUT Texture Binding & Uniforms (Texture Unit 4)
+            has_ocio_lut = (self._ocio_lut_texture is not None and self._active_ocio_lut_bake is not None)
+            self._set_uniform("uHasOcioLut3D", 1 if has_ocio_lut else 0)
+            if has_ocio_lut and self._ocio_lut_texture:
+                self._ocio_lut_texture.bind(4)
+                self._set_uniform("uOcioLut3D", 4)
+                bake = self._active_ocio_lut_bake
+                self._set_uniform("uOcioShaperMode", int(getattr(bake, "shaper_mode", 1)))
+                self._set_uniform("uOcioMinEv", float(getattr(bake, "min_ev", -10.0)))
+                self._set_uniform("uOcioMaxEv", float(getattr(bake, "max_ev", 10.0)))
+            else:
+                self._set_uniform("uOcioShaperMode", 0)
+                self._set_uniform("uOcioMinEv", -10.0)
+                self._set_uniform("uOcioMaxEv", 10.0)
 
             # Compute Model-View-Projection Matrix (Isotropic screen-pixel scaling + Rotation + Flip + Pan)
             viewport_w = max(1.0, float(self.width()))
@@ -1078,8 +1187,31 @@ class ViewportCanvas(QOpenGLWidget):
         fmt.setSwapInterval(1 if enabled else 0)
         self.setFormat(fmt)
 
-    def _upload_with_pbo(self, texture: Optional[QOpenGLTexture], arr: np.ndarray, w: int, h: int, tex_fmt, px_type) -> None:
-        """Asynchronously stream texture data via double-buffered Pixel Buffer Objects (DMA)."""
+    def is_pbo_enabled(self) -> bool:
+        """Return True if asynchronous PBO texture streaming is active and supported."""
+        if self.playback_engine == PlaybackEngineMode.SOFTWARE_SAFE:
+            return False
+        if self.playback_engine == PlaybackEngineMode.ASYNC_PBO:
+            return True
+        try:
+            return getattr(PreferencesManager.instance().prefs, "enable_pbo_streaming", True)
+        except Exception:
+            return True
+
+    def _upload_with_pbo(
+        self,
+        texture: Optional[QOpenGLTexture],
+        arr: np.ndarray,
+        w: int,
+        h: int,
+        tex_fmt,
+        px_type,
+        is_layer_b: bool = False,
+    ) -> None:
+        """
+        Asynchronously stream texture data via double-buffered Pixel Buffer Objects (DMA).
+        Orphans buffer to eliminate GPU pipeline stalls and executes non-blocking DMA transfer.
+        """
         ctx = self.context()
         gl = ctx.functions() if ctx else None
         if not gl or not texture or not texture.isCreated():
@@ -1087,35 +1219,98 @@ class ViewportCanvas(QOpenGLWidget):
                 texture.setData(QOpenGLTexture.PixelFormat.RGBA, px_type, arr)
             return
 
-        GL_PIXEL_UNPACK_BUFFER = 0x88EC
-        GL_STREAM_DRAW = 0x88E0
         GL_RGBA = 0x1908
         GL_UNSIGNED_BYTE = 0x1401
         GL_FLOAT = 0x1406
         GL_HALF_FLOAT = 0x140B
+        GL_TEXTURE_2D = 0x0DE1
+        GL_PIXEL_UNPACK_BUFFER = 0x88EC
 
-        gl_px_type = GL_UNSIGNED_BYTE if px_type == QOpenGLTexture.PixelType.UInt8 else (
-            GL_HALF_FLOAT if px_type == QOpenGLTexture.PixelType.Float16 else GL_FLOAT
+        gl_px_type = (
+            GL_UNSIGNED_BYTE
+            if px_type == QOpenGLTexture.PixelType.UInt8
+            else (GL_HALF_FLOAT if px_type == QOpenGLTexture.PixelType.Float16 else GL_FLOAT)
         )
 
+        pbo_bound = False
+        pbo = None
         try:
-            self._pbo_index = 1 - self._pbo_index
-            if self._pbo_ids[self._pbo_index] == 0:
-                self._pbo_ids[self._pbo_index] = gl.glGenBuffers(1) if hasattr(gl, "glGenBuffers") else 0
+            pbos = getattr(self, "_pbo_b" if is_layer_b else "_pbo_a", None)
+            if pbos is None:
+                pbos = [None, None]
+                if is_layer_b:
+                    self._pbo_b = pbos
+                else:
+                    self._pbo_a = pbos
 
-            pbo = self._pbo_ids[self._pbo_index]
-            if pbo != 0 and hasattr(gl, "glBindBuffer"):
-                gl.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo)
-                gl.glBufferData(GL_PIXEL_UNPACK_BUFFER, arr.nbytes, arr, GL_STREAM_DRAW)
-                texture.bind(0)
-                import ctypes
-                gl.glTexSubImage2D(0x0DE1, 0, 0, 0, w, h, GL_RGBA, gl_px_type, ctypes.c_void_p(0))
-                gl.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
-                return
+            curr_idx = getattr(self, "_pbo_b_index" if is_layer_b else "_pbo_a_index", 0)
+            nbytes = arr.nbytes
+            nbytes_attr = "_pbo_b_nbytes" if is_layer_b else "_pbo_a_nbytes"
+            curr_nbytes = getattr(self, nbytes_attr, 0)
+
+            # Reallocate or create PBOs only if uninitialized or byte count changed
+            if pbos[0] is None or pbos[1] is None or curr_nbytes != nbytes:
+                for i in range(2):
+                    if pbos[i] is not None:
+                        try:
+                            pbos[i].destroy()
+                        except Exception:
+                            pass
+                    p = QOpenGLBuffer(QOpenGLBuffer.Type.PixelUnpackBuffer)
+                    if p.create():
+                        p.setUsagePattern(QOpenGLBuffer.UsagePattern.StreamDraw)
+                        p.bind()
+                        p.allocate(nbytes)
+                        p.release()
+                        pbos[i] = p
+                    else:
+                        pbos[i] = None
+                setattr(self, nbytes_attr, nbytes)
+
+            next_idx = 1 - curr_idx
+            pbo = pbos[curr_idx]
+
+            if pbo is not None and pbo.isCreated():
+                pbo.bind()
+                pbo_bound = True
+                pbo.allocate(nbytes)
+                pbo.write(0, arr, nbytes)
+
+                gl.glBindTexture(GL_TEXTURE_2D, texture.textureId())
+
+                dma_ok = False
+                fn_sub_image = _get_gl_tex_sub_image_2d()
+                if fn_sub_image is not None:
+                    import ctypes
+                    gl.glGetError()
+                    fn_sub_image(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, gl_px_type, ctypes.c_void_p(0))
+                    if gl.glGetError() == 0:
+                        dma_ok = True
+
+                pbo.release()
+                pbo_bound = False
+
+                if dma_ok:
+                    if is_layer_b:
+                        self._pbo_b_index = next_idx
+                    else:
+                        self._pbo_a_index = next_idx
+                    return
         except Exception:
             pass
+        finally:
+            if pbo_bound and pbo is not None:
+                try:
+                    pbo.release()
+                except Exception:
+                    pass
+            if gl is not None and hasattr(gl, "glBindBuffer"):
+                try:
+                    gl.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
+                except Exception:
+                    pass
 
-        # Fallback to direct upload
+        # Graceful fallback to direct texture upload
         texture.setData(QOpenGLTexture.PixelFormat.RGBA, px_type, arr)
 
     def _upload_texture_a(self) -> None:
@@ -1155,12 +1350,7 @@ class ViewportCanvas(QOpenGLWidget):
                 alpha = np.ones((h, w, 1), dtype=np.float32)
             arr = np.concatenate([arr, alpha], axis=2)
 
-        prefs = PreferencesManager.instance().prefs
-        use_proxy = (getattr(prefs, "fast_playback_laptop_mode", False) or PreferencesManager.instance().is_low_spec_gpu()) and getattr(self, "_is_playing", False)
-        if use_proxy and (w > 2048 or h > 1200):
-            arr = np.ascontiguousarray(arr[::2, ::2])
-            w, h = arr.shape[1], arr.shape[0]
-        elif not arr.flags["C_CONTIGUOUS"]:
+        if not arr.flags["C_CONTIGUOUS"]:
             arr = np.ascontiguousarray(arr)
 
         # Fast in-place zero-copy texture update if texture matches dimensions & format
@@ -1171,8 +1361,8 @@ class ViewportCanvas(QOpenGLWidget):
             and self._texture_a.height() == h
             and self._texture_a_fmt == tex_fmt
         ):
-            if self.playback_engine == PlaybackEngineMode.ASYNC_PBO:
-                self._upload_with_pbo(self._texture_a, arr, w, h, tex_fmt, px_type)
+            if self.is_pbo_enabled():
+                self._upload_with_pbo(self._texture_a, arr, w, h, tex_fmt, px_type, is_layer_b=False)
             else:
                 self._texture_a.setData(QOpenGLTexture.PixelFormat.RGBA, px_type, arr)
             return
@@ -1189,8 +1379,8 @@ class ViewportCanvas(QOpenGLWidget):
         self._texture_a.setSize(w, h)
         self._texture_a.setFormat(tex_fmt)
         self._texture_a.allocateStorage(QOpenGLTexture.PixelFormat.RGBA, px_type)
-        if self.playback_engine == PlaybackEngineMode.ASYNC_PBO:
-            self._upload_with_pbo(self._texture_a, arr, w, h, tex_fmt, px_type)
+        if self.is_pbo_enabled():
+            self._upload_with_pbo(self._texture_a, arr, w, h, tex_fmt, px_type, is_layer_b=False)
         else:
             self._texture_a.setData(QOpenGLTexture.PixelFormat.RGBA, px_type, arr)
 
@@ -1234,12 +1424,7 @@ class ViewportCanvas(QOpenGLWidget):
                 alpha = np.ones((h, w, 1), dtype=np.float32)
             arr = np.concatenate([arr, alpha], axis=2)
 
-        prefs = PreferencesManager.instance().prefs
-        use_proxy = (getattr(prefs, "fast_playback_laptop_mode", False) or PreferencesManager.instance().is_low_spec_gpu()) and getattr(self, "_is_playing", False)
-        if use_proxy and (w > 2048 or h > 1200):
-            arr = np.ascontiguousarray(arr[::2, ::2])
-            w, h = arr.shape[1], arr.shape[0]
-        elif not arr.flags["C_CONTIGUOUS"]:
+        if not arr.flags["C_CONTIGUOUS"]:
             arr = np.ascontiguousarray(arr)
 
         if (
@@ -1249,8 +1434,8 @@ class ViewportCanvas(QOpenGLWidget):
             and self._texture_b.height() == h
             and self._texture_b_fmt == tex_fmt
         ):
-            if self.playback_engine == PlaybackEngineMode.ASYNC_PBO:
-                self._upload_with_pbo(self._texture_b, arr, w, h, tex_fmt, px_type)
+            if self.is_pbo_enabled():
+                self._upload_with_pbo(self._texture_b, arr, w, h, tex_fmt, px_type, is_layer_b=True)
             else:
                 self._texture_b.setData(QOpenGLTexture.PixelFormat.RGBA, px_type, arr)
             return
@@ -1267,8 +1452,8 @@ class ViewportCanvas(QOpenGLWidget):
         self._texture_b.setSize(w, h)
         self._texture_b.setFormat(tex_fmt)
         self._texture_b.allocateStorage(QOpenGLTexture.PixelFormat.RGBA, px_type)
-        if self.playback_engine == PlaybackEngineMode.ASYNC_PBO:
-            self._upload_with_pbo(self._texture_b, arr, w, h, tex_fmt, px_type)
+        if self.is_pbo_enabled():
+            self._upload_with_pbo(self._texture_b, arr, w, h, tex_fmt, px_type, is_layer_b=True)
         else:
             self._texture_b.setData(QOpenGLTexture.PixelFormat.RGBA, px_type, arr)
 
@@ -1306,6 +1491,38 @@ class ViewportCanvas(QOpenGLWidget):
         self._lut_texture.setData(QOpenGLTexture.PixelFormat.RGBA, QOpenGLTexture.PixelType.Float32, arr_contiguous)
         self._lut_texture.setMinMagFilters(QOpenGLTexture.Filter.Linear, QOpenGLTexture.Filter.Linear)
         self._lut_texture.setWrapMode(QOpenGLTexture.WrapMode.ClampToEdge)
+
+    def _upload_ocio_lut_texture(self) -> None:
+        if not self.isValid():
+            return
+        if self._ocio_lut_texture is not None:
+            self._ocio_lut_texture.destroy()
+            self._ocio_lut_texture = None
+
+        bake = self._active_ocio_lut_bake
+        if bake is None or getattr(bake, "data_3d", None) is None or getattr(bake, "lut_size", 0) <= 0:
+            return
+
+        sz = int(bake.lut_size)
+        self._ocio_lut_texture = QOpenGLTexture(QOpenGLTexture.Target.Target3D)
+        if not self._ocio_lut_texture.create():
+            self._ocio_lut_texture = None
+            return
+
+        self._ocio_lut_texture.setSize(sz, sz, sz)
+        self._ocio_lut_texture.setFormat(QOpenGLTexture.TextureFormat.RGBA32F)
+        self._ocio_lut_texture.allocateStorage(QOpenGLTexture.PixelFormat.RGBA, QOpenGLTexture.PixelType.Float32)
+
+        arr = bake.data_3d
+        if arr.shape[-1] == 3:
+            rgba = np.ones((sz, sz, sz, 4), dtype=np.float32)
+            rgba[..., :3] = arr
+        else:
+            rgba = arr
+        arr_contiguous = np.ascontiguousarray(rgba, dtype=np.float32)
+        self._ocio_lut_texture.setData(QOpenGLTexture.PixelFormat.RGBA, QOpenGLTexture.PixelType.Float32, arr_contiguous)
+        self._ocio_lut_texture.setMinMagFilters(QOpenGLTexture.Filter.Linear, QOpenGLTexture.Filter.Linear)
+        self._ocio_lut_texture.setWrapMode(QOpenGLTexture.WrapMode.ClampToEdge)
 
     # --------------------------------------------------------------------------
     # Media & Frame Setting
@@ -1382,6 +1599,18 @@ class ViewportCanvas(QOpenGLWidget):
             self._texture_b = None
         self._texture_a_fmt = None
         self._texture_b_fmt = None
+        for pbos in (getattr(self, "_pbo_a", []), getattr(self, "_pbo_b", [])):
+            for i in range(len(pbos)):
+                if pbos[i] is not None:
+                    try:
+                        pbos[i].destroy()
+                    except Exception:
+                        pass
+                    pbos[i] = None
+        self._pbo_a_index = 0
+        self._pbo_b_index = 0
+        self._pbo_a_nbytes = 0
+        self._pbo_b_nbytes = 0
         self._pending_upload_a = False
         self._pending_upload_b = False
         self.reset_transforms()
@@ -2276,7 +2505,14 @@ class ViewportCanvas(QOpenGLWidget):
 
             if self._active_draw_tool == ShapeType.TEXT and event.button() == Qt.MouseButton.LeftButton:
                 self._current_stroke_points.clear()
-                self.spawn_text_editor(click_pt)
+                hit = self._find_text_stroke_at(click_pt)
+                if hit is not None:
+                    idx, stroke, p0 = hit
+                    self._editing_text_stroke_idx = idx
+                    self.spawn_text_editor(p0, initial_text=stroke.text)
+                else:
+                    self._editing_text_stroke_idx = None
+                    self.spawn_text_editor(click_pt)
                 event.accept()
                 return
 
@@ -2329,10 +2565,24 @@ class ViewportCanvas(QOpenGLWidget):
             and event.button() == Qt.MouseButton.LeftButton
             and self._active_draw_tool is None
             and not (event.modifiers() & Qt.KeyboardModifier.AltModifier)
-            and self.comparison_state.mode not in (ComparisonMode.WIPE, ComparisonMode.SPLIT)
+            and self.comparison_state.mode not in (ComparisonMode.WIPE, ComparisonMode.SPLIT, ComparisonMode.SPOTLIGHT)
         ):
             self._is_scrubbing = True
             self._scrub_accum_dx = 0.0
+            event.accept()
+            return
+
+        # Interactive Spotlight Dragging
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._active_draw_tool is None
+            and self.comparison_state.mode == ComparisonMode.SPOTLIGHT
+            and not (event.modifiers() & Qt.KeyboardModifier.AltModifier)
+        ):
+            nx, ny = self._screen_to_image_norm(pos.x(), pos.y())
+            self.comparison_state.wipe_center = (max(0.0, min(1.0, nx)), max(0.0, min(1.0, ny)))
+            self._is_dragging_spotlight = True
+            self.update()
             event.accept()
             return
 
@@ -2378,7 +2628,15 @@ class ViewportCanvas(QOpenGLWidget):
         if event.button() == Qt.MouseButton.LeftButton and self._active_draw_tool is not None:
             if self._active_draw_tool == ShapeType.TEXT:
                 self._current_stroke_points.clear()
-                self.spawn_text_editor(pos.toPoint())
+                click_pt = pos.toPoint()
+                hit = self._find_text_stroke_at(click_pt)
+                if hit is not None:
+                    idx, stroke, p0 = hit
+                    self._editing_text_stroke_idx = idx
+                    self.spawn_text_editor(p0, initial_text=stroke.text)
+                else:
+                    self._editing_text_stroke_idx = None
+                    self.spawn_text_editor(click_pt)
                 event.accept()
                 return
 
@@ -2456,6 +2714,15 @@ class ViewportCanvas(QOpenGLWidget):
         if self._is_rotating_wipe and (event.buttons() & Qt.MouseButton.LeftButton):
             snap = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
             self._update_wipe_rotation_from_mouse(pos.x(), pos.y(), snap=snap)
+            event.accept()
+            return
+
+        # Handle Interactive Spotlight Drag
+        if getattr(self, "_is_dragging_spotlight", False) and (event.buttons() & Qt.MouseButton.LeftButton):
+            nx, ny = self._screen_to_image_norm(pos.x(), pos.y())
+            self.comparison_state.wipe_center = (max(0.0, min(1.0, nx)), max(0.0, min(1.0, ny)))
+            self.update()
+            self._last_mouse_pos = pos.toPoint()
             event.accept()
             return
 
@@ -2559,6 +2826,12 @@ class ViewportCanvas(QOpenGLWidget):
 
         if self._is_panning:
             self._is_panning = False
+            event.accept()
+            return
+
+        if getattr(self, "_is_dragging_spotlight", False):
+            self._is_dragging_spotlight = False
+            self.update()
             event.accept()
             return
 
@@ -2949,6 +3222,46 @@ class ViewportCanvas(QOpenGLWidget):
         if hasattr(self, "_text_editor") and self._text_editor.is_active():
             self._text_editor.cancel()
 
+    def _find_text_stroke_at(self, screen_pos: QPoint) -> Optional[Tuple[int, Stroke, QPoint]]:
+        """
+        Hit-test text annotations on current frame against screen_pos.
+        Returns (stroke_idx, stroke, p0_screen) if clicked within text bounding box, else None.
+        """
+        if not hasattr(self, "annotation_store") or self.annotation_store is None:
+            return None
+        strokes = self.annotation_store.get_strokes(self.current_frame)
+        # Search backwards so top-most stroke is hit first
+        for idx in range(len(strokes) - 1, -1, -1):
+            stroke = strokes[idx]
+            if stroke.shape_type != ShapeType.TEXT or not stroke.points:
+                continue
+            txt = (stroke.text or "").strip()
+            if not txt:
+                continue
+
+            nx, ny = stroke.points[0]
+            pt = self._image_norm_to_screen(nx, ny)
+            p0 = QPoint(int(round(pt.x())), int(round(pt.y())))
+
+            font_size = max(10, int(stroke.width * 3.5)) if stroke.width > 1.0 else 12
+            font = QFont("Segoe UI", font_size, QFont.Weight.Bold)
+            metrics = QFontMetrics(font)
+
+            lines = txt.split("\n")
+            line_height = metrics.lineSpacing()
+            max_line_w = max((metrics.horizontalAdvance(line) for line in lines), default=40)
+            total_h = line_height * len(lines)
+
+            pad_x = 8
+            pad_y = 6
+            box_w = max_line_w + pad_x * 2
+            box_h = total_h + pad_y * 2
+
+            text_rect = QRect(p0.x(), p0.y(), box_w, box_h)
+            if text_rect.contains(screen_pos):
+                return (idx, stroke, p0)
+        return None
+
     def spawn_text_editor(self, screen_pos: Optional[QPoint] = None, initial_text: str = "") -> None:
         """Spawn the in-canvas text editor at screen coordinates with active stroke styling."""
         if screen_pos is None:
@@ -2960,6 +3273,20 @@ class ViewportCanvas(QOpenGLWidget):
     def _on_text_editor_committed(self, text: str) -> None:
         """Called when user commits text in the in-canvas editor."""
         clean_text = text.strip()
+        editing_idx = getattr(self, "_editing_text_stroke_idx", None)
+        self._editing_text_stroke_idx = None
+
+        if editing_idx is not None:
+            # Editing an existing text annotation
+            if clean_text:
+                self.annotation_store.update_stroke_text(self.current_frame, editing_idx, clean_text)
+            else:
+                # User cleared all text -> remove the annotation stroke with undo support
+                self.annotation_store.remove_stroke(self.current_frame, editing_idx)
+            self.update()
+            self.setFocus()
+            return
+
         if clean_text:
             pos = self._text_editor.spawn_screen_pos
             nx, ny = self._screen_to_image_norm(pos.x(), pos.y())
@@ -2985,6 +3312,7 @@ class ViewportCanvas(QOpenGLWidget):
 
     def _on_text_editor_cancelled(self) -> None:
         """Called when user cancels in-canvas text editing."""
+        self._editing_text_stroke_idx = None
         self.setFocus()
 
     def set_draw_tool(self, tool: Optional[ShapeType]) -> None:
@@ -3040,6 +3368,12 @@ class ViewportCanvas(QOpenGLWidget):
         """Set active 3D or 1D Cube LUT."""
         self.color_grading.active_lut = lut
         self._pending_upload_lut = True
+        self.update()
+
+    def set_ocio_lut(self, bake: Optional[Any]) -> None:
+        """Set active baked OCIO v2 3D LUT (OcioLutBakeResult) for real-time GPU evaluation."""
+        self._active_ocio_lut_bake = bake
+        self._pending_upload_ocio_lut = True
         self.update()
 
     def set_cdl(self, cdl: Optional[AscCdl]) -> None:

@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import sys
 import threading
-from typing import Dict, Optional, Tuple
+import time
+from typing import Dict, Optional, Tuple, Any
 import numpy as np
 
 try:
@@ -16,6 +18,12 @@ try:
     HAS_CV2 = True
 except ImportError:
     HAS_CV2 = False
+
+try:
+    import av
+    HAS_AV = True
+except ImportError:
+    HAS_AV = False
 
 from openreview.core.reader import MediaReader
 
@@ -160,12 +168,69 @@ def is_video_file(path: str) -> bool:
     return False
 
 
-class VideoMediaReader(MediaReader):
+def get_available_hwaccel_devices() -> list[str]:
+    """Return a list of available hardware acceleration devices on the host platform."""
+    if not HAS_AV:
+        return []
+    try:
+        from av.codec.hwaccel import hwdevices_available
+        return list(hwdevices_available())
+    except Exception:
+        return []
+
+
+def create_hwaccel_context() -> Tuple[Optional[Any], Optional[str]]:
     """
-    Thread-safe, high-performance video sequence reader.
+    Create a PyAV HWAccel context configured for the host OS and GPU with software fallback.
+    Returns (hwaccel_instance, device_name) or (None, None).
+    """
+    if not HAS_AV:
+        return None, None
+    try:
+        from openreview.core.preferences import PreferencesManager
+        prefs = PreferencesManager.instance().prefs
+        if not getattr(prefs, "hardware_video_decoding", True):
+            return None, None
+    except Exception:
+        pass
+
+    try:
+        from av.codec.hwaccel import HWAccel, hwdevices_available
+        available = hwdevices_available()
+        if not available:
+            return None, None
+
+        if sys.platform == "win32":
+            priority = ["d3d11va", "dxva2", "cuda", "qsv", "d3d12va", "amf"]
+        elif sys.platform == "darwin":
+            priority = ["videotoolbox", "cuda"]
+        else:
+            priority = ["cuda", "vaapi", "vdpau", "qsv"]
+
+        for dev in priority:
+            if dev in available:
+                try:
+                    hw = HWAccel(dev, allow_software_fallback=True)
+                    return hw, dev
+                except Exception:
+                    continue
+
+        for dev in available:
+            try:
+                hw = HWAccel(dev, allow_software_fallback=True)
+                return hw, dev
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None, None
+
+
+class OpenCVVideoReader(MediaReader):
+    """
+    Thread-safe OpenCV video sequence reader (Fallback Engine).
     Demuxes and decodes frames into uint8 RGBA buffers [0..255] (or float32 [0.0..1.0] if requested).
-    Equipped with an asynchronous background lookahead prefetching pipeline (read-ahead ring buffer)
-    for zero-latency, stutter-free real-time playback matching dedicated media players like VLC.
+    Equipped with an asynchronous background lookahead prefetching pipeline (read-ahead ring buffer).
     """
 
     def __init__(
@@ -283,6 +348,10 @@ class VideoMediaReader(MediaReader):
                 self._cond.wait(timeout=0.015)
 
     @property
+    def backend(self) -> str:
+        return "OpenCV"
+
+    @property
     def fps(self) -> float:
         return self._fps
 
@@ -297,6 +366,11 @@ class VideoMediaReader(MediaReader):
     @property
     def height(self) -> int:
         return self._height
+
+    @property
+    def hwaccel_device(self) -> Optional[str]:
+        """Return the active hardware acceleration device name, or None if software decoding."""
+        return getattr(self, "_hwaccel_device", None)
 
     def _seek_and_read_locked(self, target_idx: int) -> Tuple[bool, Optional[np.ndarray]]:
         """Seek to 0-indexed target_idx with sequential fallback for streams lacking seek tables."""
@@ -457,3 +531,401 @@ class VideoMediaReader(MediaReader):
 
     def __del__(self) -> None:
         self.close()
+
+
+class PyAVVideoReader(MediaReader):
+    """
+    Studio-grade FFmpeg/PyAV hardware & multi-threaded video decoding engine.
+    Features:
+    - Thread-safe frame-accurate seek with exact Presentation Time Stamps (PTS).
+    - In-Memory GOP (Group of Pictures) Cache for instantaneous O(1) reverse scrubbing.
+    - Zero-overhead SIMD swscale color conversion (RGBA 8-bit or RGBA 16-bit half/float).
+    - Background lookahead prefetching worker for zero-wait sequential playback.
+    """
+
+    def __init__(
+        self,
+        file_path: str,
+        as_float: Optional[bool] = None,
+        buffer_size: int = 24,
+    ):
+        if not HAS_AV:
+            raise RuntimeError("PyAV ('av') is required for PyAVVideoReader.")
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Video file does not exist: {file_path}")
+
+        self.file_path = file_path
+        self._buffer_size = max(4, buffer_size)
+        self._gop_max_size = 128  # Maximum frames retained in GOP scrub cache
+
+        # Determine whether float conversion is requested
+        if as_float is not None:
+            self._as_float = bool(as_float)
+        else:
+            try:
+                from openreview.core.preferences import PreferencesManager
+                prefs = PreferencesManager.instance().prefs
+                mode = getattr(prefs, "playback_texture_mode", "auto")
+                self._as_float = (mode == "rgba32f")
+            except Exception:
+                self._as_float = False
+
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+
+        # Open container (with hardware video decoding acceleration if supported)
+        self._hwaccel, self._hwaccel_device = create_hwaccel_context()
+        try:
+            if self._hwaccel is not None:
+                self._container = av.open(file_path, hwaccel=self._hwaccel)
+            else:
+                self._container = av.open(file_path)
+        except Exception:
+            # Fallback gracefully to software CPU decode
+            self._hwaccel = None
+            self._hwaccel_device = None
+            self._container = av.open(file_path)
+
+        if not self._container.streams.video:
+            self._container.close()
+            raise RuntimeError(f"No video streams found in container: {file_path}")
+
+        self._stream = self._container.streams.video[0]
+
+        # Multi-threaded decoding configuration
+        try:
+            cpu_cnt = os.cpu_count() or 4
+            self._stream.codec_context.thread_count = min(max(2, cpu_cnt), 8)
+            self._stream.codec_context.thread_type = "FRAME"
+        except Exception:
+            pass
+
+        # Dimensions & FPS
+        self._width = int(self._stream.codec_context.width or self._stream.width or 0)
+        self._height = int(self._stream.codec_context.height or self._stream.height or 0)
+
+        rate = self._stream.guessed_rate or self._stream.average_rate or self._stream.base_rate
+        if rate is not None and float(rate) > 0:
+            self._fps = float(rate)
+        else:
+            self._fps = 24.0
+        if self._fps <= 0 or np.isnan(self._fps) or self._fps > 1000.0:
+            self._fps = 24.0
+
+        self.time_base = float(self._stream.time_base) if self._stream.time_base else (1.0 / self._fps)
+        self.start_pts = self._stream.start_time if self._stream.start_time is not None else 0
+
+        # Codec metadata
+        codec_ctx = self._stream.codec_context
+        self.fourcc = getattr(codec_ctx, "codec_tag", "") or os.path.splitext(file_path)[1].lstrip(".")
+        codec_name_raw = getattr(codec_ctx, "name", "") or self.fourcc
+        self.codec_name, self.codec_family = get_video_codec_info(codec_name_raw)
+
+        # Total frames
+        frames_count = self._stream.frames
+        if frames_count and frames_count > 0:
+            self._total_frames = int(frames_count)
+        elif self._container.duration is not None and self._container.duration > 0:
+            self._total_frames = max(1, int(round((self._container.duration / av.time_base) * self._fps)))
+        else:
+            self._total_frames = 1
+
+        # Check high bit depth (10-bit / 12-bit ProRes / DNxHR / HDR)
+        pix_fmt = getattr(codec_ctx, "pix_fmt", "") or ""
+        self._is_high_bit_depth = any(b in pix_fmt for b in ("10", "12", "14", "16", "48", "64"))
+
+        # GOP & Lookahead Buffers (1-indexed frame_number -> RGBA ndarray)
+        self._gop_cache: dict[int, np.ndarray] = {}
+        self._lookahead_buffer: dict[int, np.ndarray] = {}
+        self._last_decoded_frame: int = 0
+        self._next_prefetch_frame: int = 1
+        self._last_frame_data: Optional[np.ndarray] = None
+        self._generator = self._container.decode(self._stream)
+        self._running = True
+
+        # Background lookahead prefetching thread
+        self._worker = threading.Thread(
+            target=self._lookahead_worker_loop,
+            daemon=True,
+            name=f"PyAVLookaheadWorker-{os.path.basename(file_path)}"
+        )
+        self._worker.start()
+
+        # Prime initial buffer
+        deadline = time.perf_counter() + 0.15
+        with self._cond:
+            while len(self._lookahead_buffer) < 4 and self._running and time.perf_counter() < deadline:
+                self._cond.wait(timeout=0.015)
+
+    @property
+    def backend(self) -> str:
+        return "PyAV"
+
+    @property
+    def fps(self) -> float:
+        return self._fps
+
+    @property
+    def total_frames(self) -> int:
+        return self._total_frames
+
+    @property
+    def width(self) -> int:
+        return self._width
+
+    @property
+    def height(self) -> int:
+        return self._height
+
+    @property
+    def hwaccel_device(self) -> Optional[str]:
+        """Return the active hardware acceleration device name, or None if software decoding."""
+        return getattr(self, "_hwaccel_device", None)
+
+    def _process_av_frame(self, frame: av.VideoFrame) -> np.ndarray:
+        """Convert av.VideoFrame to C-contiguous RGBA array."""
+        if self._is_high_bit_depth:
+            try:
+                arr16 = frame.to_ndarray(format="rgba64le")
+                if self._as_float:
+                    arr = (arr16.astype(np.float32) / 65535.0)
+                else:
+                    arr = (arr16 >> 8).astype(np.uint8)
+                return np.ascontiguousarray(arr)
+            except Exception:
+                pass
+
+        # Standard 8-bit RGBA
+        arr = frame.to_ndarray(format="rgba")
+        if self._as_float:
+            arr = np.ascontiguousarray(arr, dtype=np.float32) / 255.0
+        else:
+            if not arr.flags.c_contiguous:
+                arr = np.ascontiguousarray(arr)
+        return arr
+
+    def _pts_to_frame_number(self, frame: av.VideoFrame) -> int:
+        if frame.pts is not None:
+            rel_pts = frame.pts - self.start_pts
+            frame_num = int(round((rel_pts * self.time_base) * self._fps)) + 1
+            return max(1, min(frame_num, self._total_frames))
+        return self._last_decoded_frame + 1
+
+    def _add_to_gop_cache(self, fn: int, data: np.ndarray) -> None:
+        self._gop_cache[fn] = data
+        if len(self._gop_cache) > self._gop_max_size:
+            keys = sorted(self._gop_cache.keys())
+            if keys:
+                del self._gop_cache[keys[0]]
+
+    def read_frame(self, frame: int) -> Optional[np.ndarray]:
+        target_frame = max(1, min(frame, self._total_frames))
+
+        with self._cond:
+            if not self._running or self._container is None:
+                return self._last_frame_data
+
+            # 1. Hit in GOP cache (instant O(1) for scrubbing backward or within active GOP)
+            if target_frame in self._gop_cache:
+                data = self._gop_cache[target_frame]
+                self._next_prefetch_frame = target_frame + 1
+                self._cond.notify_all()
+                return data
+
+            # 2. Hit in Lookahead buffer (during sequential forward playback)
+            if target_frame in self._lookahead_buffer:
+                data = self._lookahead_buffer.pop(target_frame)
+                self._add_to_gop_cache(target_frame, data)
+                # Evict expired frames behind
+                for k in [k for k in self._lookahead_buffer if k < target_frame]:
+                    del self._lookahead_buffer[k]
+                self._next_prefetch_frame = target_frame + 1
+                self._cond.notify_all()
+                return data
+
+            # 3. Cache miss: Random seek, scrub jump, or prefetch underrun
+            self._lookahead_buffer.clear()
+
+            # Seek backward to nearest preceding keyframe
+            target_pts = self.start_pts + int(round((target_frame - 1) / self._fps / self.time_base))
+            try:
+                self._container.seek(target_pts, stream=self._stream, backward=True, any_frame=False)
+                self._generator = self._container.decode(self._stream)
+            except Exception:
+                pass
+
+            target_data = None
+            try:
+                for av_frame in self._generator:
+                    fn = self._pts_to_frame_number(av_frame)
+                    data = self._process_av_frame(av_frame)
+                    self._add_to_gop_cache(fn, data)
+                    self._last_decoded_frame = fn
+                    if fn == target_frame:
+                        target_data = data
+                        break
+                    elif fn > target_frame:
+                        target_data = data
+                        break
+            except Exception:
+                pass
+
+            if target_data is not None:
+                self._last_frame_data = target_data
+                self._next_prefetch_frame = target_frame + 1
+                self._cond.notify_all()
+                return target_data
+
+            return self._last_frame_data
+
+    def _lookahead_worker_loop(self) -> None:
+        while self._running:
+            with self._cond:
+                # Wait while buffer is full
+                while self._running and len(self._lookahead_buffer) >= self._buffer_size:
+                    self._cond.wait(timeout=0.02)
+                if not self._running:
+                    break
+
+                target_prefetch = self._next_prefetch_frame
+                if target_prefetch > self._total_frames:
+                    self._cond.wait(timeout=0.02)
+                    continue
+
+                if self._container is None:
+                    break
+
+                # Decode next frame from active generator
+                try:
+                    av_frame = next(self._generator)
+                    fn = self._pts_to_frame_number(av_frame)
+                    data = self._process_av_frame(av_frame)
+                    self._last_decoded_frame = fn
+                    self._add_to_gop_cache(fn, data)
+                    self._lookahead_buffer[fn] = data
+                    self._next_prefetch_frame = fn + 1
+                    self._cond.notify_all()
+                except (StopIteration, Exception):
+                    self._cond.wait(timeout=0.02)
+
+    def close(self) -> None:
+        self._running = False
+        if hasattr(self, "_cond"):
+            with self._cond:
+                self._cond.notify_all()
+        if hasattr(self, "_worker") and self._worker.is_alive():
+            self._worker.join(timeout=0.5)
+        if hasattr(self, "_lock"):
+            with self._lock:
+                if hasattr(self, "_container") and self._container is not None:
+                    try:
+                        self._container.close()
+                    except Exception:
+                        pass
+                    self._container = None
+                if hasattr(self, "_gop_cache"):
+                    self._gop_cache.clear()
+                if hasattr(self, "_lookahead_buffer"):
+                    self._lookahead_buffer.clear()
+
+    def __del__(self) -> None:
+        self.close()
+
+
+class VideoMediaReader(MediaReader):
+    """
+    Unified high-performance video sequence reader for OpenReview.
+    Automatically selects the PyAV (FFmpeg) engine for hardware-accelerated,
+    GOP-cached playback and exact PTS seeking, with seamless fallback to OpenCV.
+    """
+
+    def __init__(
+        self,
+        file_path: str,
+        as_float: Optional[bool] = None,
+        buffer_size: int = 24,
+        force_backend: Optional[str] = None,
+    ):
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Video file does not exist: {file_path}")
+
+        self.file_path = file_path
+        self._reader: Optional[MediaReader] = None
+        self._backend = "Unknown"
+
+        # Check preferences if PyAV engine is enabled
+        use_pyav = True
+        try:
+            from openreview.core.preferences import PreferencesManager
+            prefs = PreferencesManager.instance().prefs
+            use_pyav = getattr(prefs, "enable_pyav_engine", True)
+        except Exception:
+            use_pyav = True
+
+        if force_backend == "opencv":
+            use_pyav = False
+        elif force_backend == "pyav":
+            use_pyav = True
+
+        if use_pyav and HAS_AV:
+            try:
+                self._reader = PyAVVideoReader(file_path, as_float=as_float, buffer_size=buffer_size)
+                self._backend = "PyAV"
+            except Exception:
+                self._reader = None
+
+        if self._reader is None:
+            if not HAS_CV2:
+                raise RuntimeError("Neither PyAV nor OpenCV is available for video playback.")
+            self._reader = OpenCVVideoReader(file_path, as_float=as_float, buffer_size=buffer_size)
+            self._backend = "OpenCV"
+
+    @property
+    def backend(self) -> str:
+        return self._backend
+
+    @property
+    def fps(self) -> float:
+        return self._reader.fps
+
+    @property
+    def total_frames(self) -> int:
+        return self._reader.total_frames
+
+    @property
+    def width(self) -> int:
+        return self._reader.width
+
+    @property
+    def height(self) -> int:
+        return self._reader.height
+
+    @property
+    def fourcc(self) -> str:
+        return getattr(self._reader, "fourcc", "")
+
+    @property
+    def codec_name(self) -> str:
+        return getattr(self._reader, "codec_name", "")
+
+    @property
+    def codec_family(self) -> str:
+        return getattr(self._reader, "codec_family", "")
+
+    @property
+    def hwaccel_device(self) -> Optional[str]:
+        return getattr(self._reader, "hwaccel_device", None)
+
+    def read_frame(self, frame: int) -> Optional[np.ndarray]:
+        return self._reader.read_frame(frame)
+
+    def close(self) -> None:
+        if self._reader is not None:
+            self._reader.close()
+            self._reader = None
+
+    def __del__(self) -> None:
+        self.close()
+
+
+UnifiedVideoReader = VideoMediaReader

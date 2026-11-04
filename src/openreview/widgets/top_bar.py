@@ -190,6 +190,7 @@ class TopControlBar(QFrame):
     zoom_fit_requested = Signal()
     zoom_100_requested = Signal()
     scrub_mode_toggled = Signal(bool)
+    workspace_selected = Signal(str)
 
     def __init__(self, ocio_manager: OCIOManager, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -608,6 +609,8 @@ class TopControlBar(QFrame):
         self.zoom_100_btn.clicked.connect(self.zoom_100_requested.emit)
         layout.addWidget(self.zoom_100_btn)
 
+
+
         # Clear focus policies for non-text inputs
         self.gain_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.gam_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -621,6 +624,15 @@ class TopControlBar(QFrame):
         self.gain_spin.editingFinished.connect(self.gain_spin.clearFocus)
         self.gam_spin.editingFinished.connect(self.gam_spin.clearFocus)
         self.sat_spin.editingFinished.connect(self.sat_spin.clearFocus)
+
+    # --------------------------------------------------------------------------
+    # Studio Workspace Management
+    # --------------------------------------------------------------------------
+    def update_workspaces(self, workspaces: list, active_id: str = "review") -> None:
+        pass
+
+    def set_active_workspace(self, workspace_id: str) -> None:
+        pass
 
     # --------------------------------------------------------------------------
     # Backward Compatibility Aliases

@@ -90,7 +90,7 @@ def test_sources_panel_exr_source_item_loading(qtbot):
     panel.refresh_tree()
     panel._refresh_subpanels()
 
-    assert not panel.exr_properties_bar.isHidden()
+    assert panel.exr_properties_bar.isHidden()
 
 
 def test_top_bar_set_current_layer(qtbot):

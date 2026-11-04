@@ -89,6 +89,9 @@ uniform float uGamma;               // Display gamma (inverse power)
 uniform float uGammaPower;          // Precomputed fast gamma power = 1.0 / max(0.001, abs(uGamma))
 uniform bool uApplyGamma;           // True if gamma != 1.0
 uniform int uChannelMode;           // 0: RGB, 1: R, 2: G, 3: B, 4: A, 5: Luma Y
+uniform mat4 uChannelMatrix;        // 4x4 color matrix for channel swizzling / routing
+uniform vec4 uChannelEnable;        // R, G, B, A channel enable masks (default vec4(1.0))
+uniform int uChannelSoloMode;       // 0: Color Solo, 1: Greyscale Solo, 2: Normals Remap [-1, 1]->[0, 1]
 
 // Colorspace & Viewer Uniforms
 // Standard Colorspaces: 0: linear, 1: sRGB, 2: rec709, 3: Cineon, 4: Gamma 1.8, 5: Gamma 2.2, 6: Panalog, 7: REDLog, 8: ViperLog, 9: REDSpace, 10: Raw
@@ -107,6 +110,9 @@ uniform float uAspect;              // Media aspect ratio (width / height)
 uniform float uDiffBoost;           // Multiplier for difference mode
 uniform float uStackMix;            // Onion skin mix (0.0 to 1.0)
 uniform vec4 uLayerAChannels;       // Active channels for Layer A (x=R, y=G, z=B, w=A)
+uniform bool uWipeShowLine;         // Render anti-aliased divider overlay line
+uniform bool uDiffHeatmap;          // Render Turbo colormap for difference mode
+uniform float uSpotlightRadius;     // Radius for spotlight inspection mode (default 0.25)
 
 // ASC CDL Uniforms
 uniform bool uHasCdl;
@@ -118,6 +124,13 @@ uniform float uCdlSat;
 // 3D LUT Uniforms
 uniform sampler3D uLut3D;
 uniform bool uHasLut3D;
+
+// OCIO v2 Fast-Path 3D LUT Uniforms (Texture Unit 4)
+uniform sampler3D uOcioLut3D;
+uniform bool uHasOcioLut3D;
+uniform int uOcioShaperMode;        // 0: Linear [0, 1], 1: Log2 [-10, 10] EV, 2: Rational
+uniform float uOcioMinEv;           // -10.0
+uniform float uOcioMaxEv;           // 10.0
 
 // Interactive Grading Uniforms
 uniform vec3 uGradingGain;
@@ -368,6 +381,26 @@ vec3 hsv2rgb(vec3 c) {
 }
 
 // Convert input color sample to scene-linear space
+// Google Turbo Colormap GLSL Approximation
+vec3 turbo_colormap(float x) {
+    x = clamp(x, 0.0, 1.0);
+    const vec4 kRedVec4 = vec4(0.13572138, 4.61539260, -42.66032258, 132.13108234);
+    const vec4 kGreenVec4 = vec4(0.09140261, 2.19418839, 4.84296658, -14.18503333);
+    const vec4 kBlueVec4 = vec4(0.10667330, 12.64194608, -60.58204836, 110.36276771);
+    const vec2 kRedVec2 = vec2(-152.94239396, 59.28637943);
+    const vec2 kGreenVec2 = vec2(4.27729857, 2.82956604);
+    const vec2 kBlueVec2 = vec2(-89.90310912, 27.34824973);
+
+    vec4 v4 = vec4(1.0, x, x * x, x * x * x);
+    vec2 v2 = v4.zw * v4.z;
+
+    return clamp(vec3(
+        dot(v4, kRedVec4) + dot(v2, kRedVec2),
+        dot(v4, kGreenVec4) + dot(v2, kGreenVec2),
+        dot(v4, kBlueVec4) + dot(v2, kBlueVec2)
+    ), 0.0, 1.0);
+}
+
 vec3 to_linear_space(vec3 c) {
     if (uInputSpace == 0) {
         return c; // linear (working space)
@@ -509,14 +542,23 @@ void main()
         float p = (TexCoord.x - 0.5) * aspect * dir.x + (TexCoord.y - 0.5) * dir.y;
         float d = (tc.x - uWipeCenter.x) * aspect * dir.x + (tc.y - uWipeCenter.y) * dir.y;
 
-        if (d < 0.0) {
-            vec4 colA = sample_layer_a(tc);
-            linearRgb = to_linear_space(colA.rgb);
-            finalAlpha = colA.a;
-        } else {
-            vec4 colB = texture(uTextureB, tc);
-            linearRgb = to_linear_space(colB.rgb);
-            finalAlpha = colB.a;
+        float delta = max(fwidth(d), 0.0005);
+        float wipeFactor = smoothstep(-delta * 0.5, delta * 0.5, d);
+
+        vec4 colA = sample_layer_a(tc);
+        vec4 colB = texture(uTextureB, tc);
+        vec3 linA = to_linear_space(colA.rgb);
+        vec3 linB = to_linear_space(colB.rgb);
+
+        linearRgb = mix(linA, linB, wipeFactor);
+        finalAlpha = mix(colA.a, colB.a, wipeFactor);
+
+        if (uWipeShowLine) {
+            float distInPixels = abs(d) / delta;
+            float lineMask = 1.0 - smoothstep(0.6, 1.25, distInPixels);
+            float shadowMask = (1.0 - smoothstep(1.25, 3.0, distInPixels)) * 0.45;
+            linearRgb = mix(linearRgb, vec3(0.0), shadowMask);
+            linearRgb = mix(linearRgb, vec3(0.98), lineMask);
         }
     }
     else if (uComparisonMode == 2 && uHasTextureB) {
@@ -549,7 +591,13 @@ void main()
         vec4 colB = texture(uTextureB, tc);
         vec3 linA = to_linear_space(colA.rgb);
         vec3 linB = to_linear_space(colB.rgb);
-        linearRgb = abs(linA - linB) * uDiffBoost;
+        vec3 diff = abs(linA - linB) * uDiffBoost;
+        if (uDiffHeatmap) {
+            float mag = max(diff.r, max(diff.g, diff.b));
+            linearRgb = turbo_colormap(mag);
+        } else {
+            linearRgb = diff;
+        }
         finalAlpha = 1.0;
     }
     else if (uComparisonMode == 4 && uHasTextureB) {
@@ -584,6 +632,63 @@ void main()
         vec3 linB = to_linear_space(colB.rgb);
         linearRgb = clamp(vec3(1.0) - abs(linA - linB) * uDiffBoost, 0.0, 1.0);
         finalAlpha = 1.0;
+    }
+    else if (uComparisonMode == 8 && uHasTextureB) {
+        // Spotlight / Circle Inspection Wipe
+        float aspect = max(0.001, uAspect);
+        vec2 diffCoord = vec2((tc.x - uWipeCenter.x) * aspect, tc.y - uWipeCenter.y);
+        float dist = length(diffCoord);
+        float radius = max(0.005, uSpotlightRadius);
+        float delta = max(fwidth(dist), 0.0005);
+        float wipeFactor = smoothstep(radius - delta * 0.5, radius + delta * 0.5, dist);
+
+        vec4 colA = sample_layer_a(tc);
+        vec4 colB = texture(uTextureB, tc);
+        vec3 linA = to_linear_space(colA.rgb);
+        vec3 linB = to_linear_space(colB.rgb);
+
+        // Inside circle (dist < radius): show Reference B. Outside: show Primary A
+        linearRgb = mix(linB, linA, wipeFactor);
+        finalAlpha = mix(colB.a, colA.a, wipeFactor);
+
+        if (uWipeShowLine) {
+            float ringDist = abs(dist - radius) / delta;
+            float lineMask = 1.0 - smoothstep(0.6, 1.25, ringDist);
+            float shadowMask = (1.0 - smoothstep(1.25, 3.0, ringDist)) * 0.45;
+            linearRgb = mix(linearRgb, vec3(0.0), shadowMask);
+            linearRgb = mix(linearRgb, vec3(0.98), lineMask);
+        }
+    }
+    else if (uComparisonMode == 9 && uHasTextureB) {
+        // Multiply Blend Mode in scene-linear space
+        vec4 colA = sample_layer_a(tc);
+        vec4 colB = texture(uTextureB, tc);
+        vec3 linA = to_linear_space(colA.rgb);
+        vec3 linB = to_linear_space(colB.rgb);
+        linearRgb = linA * linB * uDiffBoost;
+        finalAlpha = max(colA.a, colB.a);
+    }
+    else if (uComparisonMode == 10 && uHasTextureB) {
+        // Screen Blend Mode in scene-linear space
+        vec4 colA = sample_layer_a(tc);
+        vec4 colB = texture(uTextureB, tc);
+        vec3 linA = to_linear_space(colA.rgb);
+        vec3 linB = to_linear_space(colB.rgb);
+        linearRgb = (vec3(1.0) - (vec3(1.0) - clamp(linA, 0.0, 1.0)) * (vec3(1.0) - clamp(linB, 0.0, 1.0))) * uDiffBoost;
+        finalAlpha = max(colA.a, colB.a);
+    }
+    else if (uComparisonMode == 11 && uHasTextureB) {
+        // Overlay Blend Mode in scene-linear space
+        vec4 colA = sample_layer_a(tc);
+        vec4 colB = texture(uTextureB, tc);
+        vec3 linA = to_linear_space(colA.rgb);
+        vec3 linB = to_linear_space(colB.rgb);
+        vec3 cA = clamp(linA, 0.0, 1.0);
+        vec3 cB = clamp(linB, 0.0, 1.0);
+        vec3 low = 2.0 * cA * cB;
+        vec3 high = vec3(1.0) - 2.0 * (vec3(1.0) - cA) * (vec3(1.0) - cB);
+        linearRgb = mix(low, high, step(vec3(0.5), cA)) * uDiffBoost;
+        finalAlpha = max(colA.a, colB.a);
     }
     else {
         // Solo / Off Mode (isolates active channels on Layer A)
@@ -782,7 +887,21 @@ void main()
     }
 
     // 6. Display / View Transform
-    vec3 displayRgb = to_display_space(linearRgb);
+    vec3 displayRgb;
+    if (uHasOcioLut3D) {
+        vec3 lutCoord = linearRgb;
+        if (uOcioShaperMode == 1) {
+            vec3 ev = log2(max(linearRgb, vec3(0.0009765625)));
+            lutCoord = clamp((ev - vec3(uOcioMinEv)) / (uOcioMaxEv - uOcioMinEv), 0.0, 1.0);
+        } else if (uOcioShaperMode == 2) {
+            lutCoord = clamp(linearRgb / (vec3(1.0) + linearRgb), 0.0, 1.0);
+        } else {
+            lutCoord = clamp(linearRgb, 0.0, 1.0);
+        }
+        displayRgb = texture(uOcioLut3D, lutCoord).rgb;
+    } else {
+        displayRgb = to_display_space(linearRgb);
+    }
 
     // 7. Fast Hardware-Accelerated Gamma & Display Brightness Trim
     if (uApplyGamma) {
@@ -935,20 +1054,34 @@ void main()
         }
     }
 
-    // 10. Channel Solo Isolation
+    // 10. Channel Swizzling & Matrix Transform
+    vec4 routedColor = uChannelMatrix * vec4(displayRgb, finalAlpha);
+    routedColor.rgb *= uChannelEnable.rgb;
+
+    if (uChannelSoloMode == 2) {
+        // Normals Remap: [-1, 1] -> [0, 1]
+        routedColor.rgb = clamp(routedColor.rgb * 0.5 + vec3(0.5), 0.0, 1.0);
+    }
+
+    // Channel Solo Isolation (Greyscale vs Color)
     if (uChannelMode == 1) {
-        FragColor = vec4(vec3(displayRgb.r), 1.0);
+        // Red solo
+        FragColor = (uChannelSoloMode == 1) ? vec4(vec3(routedColor.r), 1.0) : vec4(routedColor.r, 0.0, 0.0, 1.0);
     } else if (uChannelMode == 2) {
-        FragColor = vec4(vec3(displayRgb.g), 1.0);
+        // Green solo
+        FragColor = (uChannelSoloMode == 1) ? vec4(vec3(routedColor.g), 1.0) : vec4(0.0, routedColor.g, 0.0, 1.0);
     } else if (uChannelMode == 3) {
-        FragColor = vec4(vec3(displayRgb.b), 1.0);
+        // Blue solo
+        FragColor = (uChannelSoloMode == 1) ? vec4(vec3(routedColor.b), 1.0) : vec4(0.0, 0.0, routedColor.b, 1.0);
     } else if (uChannelMode == 4) {
-        FragColor = vec4(vec3(finalAlpha), 1.0);
+        // Alpha solo
+        FragColor = vec4(vec3(routedColor.a), 1.0);
     } else if (uChannelMode == 5) {
-        float y = dot(displayRgb, vec3(0.2126, 0.7152, 0.0722));
+        // Luma Y (Rec.709)
+        float y = dot(routedColor.rgb, vec3(0.2126, 0.7152, 0.0722));
         FragColor = vec4(vec3(y), 1.0);
     } else {
-        FragColor = vec4(displayRgb, finalAlpha);
+        FragColor = vec4(routedColor.rgb, routedColor.a);
     }
 }
 """

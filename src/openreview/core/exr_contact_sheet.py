@@ -111,6 +111,10 @@ def draw_contact_sheet_badges(
     if h <= 0 or w <= 0 or not tile_rects:
         return canvas_rgba_float
 
+    from PySide6.QtGui import QGuiApplication
+    if not QGuiApplication.instance():
+        return canvas_rgba_float
+
     # Convert float32 [0..1] to uint8 RGBA QImage for high-quality antialiased text rendering
     uint8_data = np.ascontiguousarray(np.clip(canvas_rgba_float * 255.0, 0, 255).astype(np.uint8))
     qimg = QImage(uint8_data.data, w, h, w * 4, QImage.Format.Format_RGBA8888)

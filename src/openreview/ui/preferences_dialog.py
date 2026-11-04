@@ -426,6 +426,10 @@ class PreferencesDialog(QDialog):
         feat_layout = QVBoxLayout(grp_features)
         feat_layout.setSpacing(8)
 
+        self.chk_pyav_video = QCheckBox("Enable High-Performance PyAV Video Engine (FFmpeg)")
+        self.chk_pyav_video.setToolTip("Leverage FFmpeg/PyAV with exact PTS seeking and in-memory GOP scrub cache (falls back to OpenCV if disabled)")
+        feat_layout.addWidget(self.chk_pyav_video)
+
         self.chk_hw_video = QCheckBox("Enable Hardware Video Decoding (CUDA / NVDEC / D3D11VA)")
         self.chk_hw_video.setToolTip("Leverage dedicated GPU ASIC decoders for H.264/HEVC/ProRes decoding")
         feat_layout.addWidget(self.chk_hw_video)
@@ -474,22 +478,24 @@ class PreferencesDialog(QDialog):
         total_ram_gb = max(64.0, round(total_ram_mb / 1024.0, 1))
         auto_budget_gb = compute_dynamic_ram_budget_mb(0) / 1024.0
 
-        cache_form = QFormLayout()
-        cache_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        # Tier-1 RAM Ring Buffer Cache
+        grp_cache_ram = QGroupBox("RAM & Ring Buffer Cache (Tier-1)")
+        ram_form = QFormLayout(grp_cache_ram)
+        ram_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
         self.combo_cache_mode = QComboBox()
         self.combo_cache_mode.addItem("Cache Off (Default)", "off")
         self.combo_cache_mode.addItem("Play-Ahead Cache", "play_ahead")
         self.combo_cache_mode.addItem("In/Out Region Cache (Only)", "region")
         self.combo_cache_mode.addItem("Full Sequence Cache", "all")
-        cache_form.addRow("Default Cache Mode:", self.combo_cache_mode)
+        ram_form.addRow("Default Cache Mode:", self.combo_cache_mode)
 
         self.combo_cache_toggle = QComboBox()
         self.combo_cache_toggle.addItem("In/Out Region Cache (Default)", "region")
         self.combo_cache_toggle.addItem("Play-Ahead Cache", "play_ahead")
         self.combo_cache_toggle.addItem("Full Sequence Cache", "all")
         self.combo_cache_toggle.addItem("Resume Last Active Mode", "last_active")
-        cache_form.addRow("Cache Toggle Target:", self.combo_cache_toggle)
+        ram_form.addRow("Cache Toggle Target:", self.combo_cache_toggle)
 
         self.chk_auto_ram_budget = QCheckBox(
             f"Adapt to Available System RAM (~{auto_budget_gb:.1f} GB / {total_ram_mb / 1024.0:.1f} GB Total)"
@@ -498,44 +504,111 @@ class PreferencesDialog(QDialog):
             "Automatically allocate up to 80% of available system RAM (preserving at least 2 GB for the OS)"
         )
         self.chk_auto_ram_budget.toggled.connect(self._on_auto_ram_budget_toggled)
-        cache_form.addRow("RAM Budget Mode:", self.chk_auto_ram_budget)
+        ram_form.addRow("RAM Budget Mode:", self.chk_auto_ram_budget)
 
         self.spin_lookahead_gb = QDoubleSpinBox()
         self.spin_lookahead_gb.setRange(0.25, total_ram_gb)
         self.spin_lookahead_gb.setSingleStep(0.5)
         self.spin_lookahead_gb.setSuffix(" GB")
-        cache_form.addRow("Look Ahead Cache Size:", self.spin_lookahead_gb)
+        ram_form.addRow("Look Ahead Cache Size:", self.spin_lookahead_gb)
 
         self.spin_region_gb = QDoubleSpinBox()
         self.spin_region_gb.setRange(0.25, total_ram_gb)
         self.spin_region_gb.setSingleStep(0.5)
         self.spin_region_gb.setSuffix(" GB")
-        cache_form.addRow("Region Cache Size:", self.spin_region_gb)
+        ram_form.addRow("Region Cache Size:", self.spin_region_gb)
 
         self.spin_behind_pct = QSpinBox()
         self.spin_behind_pct.setRange(0, 100)
         self.spin_behind_pct.setSuffix(" %")
-        cache_form.addRow("Portion of Look Ahead Behind Playhead:", self.spin_behind_pct)
+        ram_form.addRow("Portion of Look Ahead Behind Playhead:", self.spin_behind_pct)
+
+        self.chk_buffer_pooling = QCheckBox("Enable Zero-Copy Frame Buffer Pool (Recycle Allocations)")
+        self.chk_buffer_pooling.setToolTip(
+            "Recycles pre-allocated contiguous NumPy frame buffers to eliminate OS page faults, "
+            "virtual memory fragmentation, and GC pauses during sustained playback."
+        )
+        ram_form.addRow("Buffer Pooling:", self.chk_buffer_pooling)
+
+        cache_layout.addWidget(grp_cache_ram)
+
+        # Native Rust Engine Acceleration (Zero-GIL Core)
+        grp_rust = QGroupBox("Native Rust Engine Acceleration (Zero-GIL Core)")
+        rust_form = QFormLayout(grp_rust)
+        rust_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        has_rust = False
+        try:
+            import openreview_engine
+            has_rust = True
+        except ImportError:
+            has_rust = False
+
+        self.lbl_rust_status = QLabel()
+        if has_rust:
+            self.lbl_rust_status.setText("✓ Native Rust Core Active (Zero-GIL parallel Rayon decoders, f16 RAM ring)")
+            self.lbl_rust_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
+        else:
+            self.lbl_rust_status.setText("⚠ openreview_engine not detected (Using pure Python/NumPy fallback)")
+            self.lbl_rust_status.setStyleSheet("color: #FF9800;")
+        rust_form.addRow("Engine Status:", self.lbl_rust_status)
+
+        self.chk_enable_rust_engine = QCheckBox("Enable Native Rust Acceleration Core (OpenEXR, DPX, TIFF)")
+        self.chk_enable_rust_engine.setToolTip(
+            "Uses compiled native Rust decoders and multi-threaded prefetching for maximum 10-bit/16-bit scrubbing performance without Python GIL locking."
+        )
+        self.chk_enable_rust_engine.setEnabled(has_rust)
+        self.chk_enable_rust_engine.toggled.connect(self._on_rust_engine_toggled)
+        rust_form.addRow("Rust Acceleration:", self.chk_enable_rust_engine)
+
+        self.spin_rust_worker_threads = QSpinBox()
+        self.spin_rust_worker_threads.setRange(0, 32)
+        self.spin_rust_worker_threads.setSingleStep(1)
+        self.spin_rust_worker_threads.setSpecialValueText("Auto (CPU - 2)")
+        self.spin_rust_worker_threads.setSuffix(" threads")
+        self.spin_rust_worker_threads.setToolTip(
+            "Number of background Rayon worker threads dedicated to concurrent image sequence decoding. 0 sets automatically based on available CPU cores."
+        )
+        rust_form.addRow("Rust Decode Threads:", self.spin_rust_worker_threads)
+
+        self.chk_enable_proxy_caching = QCheckBox("Enable Downsampled Proxy Caching (Ultra-Fast 4K/8K Scrubbing)")
+        self.chk_enable_proxy_caching.setToolTip(
+            "Maintains a lightweight downsampled proxy ring in RAM so scrubbing 1,000+ frame sequences at 4K/8K remains instantaneous."
+        )
+        self.chk_enable_proxy_caching.toggled.connect(self._on_proxy_caching_toggled)
+        rust_form.addRow("Proxy Cache Mode:", self.chk_enable_proxy_caching)
+
+        self.combo_proxy_scale = QComboBox()
+        self.combo_proxy_scale.addItem("1/2 Resolution (Balanced Quality & Speed)", 2)
+        self.combo_proxy_scale.addItem("1/4 Resolution (Maximum Scrub Speed)", 4)
+        self.combo_proxy_scale.setToolTip("Target downsampling ratio for proxy prefetching.")
+        rust_form.addRow("Proxy Resolution:", self.combo_proxy_scale)
+
+        cache_layout.addWidget(grp_rust)
 
         # Tier-2 Temp Drive Disk Caching
+        grp_disk = QGroupBox("High-Capacity Temp Drive Disk Cache (Tier-2)")
+        disk_form = QFormLayout(grp_disk)
+        disk_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
         self.chk_enable_disk_cache = QCheckBox("Enable High-Capacity Temp Drive Disk Cache (Tier-2)")
         self.chk_enable_disk_cache.setToolTip(
             "Store and spill cached frames to temporary drive to cache more sources without exhausting RAM"
         )
-        cache_form.addRow("Temp Drive Cache:", self.chk_enable_disk_cache)
+        disk_form.addRow("Temp Drive Cache:", self.chk_enable_disk_cache)
 
         self.spin_disk_cache_gb = QDoubleSpinBox()
         self.spin_disk_cache_gb.setRange(1.0, 500.0)
         self.spin_disk_cache_gb.setSingleStep(5.0)
         self.spin_disk_cache_gb.setSuffix(" GB")
-        cache_form.addRow("Disk Cache Budget:", self.spin_disk_cache_gb)
+        disk_form.addRow("Disk Cache Budget:", self.spin_disk_cache_gb)
 
         self.btn_clear_disk_cache = QPushButton("Clear Temp Disk Cache Now")
         self.btn_clear_disk_cache.setToolTip("Immediately purges all temporary cached frames from disk")
         self.btn_clear_disk_cache.clicked.connect(self._on_clear_disk_cache_clicked)
-        cache_form.addRow("Disk Maintenance:", self.btn_clear_disk_cache)
+        disk_form.addRow("Disk Maintenance:", self.btn_clear_disk_cache)
 
-        cache_layout.addLayout(cache_form)
+        cache_layout.addWidget(grp_disk)
         cache_layout.addStretch()
 
         self.tabs.addTab(self._wrap_tab_in_scroll(tab_cache), "Caching")
@@ -1170,6 +1243,7 @@ class PreferencesDialog(QDialog):
         if idx_gpu >= 0:
             self.combo_gpu_device.setCurrentIndex(idx_gpu)
 
+        self.chk_pyav_video.setChecked(getattr(p, "enable_pyav_engine", True))
         self.chk_hw_video.setChecked(getattr(p, "hardware_video_decoding", True))
         self.chk_opencl.setChecked(getattr(p, "enable_opencl_acceleration", True))
         self.chk_pbo_streaming.setChecked(getattr(p, "enable_pbo_streaming", True))
@@ -1210,8 +1284,19 @@ class PreferencesDialog(QDialog):
         self.spin_lookahead_gb.setValue(p.lookahead_cache_gb)
         self.spin_region_gb.setValue(p.region_cache_gb)
         self.spin_behind_pct.setValue(int(p.lookahead_behind_pct))
+        self.chk_buffer_pooling.setChecked(getattr(p, "enable_buffer_pooling", True))
         self.chk_enable_disk_cache.setChecked(getattr(p, "enable_disk_cache", True))
         self.spin_disk_cache_gb.setValue(getattr(p, "max_disk_cache_gb", 20.0))
+
+        # Native Rust Engine & Proxy Caching
+        self.chk_enable_rust_engine.setChecked(getattr(p, "enable_rust_engine", True))
+        self.spin_rust_worker_threads.setValue(getattr(p, "rust_worker_threads", 0))
+        self.chk_enable_proxy_caching.setChecked(getattr(p, "enable_proxy_caching", True))
+        proxy_scale = getattr(p, "proxy_resolution_scale", 2)
+        idx_proxy = self.combo_proxy_scale.findData(proxy_scale)
+        if idx_proxy >= 0:
+            self.combo_proxy_scale.setCurrentIndex(idx_proxy)
+        self._on_rust_engine_toggled(self.chk_enable_rust_engine.isChecked())
         op_val = int(getattr(p, "hud_opacity", 0.85) * 100)
         self.slider_hud_opacity.setValue(op_val)
         self.lbl_hud_opacity_val.setText(f"{op_val}%")
@@ -1254,6 +1339,14 @@ class PreferencesDialog(QDialog):
     def _on_hud_opacity_slider_changed(self, val: int) -> None:
         self.lbl_hud_opacity_val.setText(f"{val}%")
         self.hud_opacity_changed.emit(val / 100.0)
+
+    def _on_rust_engine_toggled(self, checked: bool) -> None:
+        self.spin_rust_worker_threads.setEnabled(checked)
+        self.chk_enable_proxy_caching.setEnabled(checked)
+        self.combo_proxy_scale.setEnabled(checked and self.chk_enable_proxy_caching.isChecked())
+
+    def _on_proxy_caching_toggled(self, checked: bool) -> None:
+        self.combo_proxy_scale.setEnabled(checked and self.chk_enable_rust_engine.isChecked())
 
     def _on_clear_disk_cache_clicked(self) -> None:
         try:
@@ -1309,12 +1402,23 @@ class PreferencesDialog(QDialog):
         p.lookahead_behind_pct = float(self.spin_behind_pct.value())
         p.enable_disk_cache = self.chk_enable_disk_cache.isChecked()
         p.max_disk_cache_gb = self.spin_disk_cache_gb.value()
+        p.enable_buffer_pooling = self.chk_buffer_pooling.isChecked()
+        try:
+            from openreview.core.buffer_pool import FrameBufferPool
+            FrameBufferPool.instance().enabled = p.enable_buffer_pooling
+        except Exception:
+            pass
+        p.enable_rust_engine = self.chk_enable_rust_engine.isChecked()
+        p.rust_worker_threads = self.spin_rust_worker_threads.value()
+        p.enable_proxy_caching = self.chk_enable_proxy_caching.isChecked()
+        p.proxy_resolution_scale = int(self.combo_proxy_scale.currentData() or 2)
         p.playback_texture_mode = self.combo_texture_mode.currentData()
         p.prefetch_buffer_size = self.spin_prefetch_buffer.value()
         p.prefetch_worker_threads = self.spin_prefetch_threads.value()
         p.fast_playback_laptop_mode = self.chk_laptop_mode.isChecked()
         p.playback_engine = self.combo_playback_engine.currentData() or "opengl_core"
         p.selected_gpu_device = self.combo_gpu_device.currentData() or "auto"
+        p.enable_pyav_engine = self.chk_pyav_video.isChecked()
         p.hardware_video_decoding = self.chk_hw_video.isChecked()
         p.enable_opencl_acceleration = self.chk_opencl.isChecked()
         p.enable_pbo_streaming = self.chk_pbo_streaming.isChecked()

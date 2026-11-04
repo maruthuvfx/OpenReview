@@ -151,6 +151,7 @@ class ShortcutManager(QObject):
             ("color.gamma_reset", "Reset Gamma (1.0)", "Color & Exposure", "Ctrl+Alt+G", "Reset display gamma to 1.0"),
             ("color.reset_all", "Reset All Color Adjustments", "Color & Exposure", "Ctrl+Alt+R", "Reset gain, gamma, saturation, and color adjustments"),
             ("color.adjustments", "Interactive Color Adjustments", "Color & Exposure", "/", "Open Interactive Color Adjustments panel"),
+            ("color.sliders_overlay", "Toggle On-Screen Color Sliders", "Color & Exposure", "S", "Toggle on-screen Gain, Gamma, Hue, and Saturation sliders"),
 
             # Timeline
             ("timeline.zoom_in", "Timeline Zoom In", "Timeline", "Ctrl+=", "Zoom in timeline view"),
@@ -183,12 +184,13 @@ class ShortcutManager(QObject):
             ("hud.histogram", "Toggle Live RGB Histogram", "HUDs & Panels", "H", "Show/hide real-time color histogram"),
             ("hud.waveform", "Toggle Waveform Monitor", "HUDs & Panels", "V", "Show/hide real-time Waveform scope"),
             ("hud.vectorscope", "Toggle Vectorscope Monitor", "HUDs & Panels", "Shift+V", "Show/hide real-time Vectorscope scope"),
-            ("hud.color_inspector", "Toggle Color Inspector HUD", "HUDs & Panels", "F5", "Show/hide floating pixel color inspector"),
+            ("hud.color_inspector", "Toggle Color Inspector HUD", "HUDs & Panels", "F4", "Show/hide floating pixel color inspector"),
             ("hud.wipe", "Toggle A/B Wipe Controller", "HUDs & Panels", "W", "Show/hide interactive split wipe comparison"),
             ("hud.wipe_flip_orientation", "Flip Wipe Orientation", "HUDs & Panels", "Shift+W", "Flip wipe split between Horizontal and Vertical"),
             ("hud.wipe_reset", "Reset Wipe Controls", "HUDs & Panels", "Alt+W", "Reset wipe position to center and angle to default"),
             ("hud.source_details", "Toggle Source Media Details", "HUDs & Panels", "I", "Inspect media metadata, codec, resolution, and color profile"),
             ("hud.info_strip", "Toggle Info Strip", "HUDs & Panels", "Ctrl+I", "Show/hide HUD metadata overlay strip"),
+            ("hud.metadata_tree", "Toggle Metadata & Attribute Tree", "HUDs & Panels", "Alt+I", "Inspect OpenEXR headers, ExifTool attributes, and video streams in an interactive tree"),
             ("hud.dailies_sync", "Remote Dailies Sync Panel", "HUDs & Panels", "Ctrl+Shift+D", "Open multi-user sync collaboration panel"),
             ("hud.layers", "Toggle EXR Passes HUD", "HUDs & Panels", "", "Show/hide multi-channel EXR render passes panel"),
             ("hud.stereo", "Toggle Stereoscopic 3D HUD", "HUDs & Panels", "", "Show/hide stereo 3D display panel"),
@@ -222,12 +224,20 @@ class ShortcutManager(QObject):
             ("session.save", "Save Session", "File & Sessions", "Ctrl+S", "Save session state"),
             ("session.save_as", "Save Session As...", "File & Sessions", "Ctrl+Shift+S", "Save session under new file path"),
             ("session.export", "Export Media...", "File & Sessions", "Ctrl+Shift+E", "Export sequence or frame render"),
+            ("session.batch_export", "Batch Export Queue...", "File & Sessions", "Ctrl+Shift+B", "Hardware-accelerated batch export queue manager"),
             ("app.preferences", "Preferences...", "File & Sessions", "Ctrl+,", "Open Preferences dialog"),
             ("app.clear_cache", "Clear RAM Cache", "File & Sessions", "Ctrl+Shift+C", "Flush all cached image frames from memory"),
             ("app.clear_all_cache", "Clear All Source Cache", "File & Sessions", "Ctrl+Delete", "Flush all cached image frames across all sources from memory"),
             ("app.toggle_cache", "Start In/Out Region Cache", "Playback & Transport", "Shift+C", "Start In/Out Region RAM caching"),
             ("app.quit", "Quit OpenReview", "File & Sessions", "Ctrl+Q", "Exit application"),
             ("app.escape", "Cancel / Deselect Tool", "File & Sessions", "Escape", "Deselect active tool or exit drawing mode"),
+
+            # Studio Workspaces
+            ("workspace.review", "Standard Review Workspace", "Studio Workspaces", "F5", "Switch to Standard Review workspace layout"),
+            ("workspace.color_qc", "Color & QC Studio Workspace", "Studio Workspaces", "F6", "Switch to Color & QC Studio workspace layout"),
+            ("workspace.vfx_breakdown", "VFX Breakdown Workspace", "Studio Workspaces", "F7", "Switch to VFX Breakdown & Multi-Channel EXR workspace layout"),
+            ("workspace.cinema", "Cinema Theater Workspace", "Studio Workspaces", "F8", "Switch to distraction-free Cinema Theater workspace layout"),
+            ("workspace.annotations", "Supervisor Review Workspace", "Studio Workspaces", "F9", "Switch to Supervisor Review & Notes workspace layout"),
         ]
 
         for action_id, name, cat, default_key, desc in defs:
@@ -259,7 +269,18 @@ class ShortcutManager(QObject):
             "PageDown": "mark.bookmark_segment_next",
             "PageUp": "mark.bookmark_segment_prev",
             "Alt+C": "hud.color_inspector",
-            "F5": "hud.color_inspector",
+            "F4": "hud.color_inspector",
+            "f4": "hud.color_inspector",
+            "F5": "workspace.review",
+            "f5": "workspace.review",
+            "F6": "workspace.color_qc",
+            "f6": "workspace.color_qc",
+            "F7": "workspace.vfx_breakdown",
+            "f7": "workspace.vfx_breakdown",
+            "F8": "workspace.cinema",
+            "f8": "workspace.cinema",
+            "F9": "workspace.annotations",
+            "f9": "workspace.annotations",
             "Y": "channel.luma",
             "y": "channel.luma",
             "E": "color.exp_reset",
@@ -311,6 +332,8 @@ class ShortcutManager(QObject):
             "Shift+f": "playback.set_fps",
             "Ctrl+Alt+E": "color.exp_reset",
             "Ctrl+E": "annot.export",
+            "Ctrl+Shift+B": "session.batch_export",
+            "Ctrl+Shift+b": "session.batch_export",
             "Ctrl+e": "annot.export",
             "Ctrl+Alt+G": "color.gamma_reset",
             "Ctrl+Alt+R": "color.reset_all",
@@ -348,6 +371,8 @@ class ShortcutManager(QObject):
             "v": "hud.waveform",
             "Shift+V": "hud.vectorscope",
             "Shift+v": "hud.vectorscope",
+            "S": "color.sliders_overlay",
+            "s": "color.sliders_overlay",
         }
 
     def _rebuild_key_map(self) -> None:

@@ -1,0 +1,19 @@
+[package]
+name = "openreview-engine"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "openreview_engine"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+exr = "1.72"
+rayon = "1.10"
+parking_lot = "0.12"
+memmap2 = "0.9"
+lz4_flex = "0.11"
+half = { version = "2.4", features = ["bytemuck"] }
+crossbeam-channel = "0.5"
+tiff = "0.9"

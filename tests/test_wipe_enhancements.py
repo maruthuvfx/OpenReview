@@ -221,3 +221,134 @@ def test_shader_wipe_single_line_and_aspect_ratio_alignment():
     # Verify isotropic projection calculation in shader
     assert "float rMax = 0.5 * (aspect * abs(dir.x) + abs(dir.y));" in FRAGMENT_SHADER_SOURCE
     assert "float p = (TexCoord.x - 0.5) * aspect * dir.x + (TexCoord.y - 0.5) * dir.y;" in FRAGMENT_SHADER_SOURCE
+
+
+def test_comparison_modes_enum_and_state():
+    assert ComparisonMode.SPOTLIGHT == 8
+    assert ComparisonMode.MULTIPLY == 9
+    assert ComparisonMode.SCREEN == 10
+    assert ComparisonMode.OVERLAY == 11
+
+    state = ComparisonState()
+    assert state.diff_heatmap is False
+    assert state.wipe_show_line is True
+    assert state.spotlight_radius == 0.25
+
+    state.toggle_diff_heatmap()
+    assert state.diff_heatmap is True
+
+    state.toggle_wipe_line()
+    assert state.wipe_show_line is False
+
+    state.reset()
+    assert state.diff_heatmap is False
+    assert state.wipe_show_line is True
+    assert state.mode == ComparisonMode.OFF
+
+
+def test_hud_spotlight_and_toggles(qtbot):
+    state = ComparisonState()
+    hud = WipeComparisonHUD(state)
+    qtbot.addWidget(hud)
+
+    # Click Spot mode button
+    hud.btn_spot.click()
+    assert state.mode == ComparisonMode.SPOTLIGHT
+    assert hud.btn_spot.isChecked()
+    assert not hud.btn_wipe.isChecked()
+
+    # Toggle divider line
+    assert hud.chk_line.isChecked()
+    hud.chk_line.click()
+    assert state.wipe_show_line is False
+    assert not hud.chk_line.isChecked()
+
+    # Toggle difference heatmap
+    assert not hud.chk_heatmap.isChecked()
+    hud.chk_heatmap.click()
+    assert state.diff_heatmap is True
+    assert hud.chk_heatmap.isChecked()
+
+
+def test_shader_anti_aliased_wipe_and_turbo_heatmap():
+    from openreview.color.shader_builder import FRAGMENT_SHADER_SOURCE
+
+    # Verify uniforms
+    assert "uniform bool uWipeShowLine;" in FRAGMENT_SHADER_SOURCE
+    assert "uniform bool uDiffHeatmap;" in FRAGMENT_SHADER_SOURCE
+    assert "uniform float uSpotlightRadius;" in FRAGMENT_SHADER_SOURCE
+
+    # Verify Turbo Colormap function
+    assert "vec3 turbo_colormap(float x)" in FRAGMENT_SHADER_SOURCE
+    assert "kRedVec4" in FRAGMENT_SHADER_SOURCE
+
+    # Verify sub-pixel anti-aliasing
+    assert "float delta = max(fwidth(d), 0.0005);" in FRAGMENT_SHADER_SOURCE
+    assert "float wipeFactor = smoothstep(-delta * 0.5, delta * 0.5, d);" in FRAGMENT_SHADER_SOURCE
+
+    # Verify new comparison modes in GLSL
+    assert "uComparisonMode == 8 && uHasTextureB" in FRAGMENT_SHADER_SOURCE  # Spotlight
+    assert "uComparisonMode == 9 && uHasTextureB" in FRAGMENT_SHADER_SOURCE  # Multiply
+    assert "uComparisonMode == 10 && uHasTextureB" in FRAGMENT_SHADER_SOURCE # Screen
+    assert "uComparisonMode == 11 && uHasTextureB" in FRAGMENT_SHADER_SOURCE # Overlay
+
+
+def test_main_window_new_comparison_modes_and_toggles(qtbot):
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.resize(1000, 700)
+    window.show()
+
+    # Verify all new modes work in _on_set_view_type
+    for mode in (ComparisonMode.SPOTLIGHT, ComparisonMode.MULTIPLY, ComparisonMode.SCREEN, ComparisonMode.OVERLAY):
+        window._on_set_view_type(mode)
+        assert window.comparison_state.mode == mode
+        assert window.viewport.comparison_state.mode == mode
+
+    # Test toggles
+    assert window.comparison_state.diff_heatmap is False
+    window._on_toggle_diff_heatmap()
+    assert window.comparison_state.diff_heatmap is True
+    assert window.viewport.comparison_state.diff_heatmap is True
+    assert window.act_diff_hm.isChecked()
+
+    assert window.comparison_state.wipe_show_line is True
+    window._on_toggle_wipe_line()
+    assert window.comparison_state.wipe_show_line is False
+    assert window.viewport.comparison_state.wipe_show_line is False
+    assert not window.act_wipe_line.isChecked()
+
+
+def test_viewport_spotlight_interaction(qtbot):
+    viewport = ViewportCanvas()
+    qtbot.addWidget(viewport)
+    viewport.resize(800, 600)
+    viewport.show()
+
+    viewport.comparison_state.mode = ComparisonMode.SPOTLIGHT
+    viewport._img_width = 1920
+    viewport._img_height = 1080
+
+    # Simulate mouse press to move spotlight center
+    press_event = QMouseEvent(
+        QMouseEvent.Type.MouseButtonPress,
+        QPointF(400, 300),
+        QPointF(400, 300),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    viewport.mousePressEvent(press_event)
+    assert getattr(viewport, "_is_dragging_spotlight", False) is True
+
+    # Mouse release
+    release_event = QMouseEvent(
+        QMouseEvent.Type.MouseButtonRelease,
+        QPointF(400, 300),
+        QPointF(400, 300),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    viewport.mouseReleaseEvent(release_event)
+    assert getattr(viewport, "_is_dragging_spotlight", False) is False

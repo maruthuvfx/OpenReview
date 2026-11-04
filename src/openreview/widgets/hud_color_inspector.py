@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
     QScrollArea,
+    QSizePolicy,
 )
 
 from openreview.widgets.draggable_scroll_area import BlenderScrollArea
@@ -264,7 +265,8 @@ class ColorInspectorHUD(QWidget):
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.setFixedWidth(316)
+        self.setMinimumWidth(260)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         self.setMouseTracking(True)
 
         # Inspection state
@@ -344,18 +346,21 @@ class ColorInspectorHUD(QWidget):
 
         # Color Values Grid
         grid = QGridLayout()
-        grid.setSpacing(4)
-        grid.setContentsMargins(0, 2, 0, 2)
+        grid.setVerticalSpacing(2)
+        grid.setHorizontalSpacing(6)
+        grid.setContentsMargins(0, 1, 0, 1)
 
         def make_hdr(txt: str) -> QLabel:
             lbl = QLabel(txt, self)
             lbl.setStyleSheet("color: #888888; font-size: 10px; font-weight: bold;")
+            lbl.setFixedHeight(17)
             return lbl
 
         def make_val(txt: str) -> QLabel:
             lbl = QLabel(txt, self)
             lbl.setTextFormat(Qt.TextFormat.RichText)
             lbl.setStyleSheet("color: #dddddd; font-family: monospace; font-size: 10px;")
+            lbl.setFixedHeight(17)
             return lbl
 
         grid.addWidget(make_hdr("Float:"), 0, 0)
@@ -396,6 +401,8 @@ class ColorInspectorHUD(QWidget):
 
         grid.setColumnStretch(0, 0)
         grid.setColumnStretch(1, 1)
+        for r in range(6):
+            grid.setRowStretch(r, 0)
         layout.addLayout(grid)
 
         # Controls Bar: Aperture selector & Copy button
@@ -617,6 +624,7 @@ class ColorInspectorHUD(QWidget):
         analyzer_layout.addLayout(checks_row)
         self.analyzer_container.hide()
         layout.addWidget(self.analyzer_container)
+        layout.addStretch(1)
         self._update_check_badge_styles(0, 0, 0)
 
     def _update_check_badge_styles(self, nan_cnt: int, inf_cnt: int, neg_cnt: int) -> None:

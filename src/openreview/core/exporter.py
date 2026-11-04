@@ -347,6 +347,199 @@ class MediaExporter:
 
         return str(p)
 
+    _VERIFIED_ENCODERS: Dict[str, bool] = {}
+
+    @staticmethod
+    def detect_hardware_encoders() -> Dict[str, bool]:
+        """Query FFmpeg binary to check built-in hardware encoder modules."""
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if not ffmpeg_bin:
+            return {}
+        try:
+            res = subprocess.run([ffmpeg_bin, "-encoders"], capture_output=True, text=True, timeout=5.0)
+            out = res.stdout.lower()
+            return {
+                "nvenc": "h264_nvenc" in out,
+                "qsv": "h264_qsv" in out,
+                "amf": "h264_amf" in out,
+                "videotoolbox": "h264_videotoolbox" in out,
+                "mf": "h264_mf" in out,
+                "prores_ks": "prores_ks" in out,
+                "libx264": "libx264" in out,
+                "libx265": "libx265" in out,
+            }
+        except Exception:
+            return {}
+
+    @staticmethod
+    def is_encoder_functional(encoder_name: str) -> bool:
+        """Run a micro-probe to verify if the hardware encoder initializes on the GPU."""
+        if encoder_name in MediaExporter._VERIFIED_ENCODERS:
+            return MediaExporter._VERIFIED_ENCODERS[encoder_name]
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if not ffmpeg_bin:
+            return False
+        cmd = [
+            ffmpeg_bin, "-y",
+            "-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.04",
+            "-c:v", encoder_name,
+            "-f", "null", "-"
+        ]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=3.0)
+            ok = (res.returncode == 0)
+        except Exception:
+            ok = False
+        MediaExporter._VERIFIED_ENCODERS[encoder_name] = ok
+        return ok
+
+    @staticmethod
+    def resolve_video_encoder(
+        codec: str,
+        hwaccel: str = "auto",
+        crf: int = 18,
+        is_mov: bool = False,
+    ) -> Tuple[str, List[str], str]:
+        """
+        Resolve the optimal video encoder and FFmpeg command parameters.
+        Supports:
+          - Apple ProRes: Proxy (0), LT (1), 422 (2), HQ (3), 4444 (4), 4444 XQ (5)
+          - NVIDIA NVENC: h264_nvenc, hevc_nvenc, av1_nvenc
+          - Intel QuickSync: h264_qsv, hevc_qsv, av1_qsv
+          - AMD AMF: h264_amf, hevc_amf, av1_amf
+          - Apple VideoToolbox: h264_videotoolbox, hevc_videotoolbox, prores_videotoolbox
+          - Windows MediaFoundation: h264_mf, hevc_mf
+          - CPU software fallback: libx264, libx265, prores_ks
+        Returns: (encoder_name, extra_args_list, description_str)
+        """
+        codec_str = str(codec).strip().lower()
+        hw_pref = str(hwaccel).strip().lower()
+
+        # 1. Apple ProRes Profiles (.mov container)
+        if "prores" in codec_str:
+            if "proxy" in codec_str:
+                profile = "0"
+                desc_name = "Proxy"
+            elif "lt" in codec_str:
+                profile = "1"
+                desc_name = "LT"
+            elif "4444 xq" in codec_str or "xq" in codec_str:
+                profile = "5"
+                desc_name = "4444 XQ"
+            elif "4444" in codec_str:
+                profile = "4"
+                desc_name = "4444"
+            elif "422" in codec_str and "hq" not in codec_str:
+                profile = "2"
+                desc_name = "422 Standard"
+            else:
+                profile = "3"
+                desc_name = "422 HQ"
+
+            pix_fmt = "yuva444p10le" if profile in ("4", "5") else "yuv422p10le"
+
+            # Check Apple VideoToolbox hardware ProRes on macOS
+            if hw_pref in ("auto", "videotoolbox") and MediaExporter.is_encoder_functional("prores_videotoolbox"):
+                return (
+                    "prores_videotoolbox",
+                    ["-c:v", "prores_videotoolbox", "-profile:v", profile, "-pix_fmt", pix_fmt],
+                    f"Apple ProRes {desc_name} (VideoToolbox Hardware)",
+                )
+
+            return (
+                "prores_ks",
+                ["-c:v", "prores_ks", "-profile:v", profile, "-pix_fmt", pix_fmt],
+                f"Apple ProRes {desc_name} (iCodec Pro 10-bit)",
+            )
+
+        # 2. H.265 / HEVC
+        if "265" in codec_str or "hevc" in codec_str:
+            # NVIDIA NVENC
+            if (hw_pref in ("auto", "nvenc") or "nvenc" in codec_str) and MediaExporter.is_encoder_functional("hevc_nvenc"):
+                return (
+                    "hevc_nvenc",
+                    ["-c:v", "hevc_nvenc", "-preset", "p4", "-cq", str(crf), "-pix_fmt", "yuv420p"],
+                    "H.265 / HEVC (NVIDIA NVENC GPU)",
+                )
+            # Intel QuickSync
+            if (hw_pref in ("auto", "qsv") or "qsv" in codec_str or "quicksync" in codec_str) and MediaExporter.is_encoder_functional("hevc_qsv"):
+                return (
+                    "hevc_qsv",
+                    ["-c:v", "hevc_qsv", "-global_quality", str(crf), "-pix_fmt", "yuv420p"],
+                    "H.265 / HEVC (Intel QuickSync GPU)",
+                )
+            # Apple VideoToolbox
+            if (hw_pref in ("auto", "videotoolbox") or "videotoolbox" in codec_str) and MediaExporter.is_encoder_functional("hevc_videotoolbox"):
+                return (
+                    "hevc_videotoolbox",
+                    ["-c:v", "hevc_videotoolbox", "-q:v", str(max(10, 100 - crf * 2)), "-pix_fmt", "yuv420p"],
+                    "H.265 / HEVC (Apple VideoToolbox GPU)",
+                )
+            # AMD AMF
+            if (hw_pref in ("auto", "amf") or "amf" in codec_str) and MediaExporter.is_encoder_functional("hevc_amf"):
+                return (
+                    "hevc_amf",
+                    ["-c:v", "hevc_amf", "-quality", "quality", "-pix_fmt", "yuv420p"],
+                    "H.265 / HEVC (AMD AMF GPU)",
+                )
+            # Windows MediaFoundation
+            if (hw_pref in ("auto", "mf") or "mediafoundation" in codec_str) and MediaExporter.is_encoder_functional("hevc_mf"):
+                return (
+                    "hevc_mf",
+                    ["-c:v", "hevc_mf", "-b:v", "10M", "-pix_fmt", "yuv420p"],
+                    "H.265 / HEVC (MediaFoundation GPU)",
+                )
+            # Software Fallback
+            return (
+                "libx265",
+                ["-c:v", "libx265", "-crf", str(crf), "-preset", "medium", "-pix_fmt", "yuv420p"],
+                "H.265 / HEVC (libx265 CPU)",
+            )
+
+        # 3. H.264 / AVC (Default)
+        # NVIDIA NVENC
+        if (hw_pref in ("auto", "nvenc") or "nvenc" in codec_str) and MediaExporter.is_encoder_functional("h264_nvenc"):
+            return (
+                "h264_nvenc",
+                ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", str(crf), "-pix_fmt", "yuv420p"],
+                "H.264 (NVIDIA NVENC GPU)",
+            )
+        # Intel QuickSync
+        if (hw_pref in ("auto", "qsv") or "qsv" in codec_str or "quicksync" in codec_str) and MediaExporter.is_encoder_functional("h264_qsv"):
+            return (
+                "h264_qsv",
+                ["-c:v", "h264_qsv", "-global_quality", str(crf), "-pix_fmt", "yuv420p"],
+                "H.264 (Intel QuickSync GPU)",
+            )
+        # Apple VideoToolbox
+        if (hw_pref in ("auto", "videotoolbox") or "videotoolbox" in codec_str) and MediaExporter.is_encoder_functional("h264_videotoolbox"):
+            return (
+                "h264_videotoolbox",
+                ["-c:v", "h264_videotoolbox", "-q:v", str(max(10, 100 - crf * 2)), "-pix_fmt", "yuv420p"],
+                "H.264 (Apple VideoToolbox GPU)",
+            )
+        # AMD AMF
+        if (hw_pref in ("auto", "amf") or "amf" in codec_str) and MediaExporter.is_encoder_functional("h264_amf"):
+            return (
+                "h264_amf",
+                ["-c:v", "h264_amf", "-quality", "quality", "-pix_fmt", "yuv420p"],
+                "H.264 (AMD AMF GPU)",
+            )
+        # Windows MediaFoundation
+        if (hw_pref in ("auto", "mf") or "mediafoundation" in codec_str) and MediaExporter.is_encoder_functional("h264_mf"):
+            return (
+                "h264_mf",
+                ["-c:v", "h264_mf", "-b:v", "10M", "-pix_fmt", "yuv420p"],
+                "H.264 (MediaFoundation GPU)",
+            )
+
+        # Software Fallback
+        return (
+            "libx264",
+            ["-c:v", "libx264", "-crf", str(crf), "-preset", "medium", "-pix_fmt", "yuv420p"],
+            "H.264 (libx264 CPU)",
+        )
+
     @staticmethod
     def export_video_ffmpeg(
         frame_provider: Callable[[int], np.ndarray],
@@ -355,6 +548,7 @@ class MediaExporter:
         fps: float = 24.0,
         codec: str = "Apple ProRes 422 HQ",
         crf: int = 18,
+        hwaccel: str = "auto",
         progress_callback: Optional[Callable[[int, int], None]] = None,
         cancel_token: Optional[Callable[[], bool]] = None,
     ) -> str:
@@ -381,22 +575,10 @@ class MediaExporter:
         if h % 2 != 0:
             h -= 1
 
-        codec_str = str(codec).lower()
-        if "prores" in codec_str:
-            if "proxy" in codec_str:
-                profile = "0"
-            elif "4444" in codec_str:
-                profile = "4"
-            elif "hq" in codec_str:
-                profile = "3"
-            else:
-                profile = "2"
-            pix_fmt = "yuva444p10le" if profile == "4" else "yuv422p10le"
-            codec_args = ["-c:v", "prores_ks", "-profile:v", profile, "-pix_fmt", pix_fmt]
-        elif "265" in codec_str or "hevc" in codec_str:
-            codec_args = ["-c:v", "libx265", "-crf", str(crf), "-preset", "medium", "-pix_fmt", "yuv420p"]
-        else:  # H.264
-            codec_args = ["-c:v", "libx264", "-crf", str(crf), "-preset", "medium", "-pix_fmt", "yuv420p"]
+        is_mov_file = (p.suffix.lower() == ".mov")
+        enc_name, codec_args, enc_desc = MediaExporter.resolve_video_encoder(
+            codec, hwaccel=hwaccel, crf=crf, is_mov=is_mov_file
+        )
 
         cmd = [
             ffmpeg_bin,
@@ -438,6 +620,19 @@ class MediaExporter:
             stdout_data, stderr_data = proc.communicate(timeout=60)
             if proc.returncode != 0:
                 stderr_text = stderr_data.decode("utf-8", errors="ignore") if stderr_data else ""
+                if enc_name not in ("libx264", "libx265", "prores_ks"):
+                    logger.warning("Hardware encoder %s failed (%s). Retrying with software CPU encoder...", enc_name, stderr_text[:200])
+                    return MediaExporter.export_video_ffmpeg(
+                        frame_provider,
+                        frames,
+                        output_path,
+                        fps=fps,
+                        codec=codec,
+                        crf=crf,
+                        hwaccel="cpu",
+                        progress_callback=progress_callback,
+                        cancel_token=cancel_token,
+                    )
                 raise RuntimeError(f"FFmpeg export failed (code {proc.returncode}): {stderr_text}")
         except Exception as e:
             if proc.poll() is None:
@@ -1305,3 +1500,9 @@ class MediaExporter:
         disp = np.where(lin > 0.0031308, higher, lower)
         return np.clip(disp, 0.0, 1.0).astype(np.float32)
 
+
+
+# Module-level convenience aliases
+detect_hardware_encoders = MediaExporter.detect_hardware_encoders
+is_encoder_functional = MediaExporter.is_encoder_functional
+resolve_video_encoder = MediaExporter.resolve_video_encoder

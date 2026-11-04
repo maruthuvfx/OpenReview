@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QComboBox,
     QFrame,
+    QSizePolicy,
 )
 
 
@@ -23,12 +24,36 @@ class HistogramCanvas(QWidget):
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.setFixedSize(260, 110)
+        self.setMinimumSize(180, 80)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._hist_r = np.zeros(256, dtype=np.float32)
         self._hist_g = np.zeros(256, dtype=np.float32)
         self._hist_b = np.zeros(256, dtype=np.float32)
         self._hist_y = np.zeros(256, dtype=np.float32)
         self._max_val = 1.0
+
+    def set_histogram_data(
+        self,
+        hist_r: Optional[np.ndarray],
+        hist_g: Optional[np.ndarray],
+        hist_b: Optional[np.ndarray],
+        hist_y: Optional[np.ndarray],
+        max_val: float,
+    ) -> None:
+        """Set pre-computed histogram distributions from asynchronous worker (thread-safe UI update)."""
+        if hist_r is None:
+            self._hist_r = np.zeros(256, dtype=np.float32)
+            self._hist_g = np.zeros(256, dtype=np.float32)
+            self._hist_b = np.zeros(256, dtype=np.float32)
+            self._hist_y = np.zeros(256, dtype=np.float32)
+            self._max_val = 1.0
+        else:
+            self._hist_r = hist_r
+            self._hist_g = hist_g
+            self._hist_b = hist_b
+            self._hist_y = hist_y
+            self._max_val = max_val
+        self.update()
 
     def update_data(self, image_data: Optional[np.ndarray]) -> None:
         if image_data is None or image_data.size == 0:
@@ -123,29 +148,47 @@ class HistogramHUD(QWidget):
 
         # Canvas
         self.canvas = HistogramCanvas(self)
-        layout.addWidget(self.canvas)
+        layout.addWidget(self.canvas, 1)
 
-        # Info readout row (Min / Max clipping values)
+        # Info readout row (Min / Max clipping values) - compact horizontal bar
         info_frame = QFrame(self)
-        info_layout = QVBoxLayout(info_frame)
-        info_layout.setContentsMargins(2, 2, 2, 2)
-        info_layout.setSpacing(2)
+        info_frame.setStyleSheet("background: transparent;")
+        info_layout = QHBoxLayout(info_frame)
+        info_layout.setContentsMargins(4, 2, 4, 2)
+        info_layout.setSpacing(8)
 
-        self.min_label = QLabel("Min: RGB U8 [0, 0, 0]", self)
+        self.min_label = QLabel("Min: [0, 0, 0]", self)
         self.min_label.setStyleSheet("color: #888888; font-family: monospace; font-size: 10px;")
         info_layout.addWidget(self.min_label)
 
-        self.max_label = QLabel("Max: RGB U8 [255, 255, 255]", self)
+        info_layout.addStretch()
+
+        self.max_label = QLabel("Max: [255, 255, 255]", self)
         self.max_label.setStyleSheet("color: #888888; font-family: monospace; font-size: 10px;")
         info_layout.addWidget(self.max_label)
 
-        layout.addWidget(info_frame)
+        layout.addWidget(info_frame, 0)
+
+    def set_histogram_data(
+        self,
+        hist_r: Optional[np.ndarray],
+        hist_g: Optional[np.ndarray],
+        hist_b: Optional[np.ndarray],
+        hist_y: Optional[np.ndarray],
+        max_val: float,
+    ) -> None:
+        """Set pre-computed histogram distributions asynchronously."""
+        self.canvas.set_histogram_data(hist_r, hist_g, hist_b, hist_y, max_val)
 
     def update_frame(self, image_data: Optional[np.ndarray]) -> None:
         self.canvas.update_data(image_data)
         if image_data is not None and image_data.size > 0:
-            rgb = image_data[:, :, :3]
-            min_vals = np.clip(np.min(rgb, axis=(0, 1)) * 255.0, 0, 255).astype(int)
-            max_vals = np.clip(np.max(rgb, axis=(0, 1)) * 255.0, 0, 255).astype(int)
+            sub = image_data[::4, ::4, :3] if image_data.ndim >= 2 else image_data
+            if sub.dtype == np.uint8:
+                min_vals = np.min(sub, axis=(0, 1)).astype(int)
+                max_vals = np.max(sub, axis=(0, 1)).astype(int)
+            else:
+                min_vals = np.clip(np.min(sub, axis=(0, 1)) * 255.0, 0, 255).astype(int)
+                max_vals = np.clip(np.max(sub, axis=(0, 1)) * 255.0, 0, 255).astype(int)
             self.min_label.setText(f"Min: RGB [{min_vals[0]}, {min_vals[1]}, {min_vals[2]}]")
             self.max_label.setText(f"Max: RGB [{max_vals[0]}, {max_vals[1]}, {max_vals[2]}]")

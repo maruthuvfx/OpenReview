@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QComboBox,
     QFrame,
+    QSizePolicy,
 )
 
 
@@ -28,7 +29,8 @@ class WaveformCanvas(QWidget):
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.setFixedSize(308, 175)
+        self.setMinimumSize(200, 100)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._mode: str = self.MODE_OVERLAY
         self._trace_img: Optional[QImage] = None
 
@@ -37,15 +39,35 @@ class WaveformCanvas(QWidget):
         self._m_right = 6
         self._m_top = 8
         self._m_bottom = 14
-        self._plot_w = self.width() - self._m_left - self._m_right  # 270 px
-        self._plot_h = self.height() - self._m_top - self._m_bottom  # 153 px
+
+    @property
+    def _plot_w(self) -> int:
+        return max(10, self.width() - self._m_left - self._m_right)
+
+    @property
+    def _plot_h(self) -> int:
+        return max(10, self.height() - self._m_top - self._m_bottom)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.update()
 
     def set_mode(self, mode: str) -> None:
         if self._mode != mode:
             self._mode = mode
             self.update()
 
+    def set_trace_image(self, img: Optional[QImage]) -> None:
+        """Set pre-computed trace image from asynchronous compute worker (thread-safe UI update)."""
+        self._trace_img = img
+        self.update()
+
     def update_data(self, image_data: Optional[np.ndarray]) -> None:
+        if image_data is not None and image_data.ndim >= 2:
+            ih, iw = image_data.shape[:2]
+            step = 4 if (iw >= 3840 or ih >= 2160) else (2 if (iw >= 1920 or ih >= 1080) else 1)
+            if step > 1:
+                image_data = image_data[::step, ::step]
         if image_data is None or image_data.size == 0:
             self._trace_img = None
             self.update()
@@ -195,7 +217,8 @@ class WaveformCanvas(QWidget):
 
         # Paint phosphor trace
         if self._trace_img is not None and not self._trace_img.isNull():
-            painter.drawImage(x_start, y_top, self._trace_img)
+            target_rect = QRectF(x_start, y_top, pw, ph)
+            painter.drawImage(target_rect, self._trace_img)
 
         # Plot border
         painter.setPen(QPen(QColor(50, 50, 50), 1))
@@ -261,7 +284,7 @@ class WaveformHUD(QWidget):
 
         # Canvas
         self.canvas = WaveformCanvas(self)
-        layout.addWidget(self.canvas)
+        layout.addWidget(self.canvas, 1)
 
         # Bottom info status bar
         info_frame = QFrame(self)
@@ -272,7 +295,7 @@ class WaveformHUD(QWidget):
         self.info_label = QLabel("IRE: 0% - 100% | Full Range", self)
         self.info_label.setStyleSheet("color: #777777; font-family: monospace; font-size: 9.5px;")
         info_layout.addWidget(self.info_label)
-        layout.addWidget(info_frame)
+        layout.addWidget(info_frame, 0)
 
     def _on_mode_changed(self, index: int) -> None:
         mode = self.mode_combo.itemData(index)
@@ -280,6 +303,18 @@ class WaveformHUD(QWidget):
             self.canvas.set_mode(mode)
             if self._last_frame_data is not None:
                 self.canvas.update_data(self._last_frame_data)
+
+    @property
+    def _mode(self) -> str:
+        return self.canvas._mode
+
+    def set_trace_image(self, img: Optional[QImage]) -> None:
+        """Set pre-computed trace image asynchronously."""
+        self.canvas.set_trace_image(img)
+        if img is None:
+            self.info_label.setText("IRE: 0% - 100% | No Signal")
+        else:
+            self.info_label.setText("IRE: 0% - 100% | Active Signal")
 
     def update_frame(self, image_data: Optional[np.ndarray]) -> None:
         self._last_frame_data = image_data

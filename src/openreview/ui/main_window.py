@@ -68,6 +68,14 @@ from openreview.models.session import (
 )
 from openreview.core.exporter import MediaExporter
 from openreview.ui.export_dialog import ExportDialog
+from openreview.ui.workspaces import (
+    StudioWorkspaceManager,
+    ScopesDockWidget,
+    InspectorDockWidget,
+    VFXEXRDockWidget,
+    ColorGradingDockWidget,
+    AnnotationsDockWidget,
+)
 from openreview.color.ocio_manager import OCIOManager
 from openreview.color.standard_colorspaces import (
     STANDARD_COLORSPACES,
@@ -85,13 +93,16 @@ from openreview.widgets.markup_tools import MarkupToolPalette
 from openreview.widgets.viewport import ViewportCanvas
 from openreview.widgets.timeline import TimelineWidget
 from openreview.widgets.floating_hud import FloatingHUDCard
+from openreview.widgets.color_sliders_overlay import ColorSlidersOverlay
 from openreview.widgets.hud_histogram import HistogramHUD
 from openreview.widgets.hud_waveform import WaveformHUD
 from openreview.widgets.hud_vectorscope import VectorscopeHUD
+from openreview.widgets.hud_scopes_async import ScopeAsyncEngine
 from openreview.widgets.hud_wipe import WipeComparisonHUD
 from openreview.widgets.hud_color_inspector import ColorInspectorHUD
 from openreview.packages.builtin.comp_qc.qc_state import QcMode
 from openreview.ui.image_info_dialog import ImageInfoDialog, ImageInfoWidget
+from openreview.widgets.metadata_tree_widget import MetadataTreeWidget
 from openreview.ui.process_info_dialog import ProcessInfoDialog
 from openreview.ui.goto_frame_dialog import GoToFrameDialog
 from openreview.ui.frame_rate_dialog import FrameRateDialog
@@ -99,6 +110,8 @@ from openreview.ui.annotation_manager_dialog import AnnotationManagerDialog, Ann
 from openreview.audio.audio_engine import AudioEngine
 from openreview.ui.audio_dialog import AudioSettingsDialog, AudioSettingsWidget
 from openreview.widgets.hud_layers import HUDLayersWidget
+from openreview.widgets.hud_channel_matrix import HUDChannelMatrixWidget
+from openreview.core.exr_matrix import inspect_exr_matrix, build_layer_preset, EXRMatrixMapping
 from openreview.widgets.hud_stereo import HUDStereoWidget
 from openreview.ui.ocio_dialog import OCIOConfigDialog, OCIOConfigWidget
 from openreview.network.sync_engine import DailiesSyncEngine
@@ -292,6 +305,9 @@ class MainWindow(QMainWindow):
                 self.ocio_manager.view = prefs.ocio_view
             if getattr(prefs, "ocio_input_space", ""):
                 self.ocio_manager.input_space = prefs.ocio_input_space
+            self.ocio_manager.color_management_mode = "ocio"
+        else:
+            self.ocio_manager.color_management_mode = "standard"
         self._update_color_menus()
 
         # Restore Dailies Sync room and username
@@ -335,6 +351,7 @@ class MainWindow(QMainWindow):
         self.setDockOptions(
             QMainWindow.DockOption.AnimatedDocks |
             QMainWindow.DockOption.AllowTabbedDocks |
+            QMainWindow.DockOption.AllowNestedDocks |
             QMainWindow.DockOption.GroupedDragging
         )
         self.setCorner(Qt.Corner.BottomLeftCorner, Qt.DockWidgetArea.BottomDockWidgetArea)
@@ -445,6 +462,9 @@ class MainWindow(QMainWindow):
         self.console_window.hide()
         self.console_window.visibility_changed.connect(self._on_console_visibility_changed)
 
+        # 8. Studio Dock Widgets & Workspace Presets Layout Manager
+        self._setup_studio_workspaces()
+
     def _setup_floating_huds(self) -> None:
         """Create and place in-viewport Photoshop-style floating/dockable HUD cards."""
         # A. Live Histogram HUD (Top-Left)
@@ -473,6 +493,10 @@ class MainWindow(QMainWindow):
             parent=self.viewport,
             initial_pos=QPoint(16, 420),
         )
+
+        # Initialize non-blocking asynchronous scope compute engine
+        self.scope_engine = ScopeAsyncEngine(self)
+        self.scope_engine.register_widgets(self.hist_widget, self.waveform_widget, self.vectorscope_widget)
 
         # B. A/B Wipe Comparison Controller HUD (Top-Right)
         self.wipe_widget = WipeComparisonHUD(self.comparison_state)
@@ -560,6 +584,20 @@ class MainWindow(QMainWindow):
             initial_pos=QPoint(140, 60),
         )
 
+        # J1b. EXR Channel Matrix & Swizzler HUD
+        self.channel_matrix_widget = HUDChannelMatrixWidget()
+        self.channel_matrix_widget.mapping_changed.connect(self._on_exr_matrix_mapping_changed)
+        self.channel_matrix_widget.channel_mode_changed.connect(self._on_exr_channel_mode_changed)
+        self.channel_matrix_widget.channel_enable_changed.connect(self._on_exr_channel_enable_changed)
+        self.channel_matrix_widget.normals_remap_toggled.connect(self._on_normals_remap_toggled)
+        self.hud_channel_matrix = FloatingHUDCard(
+            title="EXR Channel Matrix & Swizzler",
+            content_widget=self.channel_matrix_widget,
+            parent=self.viewport,
+            initial_pos=QPoint(160, 80),
+        )
+        self.hud_channel_matrix.hide()
+
         # J2. Stereoscopic 3D HUD
         self.stereo_widget = HUDStereoWidget()
         self.stereo_widget.mode_changed.connect(self._on_stereo_changed)
@@ -578,6 +616,29 @@ class MainWindow(QMainWindow):
             parent=self.viewport,
             initial_pos=QPoint(180, 50),
         )
+
+        # L. Interactive Metadata & OpenEXR / ExifTool Attribute Tree HUD
+        self.metadata_tree_widget = MetadataTreeWidget()
+        self.hud_metadata = FloatingHUDCard(
+            title="Metadata & Attribute Tree",
+            content_widget=self.metadata_tree_widget,
+            parent=self.viewport,
+            initial_pos=QPoint(100, 60),
+        )
+        self.hud_metadata.resize(680, 520)
+        self.hud_metadata.hide()
+
+        # M. On-Screen Color Adjustment Sliders Overlay (Gain, Gamma, Hue, Saturation) (S)
+        self.color_sliders_overlay = ColorSlidersOverlay(parent=self.viewport)
+        self.color_sliders_overlay.colorGradeChanged.connect(self._on_color_sliders_changed)
+        self.color_sliders_overlay.gainChanged.connect(self._on_overlay_gain_changed)
+        self.color_sliders_overlay.gammaChanged.connect(self._on_overlay_gamma_changed)
+        self.color_sliders_overlay.saturationChanged.connect(self._on_overlay_saturation_changed)
+        self.color_sliders_overlay.committed.connect(self._on_color_sliders_committed)
+        self.color_sliders_overlay.cancelled.connect(self._on_color_sliders_cancelled)
+
+        # Connect Source Details to Attribute Tree
+        self.source_details_widget.tree_requested.connect(self._on_show_metadata_tree)
 
         # HUD cards hidden by default on startup
         self.hud_hist.hide()
@@ -689,28 +750,7 @@ class MainWindow(QMainWindow):
         self.cache_status_label.setStyleSheet("color: #888888; font-family: monospace;")
         status.addPermanentWidget(self.cache_status_label)
 
-        # GPU Playback Engine badge (Clickable to open GPU Preferences)
-        engine_str = getattr(self.pref_mgr.prefs, "playback_engine", "opengl_core")
-        self.gpu_engine_status_label = QLabel(self._format_gpu_engine_label(engine_str), self)
-        self.gpu_engine_status_label.setStyleSheet("""
-            QLabel {
-                color: #e5a823;
-                font-family: monospace;
-                font-weight: bold;
-                padding: 1px 6px;
-                border: 1px solid #444444;
-                border-radius: 3px;
-                background-color: #242424;
-            }
-            QLabel:hover {
-                background-color: #333333;
-                border-color: #e5a823;
-            }
-        """)
-        self.gpu_engine_status_label.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.gpu_engine_status_label.setToolTip("Active Playback Engine & GPU Accelerator (Click to configure)")
-        self.gpu_engine_status_label.mousePressEvent = lambda e: self._on_open_preferences_tab("GPU Acceleration")
-        status.addPermanentWidget(self.gpu_engine_status_label)
+
 
         # Shuttle Speed Multiplier
         self.shuttle_status_label = QLabel("1.0x", self)
@@ -779,6 +819,9 @@ class MainWindow(QMainWindow):
         export_act = file_menu.addAction("Export Media... (Ctrl+Shift+E)")
         export_act.triggered.connect(self._on_export_media)
 
+        batch_export_act = file_menu.addAction("Batch Export Queue... (Ctrl+Shift+B)")
+        batch_export_act.triggered.connect(self._on_batch_export_media)
+
         file_menu.addSeparator()
         exit_act = file_menu.addAction("Exit (Ctrl+Q)")
         exit_act.triggered.connect(self.close)
@@ -836,6 +879,8 @@ class MainWindow(QMainWindow):
         self.layered_input_menu = mb.addMenu("&Layered input")
         self.act_exr_pass_inspector = self.layered_input_menu.addAction("EXR Multilayer Pass Inspector")
         self.act_exr_pass_inspector.triggered.connect(lambda: self.hud_layers.setVisible(not self.hud_layers.isVisible()))
+        self.act_exr_channel_matrix = self.layered_input_menu.addAction("EXR Channel Matrix & Swizzler")
+        self.act_exr_channel_matrix.triggered.connect(lambda: self.hud_channel_matrix.setVisible(not self.hud_channel_matrix.isVisible()))
         self.act_stereo_controls = self.layered_input_menu.addAction("Stereoscopic 3D Controls")
         self.act_stereo_controls.triggered.connect(lambda: self.hud_stereo.setVisible(not self.hud_stereo.isVisible()))
         self.layered_input_menu.menuAction().setVisible(False)
@@ -944,6 +989,9 @@ class MainWindow(QMainWindow):
         self.source_details_act = view_menu.addAction("Source Media Details (I)")
         self.source_details_act.triggered.connect(self._on_toggle_source_details)
 
+        self.metadata_tree_act = view_menu.addAction("Metadata & Attribute Tree... (Alt+I)")
+        self.metadata_tree_act.triggered.connect(self._on_toggle_metadata_tree)
+
         # 4. Review Menu
         review_menu = mb.addMenu("&Review")
 
@@ -959,6 +1007,10 @@ class MainWindow(QMainWindow):
             ("Add", ComparisonMode.ADD),
             ("Difference", ComparisonMode.DIFFERENCE),
             ("Difference (Inverted)", ComparisonMode.DIFFERENCE_INVERTED),
+            ("Spotlight / Circle Loupe", ComparisonMode.SPOTLIGHT),
+            ("Multiply", ComparisonMode.MULTIPLY),
+            ("Screen", ComparisonMode.SCREEN),
+            ("Overlay", ComparisonMode.OVERLAY),
         ]:
             act = vt_sub.addAction(label)
             act.setCheckable(True)
@@ -967,6 +1019,19 @@ class MainWindow(QMainWindow):
             act.triggered.connect(lambda checked=False, m=mode: self._on_set_view_type(m))
             self.view_type_group.addAction(act)
             self.view_type_actions[mode] = act
+
+        review_menu.addSeparator()
+
+        act_diff_hm = review_menu.addAction("Toggle Turbo Difference Heatmap")
+        act_diff_hm.setCheckable(True)
+        act_diff_hm.triggered.connect(self._on_toggle_diff_heatmap)
+        self.act_diff_hm = act_diff_hm
+
+        act_wipe_line = review_menu.addAction("Toggle Wipe Divider Line")
+        act_wipe_line.setCheckable(True)
+        act_wipe_line.setChecked(True)
+        act_wipe_line.triggered.connect(self._on_toggle_wipe_line)
+        self.act_wipe_line = act_wipe_line
 
         review_menu.addSeparator()
 
@@ -1133,10 +1198,12 @@ class MainWindow(QMainWindow):
         self.invert_colors_act.setChecked(False)
         self.invert_colors_act.triggered.connect(self._on_toggle_invert_colors)
 
+        color_sliders_act = color_menu.addAction("On-Screen Color Sliders (S)")
+        color_sliders_act.triggered.connect(self._on_toggle_color_sliders)
         adj_act = color_menu.addAction("Interactive Color Adjustments... (/)")
         adj_act.triggered.connect(self._on_open_color_adjustments)
 
-        self.color_insp_act = color_menu.addAction("Color Inspector (F5)")
+        self.color_insp_act = color_menu.addAction("Color Inspector (F4)")
         self.color_insp_act.triggered.connect(self._on_toggle_color_inspector)
 
         ocio_cfg_act = color_menu.addAction("OpenColorIO Configuration...")
@@ -1269,6 +1336,18 @@ class MainWindow(QMainWindow):
                 self.budget_actions[target_mb].setChecked(True)
 
         budget_menu.aboutToShow.connect(self._refresh_budget_menu_labels)
+
+        # 9b. Workspaces Menu
+        ws_menu = mb.addMenu("&Workspaces")
+        ws_menu.addAction("Standard Review (F5)").triggered.connect(lambda: self._apply_workspace("review"))
+        ws_menu.addAction("Color & QC Studio (F6)").triggered.connect(lambda: self._apply_workspace("color_qc"))
+        ws_menu.addAction("VFX Breakdown & EXR (F7)").triggered.connect(lambda: self._apply_workspace("vfx_breakdown"))
+        ws_menu.addAction("Cinema / Dailies Theater (F8)").triggered.connect(lambda: self._apply_workspace("cinema"))
+        ws_menu.addAction("Supervisor Review & Notes (F9)").triggered.connect(lambda: self._apply_workspace("annotations"))
+        ws_menu.addSeparator()
+        ws_menu.addAction("Save Current Workspace As...").triggered.connect(self._on_save_workspace_as)
+        ws_menu.addAction("Reset Workspace to Default").triggered.connect(self._on_reset_workspace)
+        ws_menu.addAction("Delete Custom Workspace...").triggered.connect(self._on_delete_custom_workspace)
 
         # 10. Window Menu (Categorized sections ordered in ascending alphabetical order)
         win_menu = mb.addMenu("&Window")
@@ -1441,6 +1520,7 @@ class MainWindow(QMainWindow):
         sm.bind_callback("color.gamma_reset", self.top_bar.reset_gamma)
         sm.bind_callback("color.reset_all", self._on_reset_all_colors)
         sm.bind_callback("color.adjustments", lambda: self._on_open_color_adjustments())
+        sm.bind_callback("color.sliders_overlay", self._on_toggle_color_sliders)
 
         # Timeline
         sm.bind_callback("timeline.zoom_in", self.timeline.zoom_in)
@@ -1478,6 +1558,7 @@ class MainWindow(QMainWindow):
         sm.bind_callback("hud.wipe_reset", self._on_reset_wipe)
         sm.bind_callback("hud.source_details", self._on_toggle_source_details)
         sm.bind_callback("hud.info_strip", self._on_toggle_info_strip)
+        sm.bind_callback("hud.metadata_tree", self._on_toggle_metadata_tree)
         sm.bind_callback("hud.dailies_sync", self._on_open_dailies_sync)
         sm.bind_callback("hud.layers", lambda: self.hud_layers.setVisible(not self.hud_layers.isVisible()))
         sm.bind_callback("hud.stereo", lambda: self.hud_stereo.setVisible(not self.hud_stereo.isVisible()))
@@ -1518,6 +1599,14 @@ class MainWindow(QMainWindow):
         sm.bind_callback("session.save", self._on_save_session)
         sm.bind_callback("session.save_as", self._on_save_session_as)
         sm.bind_callback("session.export", self._on_export_media)
+        sm.bind_callback("session.batch_export", self._on_batch_export_media)
+
+        # Studio Workspaces
+        sm.bind_callback("workspace.review", lambda: self._apply_workspace("review"))
+        sm.bind_callback("workspace.color_qc", lambda: self._apply_workspace("color_qc"))
+        sm.bind_callback("workspace.vfx_breakdown", lambda: self._apply_workspace("vfx_breakdown"))
+        sm.bind_callback("workspace.cinema", lambda: self._apply_workspace("cinema"))
+        sm.bind_callback("workspace.annotations", lambda: self._apply_workspace("annotations"))
         sm.bind_callback("app.preferences", self._on_open_preferences)
         sm.bind_callback("app.clear_cache", self._on_clear_cache)
         sm.bind_callback("app.clear_all_cache", self._on_clear_all_cache)
@@ -1548,6 +1637,16 @@ class MainWindow(QMainWindow):
         # Direct Shift+C hotkey to toggle cache
         if event.modifiers() == Qt.KeyboardModifier.ShiftModifier and event.key() == Qt.Key.Key_C:
             self._on_toggle_cache()
+            event.accept()
+            return
+
+        # Direct [ and ] hotkeys to cycle EXR layers
+        if event.modifiers() == Qt.KeyboardModifier.NoModifier and event.key() == Qt.Key.Key_BracketLeft:
+            self._on_cycle_exr_layer(forward=False)
+            event.accept()
+            return
+        if event.modifiers() == Qt.KeyboardModifier.NoModifier and event.key() == Qt.Key.Key_BracketRight:
+            self._on_cycle_exr_layer(forward=True)
             event.accept()
             return
 
@@ -1740,8 +1839,11 @@ class MainWindow(QMainWindow):
         self.sync_engine.remote_annotations_cleared.connect(self._on_remote_clear_annotations)
         self.sync_engine.remote_note_received.connect(self._on_remote_note)
 
-        # OpenColorIO Configuration Updates
+        # OpenColorIO Configuration Updates & GPU 3D LUT Fast Path
         self.ocio_manager.config_changed.connect(self._on_ocio_config_changed)
+        self.ocio_manager.ocio_lut_baked.connect(self.viewport.set_ocio_lut)
+        if getattr(self.ocio_manager, "color_management_mode", "standard") == "ocio":
+            self.ocio_manager.bake_current_display_lut()
 
         # Dynamic Layered Input Menu Visibility Sync
         if hasattr(self, "session_graph"):
@@ -1849,6 +1951,19 @@ class MainWindow(QMainWindow):
 
         viewable = self.session_graph.get_active_viewable() if hasattr(self, "session_graph") else None
         sync_read_allowed = not getattr(self, "_async_drop_active", False)
+        is_fast_transport = (
+            self.clock.is_playing
+            or self._is_scrubbing
+            or abs(getattr(self.clock, "shuttle_speed", 1.0)) > 1.0
+        )
+        prefer_proxy = (
+            is_fast_transport
+            and (
+                PreferencesManager.instance().is_low_spec_gpu()
+                or getattr(PreferencesManager.instance().prefs, "fast_playback_laptop_mode", False)
+                or self._is_scrubbing
+            )
+        )
 
         if isinstance(viewable, SequenceView):
             source, src_frame = viewable.resolve_frame(frame, self.session_graph.sources)
@@ -1856,18 +1971,14 @@ class MainWindow(QMainWindow):
             is_proxy = False
             if source:
                 self.cache.set_active_source(source.id)
-                data = self.cache.get_source_frame(source.id, src_frame)
+                data = self.cache.get_source_frame(source.id, src_frame, prefer_proxy=prefer_proxy)
                 is_proxy = self.cache.is_source_frame_proxy(source.id, src_frame) if data is not None else False
                 if data is None:
                     reader = self._get_reader_for_source(source)
                     if reader:
-                        if self._is_scrubbing or self.clock.is_playing:
-                            data = read_adaptive_frame(reader, src_frame, normalize_fn=self._normalize_frame_data)
-                            if data is not None:
-                                is_proxy = True
-                                if self.cache.mode != CacheMode.OFF:
-                                    self.cache.put_source_frame(source.id, src_frame, data, is_proxy=True)
-                            elif hasattr(self, "reader_engine") and self.reader_engine:
+                        if is_fast_transport:
+                            # Zero-block asynchronous decode: never block Qt GUI thread during scrub or playback
+                            if hasattr(self, "reader_engine") and self.reader_engine:
                                 self.reader_engine.request_immediate_frame(
                                     source.id, src_frame, frame, reader=reader, downsample=True, callback=self._on_immediate_frame_ready
                                 )
@@ -1888,6 +1999,8 @@ class MainWindow(QMainWindow):
                 if orig_w == 0 or orig_h == 0:
                     orig_w = getattr(reader, "width", 0) if "reader" in locals() and reader else 0
                     orig_h = getattr(reader, "height", 0) if "reader" in locals() and reader else 0
+                if hasattr(data, "shape") and orig_w > 0 and data.shape[1] < orig_w:
+                    is_proxy = True
                 logical_size = (orig_w, orig_h) if is_proxy and orig_w > 0 else None
                 self.viewport.set_primary_frame(frame, data, logical_size=logical_size, is_proxy=is_proxy)
                 if hasattr(data, "shape") and len(data.shape) >= 2:
@@ -1916,7 +2029,7 @@ class MainWindow(QMainWindow):
                     if data_b is None:
                         reader_b = self._get_reader_for_source(layer_b)
                         if reader_b:
-                            if self._is_scrubbing or self.clock.is_playing:
+                            if is_fast_transport:
                                 data_b = read_adaptive_frame(reader_b, frame, normalize_fn=self._normalize_frame_data)
                                 if data_b is not None:
                                     is_proxy_b = True
@@ -1972,7 +2085,7 @@ class MainWindow(QMainWindow):
                     if data_a is None:
                         reader_a = self._get_reader_for_source(layer_a)
                         if reader_a:
-                            if self._is_scrubbing or self.clock.is_playing:
+                            if is_fast_transport:
                                 data_a = read_adaptive_frame(reader_a, frame, normalize_fn=self._normalize_frame_data)
                                 if data_a is not None:
                                     is_proxy_a = True
@@ -1996,7 +2109,7 @@ class MainWindow(QMainWindow):
                     if data_b is None:
                         reader_b = self._get_reader_for_source(layer_b)
                         if reader_b:
-                            if self._is_scrubbing or self.clock.is_playing:
+                            if is_fast_transport:
                                 data_b = read_adaptive_frame(reader_b, frame, normalize_fn=self._normalize_frame_data)
                                 if data_b is not None and self.cache.mode != CacheMode.OFF:
                                     self.cache.put_source_frame(layer_b.id, frame, data_b, is_proxy=True)
@@ -2096,16 +2209,12 @@ class MainWindow(QMainWindow):
             data = None
             is_proxy = False
             if cur_src_id:
-                data = self.cache.get_source_frame(cur_src_id, frame)
+                data = self.cache.get_source_frame(cur_src_id, frame, prefer_proxy=prefer_proxy)
                 is_proxy = self.cache.is_source_frame_proxy(cur_src_id, frame) if data is not None else False
                 if data is None and self.reader is not None:
-                    if self._is_scrubbing or self.clock.is_playing:
-                        data = read_adaptive_frame(self.reader, frame, normalize_fn=self._normalize_frame_data)
-                        if data is not None:
-                            is_proxy = True
-                            if self.cache.mode != CacheMode.OFF:
-                                self.cache.put_source_frame(cur_src_id, frame, data, is_proxy=True)
-                        elif hasattr(self, "reader_engine") and self.reader_engine:
+                    if is_fast_transport:
+                        # Zero-block asynchronous decode on dedicated interactive pool
+                        if hasattr(self, "reader_engine") and self.reader_engine:
                             self.reader_engine.request_immediate_frame(
                                 cur_src_id, frame, frame, reader=self.reader, downsample=True, callback=self._on_immediate_frame_ready
                             )
@@ -2121,7 +2230,7 @@ class MainWindow(QMainWindow):
                 data = self.cache.get_frame(frame)
                 is_proxy = self.cache.is_frame_proxy(frame) if data is not None else False
                 if data is None and self.reader is not None:
-                    if self._is_scrubbing or self.clock.is_playing:
+                    if is_fast_transport:
                         data = read_adaptive_frame(self.reader, frame, normalize_fn=self._normalize_frame_data)
                         if data is not None:
                             is_proxy = True
@@ -2147,6 +2256,8 @@ class MainWindow(QMainWindow):
                 if orig_w == 0 or orig_h == 0:
                     orig_w = getattr(self.reader, "width", 0) if hasattr(self, "reader") and self.reader else 0
                     orig_h = getattr(self.reader, "height", 0) if hasattr(self, "reader") and self.reader else 0
+                if hasattr(data, "shape") and orig_w > 0 and data.shape[1] < orig_w:
+                    is_proxy = True
                 logical_size = (orig_w, orig_h) if is_proxy and orig_w > 0 else None
                 self.viewport.set_primary_frame(frame, data, logical_size=logical_size, is_proxy=is_proxy)
                 if hasattr(data, "shape") and len(data.shape) >= 2:
@@ -2233,6 +2344,16 @@ class MainWindow(QMainWindow):
             if not is_playing or (now - last_update >= 0.15):
                 self._last_source_details_update = now
                 self.source_details_widget.update_info(self._get_current_source_info())
+
+        # Update metadata attribute tree HUD if visible (throttled during continuous playback)
+        if hasattr(self, "hud_metadata") and hasattr(self, "metadata_tree_widget") and self.hud_metadata.isVisible():
+            import time
+            now = time.time()
+            is_playing = getattr(self.clock, "is_playing", False)
+            last_meta_up = getattr(self, "_last_metadata_tree_update", 0.0)
+            if not is_playing or (now - last_meta_up >= 0.2):
+                self._last_metadata_tree_update = now
+                self._update_metadata_tree_content()
 
     def _resolve_timeline_frame_sources(self, timeline_frame: int) -> list[tuple[Optional[str], int, Optional[Any]]]:
         """Decompose an upcoming timeline frame into its underlying source items, frames, and readers."""
@@ -2486,6 +2607,12 @@ class MainWindow(QMainWindow):
             cached = self.cache.get_cached_frames()
             disk_cached = self.cache.get_disk_cached_frames()
 
+        proxy_cached = set()
+        if isinstance(viewable, (SourceItem, SequenceView, StackView)):
+            sid = viewable.id if hasattr(viewable, "id") else (getattr(self.cache, "_active_source_id", "") or "")
+            if sid:
+                proxy_cached = self.cache.get_source_proxy_cached_frames(sid)
+
         used_mb, max_mb, pct = self.cache.get_memory_stats()
         d_used_mb, d_max_mb, d_pct = self.cache.get_disk_memory_stats()
         self.timeline.update_cache_display(
@@ -2494,6 +2621,7 @@ class MainWindow(QMainWindow):
             cache_mode=self.cache.mode.value,
             disk_cached_frames=disk_cached,
             disk_pct_used=d_pct,
+            proxy_cached_frames=proxy_cached,
         )
         disk_info = f" | Disk: {d_used_mb:.0f}MB" if d_used_mb > 0 else ""
         if self.cache.mode == CacheMode.OFF:
@@ -2567,10 +2695,9 @@ class MainWindow(QMainWindow):
     def _on_toggle_cache(self) -> None:
         """Toggle caching on/off (Shift+C), defaulting between OFF and In/Out Region according to preferences."""
         if not getattr(self, "_cache_started", False) or self.cache.mode == CacheMode.OFF:
-            toggle_pref = getattr(self.pref_mgr.prefs, "cache_toggle_mode", "region")
-            if toggle_pref == "last_active":
-                target_mode = getattr(self, "_last_active_cache_mode", None) or CacheMode.REGION
-            else:
+            target_mode = getattr(self, "_last_active_cache_mode", None)
+            if target_mode is None or target_mode == CacheMode.OFF:
+                toggle_pref = getattr(self.pref_mgr.prefs, "cache_toggle_mode", "region")
                 try:
                     target_mode = CacheMode(toggle_pref)
                 except Exception:
@@ -2771,6 +2898,9 @@ class MainWindow(QMainWindow):
 
     def _on_gamma_changed(self, g: float) -> None:
         self.viewport.gamma = g
+        self.viewport.color_grading.gamma = g
+        if hasattr(self, "color_sliders_overlay") and not getattr(self, "_syncing_color_overlay", False):
+            self.color_sliders_overlay.set_gamma_quiet(g)
         self.viewport.update()
         if self.sync_engine.is_connected and (self.sync_engine.is_presenter or self.sync_engine.is_host):
             if not getattr(self, "_suppress_sync_broadcast", False):
@@ -2784,10 +2914,16 @@ class MainWindow(QMainWindow):
 
     def _on_gain_changed(self, g: float) -> None:
         self.viewport.gain = g
+        self.viewport.color_grading.gain = (g, g, g)
+        if hasattr(self, "color_sliders_overlay") and not getattr(self, "_syncing_color_overlay", False):
+            self.color_sliders_overlay.set_gain_quiet(g)
         self.viewport.update()
 
     def _on_saturation_changed(self, s: float) -> None:
         self.viewport.saturation = s
+        self.viewport.color_grading.saturation = s
+        if hasattr(self, "color_sliders_overlay") and not getattr(self, "_syncing_color_overlay", False):
+            self.color_sliders_overlay.set_saturation_quiet(s)
         self.viewport.update()
 
     def _on_stack_cycle_forward(self) -> None:
@@ -2889,16 +3025,92 @@ class MainWindow(QMainWindow):
             self._is_cycling_stack = False
 
     def _on_channel_changed(self, mode: int) -> None:
-        self.viewport.channel_mode = mode
+        self.viewport.solo_channel(mode, greyscale=True)
+        if hasattr(self, "channel_matrix_widget"):
+            btn = self.channel_matrix_widget._solo_btns.get(mode)
+            if btn:
+                btn.setChecked(True)
+        if hasattr(self, "vfx_exr_dock") and hasattr(self.vfx_exr_dock, "channel_matrix_widget"):
+            btn = self.vfx_exr_dock.channel_matrix_widget._solo_btns.get(mode)
+            if btn:
+                btn.setChecked(True)
         self.viewport.update()
+
+    def _on_exr_matrix_mapping_changed(self, mapping: Any) -> None:
+        """Handle custom channel-to-RGBA routing from Channel Matrix HUD."""
+        # Auto-exit contact sheet mode on custom channel swizzle
+        if getattr(self, "_is_exr_contact_sheet_active", False):
+            self._is_exr_contact_sheet_active = False
+            if hasattr(self, "layers_widget"):
+                self.layers_widget.set_contact_sheet_active(False)
+            if hasattr(self, "vfx_exr_dock") and hasattr(self.vfx_exr_dock, "layers_widget"):
+                self.vfx_exr_dock.layers_widget.set_contact_sheet_active(False)
+        if hasattr(self, "reader") and self.reader and hasattr(self.reader, "set_matrix_mapping"):
+            self.reader.set_matrix_mapping(mapping)
+        if hasattr(self, "_source_readers"):
+            for r in self._source_readers.values():
+                if hasattr(r, "set_matrix_mapping"):
+                    r.set_matrix_mapping(mapping)
+        self.cache.clear()
+        self._on_frame_changed(self.clock.current_frame)
+        self.statusBar().showMessage("EXR Channel Matrix Routing Applied", 2500)
+
+    def _on_exr_channel_mode_changed(self, mode: int, is_greyscale: bool) -> None:
+        """Handle channel soloing (RGB/R/G/B/A/Y) with greyscale or color isolation."""
+        self.viewport.solo_channel(mode, greyscale=is_greyscale)
+        if hasattr(self, "channel_matrix_widget"):
+            btn = self.channel_matrix_widget._solo_btns.get(mode)
+            if btn:
+                btn.setChecked(True)
+        names = {0: "RGB", 1: "Red", 2: "Green", 3: "Blue", 4: "Alpha", 5: "Luma Y"}
+        mode_str = "Greyscale" if is_greyscale else "Color"
+        self.statusBar().showMessage(f"Solo Channel: {names.get(mode, 'RGB')} ({mode_str})", 2000)
+
+    def _on_exr_channel_enable_changed(self, enables: tuple) -> None:
+        """Handle individual channel enable / mute."""
+        self.viewport.set_channel_enable(*enables)
+
+    def _on_normals_remap_toggled(self, enabled: bool) -> None:
+        """Toggle hardware normal vector remap [-1, 1] -> [0, 1]."""
+        self.viewport.set_channel_solo_mode(2 if enabled else 1)
+        self.statusBar().showMessage(f"Normals [-1, 1] -> [0, 1] Remap: {'Enabled' if enabled else 'Disabled'}", 2000)
+
+    def _on_cycle_exr_layer(self, forward: bool = True) -> None:
+        """Cycle through available multi-channel EXR layers."""
+        if not hasattr(self, "layers_widget"):
+            return
+        layers = getattr(self.layers_widget, "_layers", [])
+        if not layers or len(layers) <= 1:
+            return
+        cur = getattr(self, "_current_exr_layer", "beauty")
+        try:
+            idx = layers.index(cur)
+        except ValueError:
+            idx = 0
+        new_idx = (idx + 1) % len(layers) if forward else (idx - 1) % len(layers)
+        self._on_layer_changed(layers[new_idx])
 
     def _on_layer_changed(self, layer_name: str) -> None:
         """Handle switching of multi-channel EXR layers."""
         self._current_exr_layer = layer_name
+        # Auto-exit Contact Sheet mode on pass selection
+        if getattr(self, "_is_exr_contact_sheet_active", False):
+            self._is_exr_contact_sheet_active = False
+            if hasattr(self, "layers_widget"):
+                self.layers_widget.set_contact_sheet_active(False)
+            if hasattr(self, "vfx_exr_dock") and hasattr(self.vfx_exr_dock, "layers_widget"):
+                self.vfx_exr_dock.layers_widget.set_contact_sheet_active(False)
+
         if hasattr(self, "top_bar") and hasattr(self.top_bar, "set_current_layer"):
             self.top_bar.set_current_layer(layer_name)
         if hasattr(self, "layers_widget"):
             self.layers_widget.set_current_layer(layer_name)
+        if hasattr(self, "vfx_exr_dock") and hasattr(self.vfx_exr_dock, "layers_widget"):
+            self.vfx_exr_dock.layers_widget.set_current_layer(layer_name)
+        if hasattr(self, "channel_matrix_widget"):
+            self.channel_matrix_widget.apply_preset(layer_name)
+        if hasattr(self, "vfx_exr_dock") and hasattr(self.vfx_exr_dock, "channel_matrix_widget"):
+            self.vfx_exr_dock.channel_matrix_widget.apply_preset(layer_name)
         if hasattr(self, "reader") and self.reader and hasattr(self.reader, "set_layer"):
             self.reader.set_layer(layer_name)
         if hasattr(self, "_source_readers"):
@@ -2951,10 +3163,27 @@ class MainWindow(QMainWindow):
                 lyrs = ["beauty"]
 
         layer_frames = {}
-        for lyr in lyrs:
-            arr = read_image_file(f_path, layer=lyr)
-            if arr is not None:
-                layer_frames[lyr] = arr
+        from openreview.core.image_io import _is_rust_io_enabled
+        if _is_rust_io_enabled():
+            try:
+                import openreview_engine
+                rust_eng = getattr(self, "_rust_engine", None)
+                if rust_eng is None:
+                    rust_eng = openreview_engine.OpenReviewEngine()
+                    self._rust_engine = rust_eng
+                all_raw = rust_eng.read_all_exr_layers(f_path, False)
+                for lyr in lyrs:
+                    if lyr in all_raw:
+                        nf = all_raw[lyr]
+                        layer_frames[lyr] = np.frombuffer(nf.as_memoryview(), dtype=np.float32).reshape((nf.height, nf.width, 4))
+            except Exception:
+                pass
+
+        if not layer_frames:
+            for lyr in lyrs:
+                arr = read_image_file(f_path, layer=lyr)
+                if arr is not None:
+                    layer_frames[lyr] = arr
 
         base_w = getattr(self.reader, "width", 1920) or 1920
         base_h = getattr(self.reader, "height", 1080) or 1080
@@ -2972,6 +3201,8 @@ class MainWindow(QMainWindow):
         self._is_exr_contact_sheet_active = enabled
         if hasattr(self, "layers_widget"):
             self.layers_widget.set_contact_sheet_active(enabled)
+        if hasattr(self, "vfx_exr_dock") and hasattr(self.vfx_exr_dock, "layers_widget"):
+            self.vfx_exr_dock.layers_widget.set_contact_sheet_active(enabled)
         # Clear cache and trigger immediate frame rendering
         self.cache.clear()
         self._on_frame_changed(self.clock.current_frame)
@@ -2993,6 +3224,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, "layers_widget"):
             self.layers_widget.set_contact_sheet_active(False)
             self.layers_widget.set_current_layer(target_pass)
+        if hasattr(self, "vfx_exr_dock") and hasattr(self.vfx_exr_dock, "layers_widget"):
+            self.vfx_exr_dock.layers_widget.set_contact_sheet_active(False)
+            self.vfx_exr_dock.layers_widget.set_current_layer(target_pass)
         if hasattr(self, "top_bar") and hasattr(self.top_bar, "set_current_layer"):
             self.top_bar.set_current_layer(target_pass)
 
@@ -3005,6 +3239,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, "layers_widget"):
             self.layers_widget.set_contact_sheet_active(False)
             self.layers_widget.set_current_layer(layer_name)
+        if hasattr(self, "vfx_exr_dock") and hasattr(self.vfx_exr_dock, "layers_widget"):
+            self.vfx_exr_dock.layers_widget.set_contact_sheet_active(False)
+            self.vfx_exr_dock.layers_widget.set_current_layer(layer_name)
         if hasattr(self, "top_bar") and hasattr(self.top_bar, "set_current_layer"):
             self.top_bar.set_current_layer(layer_name)
 
@@ -3040,8 +3277,11 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def _on_show_exr_inspector(self) -> None:
-        """Reveal and focus EXR Multilayer Pass Inspector floating HUD."""
-        if hasattr(self, "hud_layers"):
+        """Reveal and focus EXR Multilayer Pass Inspector dock or HUD."""
+        if hasattr(self, "vfx_exr_dock"):
+            self.vfx_exr_dock.show()
+            self.vfx_exr_dock.raise_()
+        elif hasattr(self, "hud_layers"):
             self.hud_layers.show()
             self.hud_layers.raise_()
 
@@ -3087,13 +3327,22 @@ class MainWindow(QMainWindow):
             self.vectorscope_widget.update_frame(self.viewport._image_a)
 
     def _update_hud_scopes(self, data: Optional[np.ndarray]) -> None:
-        """Update live scopes HUDs (Histogram, Waveform, Vectorscope) if visible."""
-        if hasattr(self, "hud_hist") and self.hud_hist.isVisible():
-            self.hist_widget.update_frame(data)
-        if hasattr(self, "hud_waveform") and self.hud_waveform.isVisible():
-            self.waveform_widget.update_frame(data)
-        if hasattr(self, "hud_vectorscope") and self.hud_vectorscope.isVisible():
-            self.vectorscope_widget.update_frame(data)
+        """Update live scopes HUDs (Histogram, Waveform, Vectorscope) asynchronously if visible."""
+        show_h = (hasattr(self, "hud_hist") and self.hud_hist.isVisible()) or (hasattr(self, "scopes_dock") and self.scopes_dock.is_histogram_visible())
+        show_w = (hasattr(self, "hud_waveform") and self.hud_waveform.isVisible()) or (hasattr(self, "scopes_dock") and self.scopes_dock.is_waveform_visible())
+        show_v = (hasattr(self, "hud_vectorscope") and self.hud_vectorscope.isVisible()) or (hasattr(self, "scopes_dock") and self.scopes_dock.is_vectorscope_visible())
+        if not (show_h or show_w or show_v):
+            return
+
+        if hasattr(self, "scope_engine"):
+            self.scope_engine.dispatch(data, show_h, show_w, show_v)
+        else:
+            if show_h:
+                self.hist_widget.update_frame(data)
+            if show_w:
+                self.waveform_widget.update_frame(data)
+            if show_v:
+                self.vectorscope_widget.update_frame(data)
 
     def _on_color_adj_changed(self, settings: ColorGradeSettings) -> None:
         """Handle adjustments from full Color Adjustments dialog/HUD."""
@@ -4354,6 +4603,57 @@ class MainWindow(QMainWindow):
             2000,
         )
 
+    def _sync_active_exr_channels(self, path: Optional[str]) -> None:
+        """Discover and synchronize EXR layers and channels across TopBar and VFX EXR Dock."""
+        if not path or not str(path).lower().endswith(".exr") or not os.path.exists(path):
+            self.top_bar.set_available_layers(["beauty"], "beauty")
+            if hasattr(self, "layers_widget"):
+                self.layers_widget.refresh_list(["beauty"])
+            if hasattr(self, "vfx_exr_dock") and hasattr(self.vfx_exr_dock, "layers_widget"):
+                self.vfx_exr_dock.layers_widget.refresh_list(["beauty"])
+            if hasattr(self, "vfx_exr_dock") and hasattr(self.vfx_exr_dock, "channel_matrix_widget"):
+                self.vfx_exr_dock.channel_matrix_widget.populate_matrix({}, [])
+            return
+
+        try:
+            from openreview.core.image_io import get_exr_channels
+            from openreview.core.exr_matrix import inspect_exr_matrix
+
+            exr_info = get_exr_channels(str(path))
+            lyrs = list(exr_info.get("layers", {}).keys())
+            for cl in exr_info.get("cryptomatte_layers", []):
+                if cl not in lyrs:
+                    lyrs.append(cl)
+            if not lyrs:
+                lyrs = ["beauty"]
+
+            cur_lyr = getattr(self, "_current_exr_layer", "beauty")
+            if cur_lyr not in lyrs:
+                cur_lyr = "beauty" if "beauty" in lyrs else lyrs[0]
+
+            self.top_bar.set_available_layers(lyrs, cur_lyr)
+            if hasattr(self, "layers_widget"):
+                self.layers_widget.refresh_list(lyrs)
+            if hasattr(self, "vfx_exr_dock") and hasattr(self.vfx_exr_dock, "layers_widget"):
+                self.vfx_exr_dock.layers_widget.refresh_list(lyrs)
+                if len(lyrs) > 1 and hasattr(self.vfx_exr_dock, "sec_layers"):
+                    self.vfx_exr_dock.sec_layers.set_expanded(True)
+
+            try:
+                layers_dict, all_chans = inspect_exr_matrix(str(path))
+                if hasattr(self, "channel_matrix_widget"):
+                    self.channel_matrix_widget.populate_matrix(layers_dict, all_chans)
+                if hasattr(self, "vfx_exr_dock") and hasattr(self.vfx_exr_dock, "channel_matrix_widget"):
+                    self.vfx_exr_dock.channel_matrix_widget.populate_matrix(layers_dict, all_chans)
+            except Exception:
+                pass
+        except Exception:
+            self.top_bar.set_available_layers(["beauty"], "beauty")
+            if hasattr(self, "layers_widget"):
+                self.layers_widget.refresh_list(["beauty"])
+            if hasattr(self, "vfx_exr_dock") and hasattr(self.vfx_exr_dock, "layers_widget"):
+                self.vfx_exr_dock.layers_widget.refresh_list(["beauty"])
+
     def _load_path(self, path: str) -> None:
         if not path or not os.path.exists(path):
             return
@@ -4462,27 +4762,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Loaded Media: {os.path.basename(path)}", 5000)
 
         # 4. Multi-Channel EXR Layer Discovery
-        if str(path).lower().endswith(".exr"):
-            try:
-                from openreview.core.image_io import get_exr_channels
-                exr_info = get_exr_channels(str(path))
-                lyrs = list(exr_info.get("layers", {}).keys())
-                for cl in exr_info.get("cryptomatte_layers", []):
-                    if cl not in lyrs:
-                        lyrs.append(cl)
-                if not lyrs:
-                    lyrs = ["beauty"]
-                self.top_bar.set_available_layers(lyrs, "beauty")
-                if hasattr(self, "layers_widget"):
-                    self.layers_widget.refresh_list(lyrs)
-            except Exception:
-                self.top_bar.set_available_layers(["beauty"], "beauty")
-                if hasattr(self, "layers_widget"):
-                    self.layers_widget.refresh_list(["beauty"])
-        else:
-            self.top_bar.set_available_layers(["beauty"], "beauty")
-            if hasattr(self, "layers_widget"):
-                self.layers_widget.refresh_list(["beauty"])
+        self._sync_active_exr_channels(path)
 
         # 5. Stereo 3D Auto-Detection
         try:
@@ -4500,6 +4780,16 @@ class MainWindow(QMainWindow):
             self._current_stereo_pair = None
 
         self._update_layered_input_menu_visibility()
+
+        # Update source details across both floating HUD and docked Inspector panel
+        try:
+            cur_info = self._get_current_source_info()
+            if hasattr(self, "source_details_widget"):
+                self.source_details_widget.update_info(cur_info)
+            if hasattr(self, "inspector_dock") and hasattr(self.inspector_dock, "details_widget"):
+                self.inspector_dock.details_widget.update_info(cur_info)
+        except Exception:
+            pass
 
         if hasattr(self, "pkg_mgr") and self.pkg_mgr:
             try:
@@ -4748,6 +5038,11 @@ class MainWindow(QMainWindow):
                 self.timeline.magnified_popup.setVisible(False)
             else:
                 self._pre_presentation_magnifier = False
+            if hasattr(self, "color_sliders_overlay") and self.color_sliders_overlay.isVisible():
+                self._pre_presentation_color_sliders = True
+                self.color_sliders_overlay.setVisible(False)
+            else:
+                self._pre_presentation_color_sliders = False
             self.timeline.setVisible(False)
             if hasattr(self, "timeline_dock"):
                 self.timeline_dock.setVisible(False)
@@ -4777,6 +5072,11 @@ class MainWindow(QMainWindow):
                     self.timeline.magnified_popup.setVisible(True)
                     self.timeline.magnified_popup.auto_center_in_parent()
                     self.timeline.magnified_popup.raise_()
+            if getattr(self, "_pre_presentation_color_sliders", False):
+                if hasattr(self, "color_sliders_overlay"):
+                    self.color_sliders_overlay.setVisible(True)
+                    self.color_sliders_overlay.auto_center_in_parent()
+                    self.color_sliders_overlay.raise_()
             if hasattr(self, "timeline_dock"):
                 self.timeline_dock.setVisible(True)
             self.timeline.setVisible(True)
@@ -4850,6 +5150,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Matte Opacity: {label}", 2500)
 
     def _on_escape_pressed(self) -> None:
+        if hasattr(self, "color_sliders_overlay") and self.color_sliders_overlay.isVisible():
+            self.color_sliders_overlay.cancel()
+            return
         """Escape exits presentation mode first, cancels text note, deselects drawing tool, or exits fullscreen."""
         if getattr(self, "_in_presentation_mode", False):
             self._on_toggle_presentation_mode()
@@ -5009,8 +5312,7 @@ class MainWindow(QMainWindow):
         # Hot-switch GPU Playback Engine and VSync dynamically
         if hasattr(prefs, "playback_engine"):
             self.viewport.set_playback_engine(prefs.playback_engine)
-            if hasattr(self, "gpu_engine_status_label"):
-                self.gpu_engine_status_label.setText(self._format_gpu_engine_label(prefs.playback_engine))
+
         if hasattr(prefs, "vsync_enabled"):
             self.viewport.set_vsync_enabled(prefs.vsync_enabled)
 
@@ -5019,6 +5321,7 @@ class MainWindow(QMainWindow):
         std_view = getattr(prefs, "standard_view_transform", "sRGB")
         std_input = getattr(prefs, "standard_input_space", "linear")
         self.top_bar.set_color_management_mode(cm_mode, std_view, std_input)
+        self.ocio_manager.color_management_mode = cm_mode
         if hasattr(self, "sources_dock") and self.sources_dock:
             self.sources_dock.panel.set_color_management_mode(cm_mode, self.ocio_manager.get_color_spaces() if cm_mode == "ocio" else None)
         self._update_color_menus()
@@ -5250,6 +5553,37 @@ class MainWindow(QMainWindow):
         dlg.export_started.connect(self._run_export)
         dlg.exec()
 
+    def _on_batch_export_media(self) -> None:
+        """Open the Hardware-Accelerated Batch Export Queue Dialog."""
+        name = "Media"
+        if hasattr(self, "session_graph"):
+            viewable = self.session_graph.get_active_viewable()
+            if viewable:
+                name = getattr(viewable, "name", "Shot")
+        elif self.reader and getattr(self.reader, "path", None):
+            name = Path(self.reader.path).stem
+
+        if self.clock.duration > 0:
+            frames = list(range(self.clock.duration))
+        else:
+            frames = [0]
+
+        active_info = {
+            "frame_provider": self._render_frame_for_export,
+            "frames": frames,
+            "name": name,
+            "fps": float(self.clock.fps),
+            "reader_getter": getattr(self, "_get_reader_for_source", None),
+        }
+
+        from openreview.ui.batch_export_dialog import BatchExportDialog
+        dlg = BatchExportDialog(
+            session_graph=getattr(self, "session_graph", None),
+            active_view_info=active_info,
+            parent=self,
+        )
+        dlg.exec()
+
     def _run_export(self, export_data: dict) -> None:
         fmt = export_data.get("format", "")
         dest = export_data["destination"]
@@ -5296,7 +5630,17 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(f"Exported current frame to {dest}", 5000)
             elif fmt in ("mov", "mp4"):
                 codec = export_data.get("codec", "Apple ProRes 422 HQ")
-                MediaExporter.export_video_ffmpeg(_frame_provider, frames, dest, fps=fps, codec=codec)
+                hwaccel = export_data.get("hwaccel", "auto")
+                crf = int(export_data.get("crf", 18))
+                MediaExporter.export_video_ffmpeg(
+                    _frame_provider,
+                    frames,
+                    dest,
+                    fps=fps,
+                    codec=codec,
+                    crf=crf,
+                    hwaccel=hwaccel,
+                )
                 self.statusBar().showMessage(f"Exported video ({len(frames)} frames) to {dest}", 5000)
             else:
                 ext = export_data.get("ext", "png")
@@ -5438,6 +5782,74 @@ class MainWindow(QMainWindow):
         self.viewport.set_cdl(None)
         self.statusBar().showMessage("Cleared active LUT and CDL.", 3000)
 
+    def _on_toggle_color_sliders(self) -> None:
+        """Toggle on-screen color adjustment sliders (Gain, Gamma, Hue, Saturation) (S)."""
+        if hasattr(self, "color_sliders_overlay"):
+            if not self.color_sliders_overlay.isVisible():
+                if hasattr(self, "top_bar"):
+                    g = getattr(self.top_bar, "_gain", self.viewport.gain)
+                    gam = getattr(self.top_bar.ocio, "gamma", self.viewport.gamma)
+                    s = getattr(self.top_bar, "_saturation", getattr(self.viewport, "saturation", 1.0))
+                    self.viewport.color_grading.gain = (g, g, g)
+                    self.viewport.color_grading.gamma = gam
+                    self.viewport.color_grading.saturation = s
+            self.color_sliders_overlay.toggle(self.viewport.color_grading)
+
+    def _on_overlay_gain_changed(self, g: float) -> None:
+        self._syncing_color_overlay = True
+        try:
+            if hasattr(self, "top_bar"):
+                self.top_bar.set_gain(g)
+            self.viewport.gain = g
+            self.viewport.color_grading.gain = (g, g, g)
+            self.viewport.update()
+        finally:
+            self._syncing_color_overlay = False
+
+    def _on_overlay_gamma_changed(self, g: float) -> None:
+        self._syncing_color_overlay = True
+        try:
+            if hasattr(self, "top_bar"):
+                self.top_bar.set_gamma(g)
+            self.viewport.gamma = g
+            self.viewport.color_grading.gamma = g
+            self.viewport.update()
+        finally:
+            self._syncing_color_overlay = False
+
+    def _on_overlay_saturation_changed(self, s: float) -> None:
+        self._syncing_color_overlay = True
+        try:
+            if hasattr(self, "top_bar"):
+                self.top_bar.set_saturation(s)
+            self.viewport.saturation = s
+            self.viewport.color_grading.saturation = s
+            self.viewport.update()
+        finally:
+            self._syncing_color_overlay = False
+
+    def _on_color_sliders_changed(self, settings: ColorGradeSettings) -> None:
+        """Handle real-time adjustments from on-screen sliders."""
+        self.viewport.set_color_grading(settings)
+        if hasattr(self, "color_adj_widget"):
+            self.color_adj_widget._load_from_settings(settings)
+        if hasattr(self, "color_dock") and hasattr(self.color_dock, "color_adj_widget"):
+            self.color_dock.color_adj_widget._load_from_settings(settings)
+
+    def _on_color_sliders_committed(self, settings: ColorGradeSettings) -> None:
+        """Handle commit from on-screen sliders."""
+        self._on_color_sliders_changed(settings)
+        self.statusBar().showMessage("Color adjustments committed", 2000)
+
+    def _on_color_sliders_cancelled(self) -> None:
+        """Handle cancellation from on-screen sliders."""
+        if hasattr(self, "top_bar") and hasattr(self, "color_sliders_overlay"):
+            orig = self.color_sliders_overlay._original_settings
+            if orig is not None:
+                self.top_bar.set_gain(float(orig.gain[0]))
+                self.top_bar.set_gamma(float(orig.gamma))
+                self.top_bar.set_saturation(float(orig.saturation))
+
     def _on_open_color_adjustments(self) -> None:
         """Toggle Interactive Color Adjustments panel (/ or menu)."""
         vis = self.hud_color_adj.isHidden()
@@ -5460,8 +5872,34 @@ class MainWindow(QMainWindow):
             ComparisonMode.ADD: "Add",
             ComparisonMode.DIFFERENCE: "Difference",
             ComparisonMode.DIFFERENCE_INVERTED: "Difference (Inverted)",
+            ComparisonMode.SPOTLIGHT: "Spotlight / Circle Loupe",
+            ComparisonMode.MULTIPLY: "Multiply",
+            ComparisonMode.SCREEN: "Screen",
+            ComparisonMode.OVERLAY: "Overlay",
         }
         self.statusBar().showMessage(f"Review View Type: {names.get(mode, 'Replace')}", 3000)
+
+    def _on_toggle_diff_heatmap(self) -> None:
+        self.comparison_state.toggle_diff_heatmap()
+        self.viewport.comparison_state.diff_heatmap = self.comparison_state.diff_heatmap
+        if hasattr(self, "wipe_widget") and hasattr(self.wipe_widget, "chk_heatmap"):
+            self.wipe_widget.chk_heatmap.setChecked(self.comparison_state.diff_heatmap)
+        if hasattr(self, "act_diff_hm"):
+            self.act_diff_hm.setChecked(self.comparison_state.diff_heatmap)
+        self.viewport.update()
+        state_str = "Enabled" if self.comparison_state.diff_heatmap else "Disabled"
+        self.statusBar().showMessage(f"Turbo Difference Heatmap: {state_str}", 2000)
+
+    def _on_toggle_wipe_line(self) -> None:
+        self.comparison_state.toggle_wipe_line()
+        self.viewport.comparison_state.wipe_show_line = self.comparison_state.wipe_show_line
+        if hasattr(self, "wipe_widget") and hasattr(self.wipe_widget, "chk_line"):
+            self.wipe_widget.chk_line.setChecked(self.comparison_state.wipe_show_line)
+        if hasattr(self, "act_wipe_line"):
+            self.act_wipe_line.setChecked(self.comparison_state.wipe_show_line)
+        self.viewport.update()
+        state_str = "Shown" if self.comparison_state.wipe_show_line else "Hidden"
+        self.statusBar().showMessage(f"Wipe Divider Line: {state_str}", 2000)
 
     def _on_toggle_color_inspector(self) -> None:
         vis = self.hud_inspector.isHidden()
@@ -5513,8 +5951,13 @@ class MainWindow(QMainWindow):
                 if active_src.width and active_src.height:
                     self.viewport.set_media_resolution(active_src.width, active_src.height)
 
+        info = self._get_current_source_info()
         if hasattr(self, "hud_source_details") and not self.hud_source_details.isHidden():
-            self.source_details_widget.update_info(self._get_current_source_info())
+            self.source_details_widget.update_info(info)
+        if hasattr(self, "inspector_dock") and hasattr(self.inspector_dock, "details_widget"):
+            self.inspector_dock.details_widget.update_info(info)
+        if hasattr(self, "hud_metadata") and not self.hud_metadata.isHidden():
+            self._update_metadata_tree_content()
         if hasattr(self, "viewport"):
             self.viewport.update()
 
@@ -5627,6 +6070,44 @@ class MainWindow(QMainWindow):
         """Backward compatibility alias for Source Details."""
         self._on_toggle_source_details()
 
+    def _on_toggle_metadata_tree(self) -> None:
+        """Toggle Interactive Metadata & OpenEXR / ExifTool Attribute Tree HUD (Alt+I)."""
+        vis = self.hud_metadata.isHidden()
+        if vis:
+            self._update_metadata_tree_content()
+            self.hud_metadata.show()
+            self.hud_metadata.raise_()
+        else:
+            self.hud_metadata.close_panel()
+        self.statusBar().showMessage(f"Metadata Attribute Tree: {'Shown' if vis else 'Hidden'}", 2000)
+
+    def _on_show_metadata_tree(self) -> None:
+        """Show and focus Metadata & Attribute Tree HUD."""
+        self._update_metadata_tree_content()
+        self.hud_metadata.show()
+        self.hud_metadata.raise_()
+
+    def _update_metadata_tree_content(self) -> None:
+        """Refresh metadata tree widget with current active media path and frame."""
+        path = getattr(self, "_current_media_path", None)
+        if not path and hasattr(self, "reader") and self.reader:
+            if hasattr(self.reader, "_frame_path"):
+                path = self.reader._frame_path(self.clock.current_frame)
+            elif hasattr(self.reader, "seq") and hasattr(self.reader.seq, "frame_path"):
+                path = self.reader.seq.frame_path(self.clock.current_frame)
+        ctx = self._get_current_source_info()
+        self.metadata_tree_widget.set_media(
+            path,
+            frame=self.clock.current_frame,
+            context=ctx,
+        )
+        if hasattr(self, "inspector_dock") and hasattr(self.inspector_dock, "metadata_widget"):
+            self.inspector_dock.metadata_widget.set_media(
+                path,
+                frame=self.clock.current_frame,
+                context=ctx,
+            )
+
     @property
     def _source_details_dialog(self):
         return self.hud_source_details if not self.hud_source_details.isHidden() else None
@@ -5644,8 +6125,10 @@ class MainWindow(QMainWindow):
             self.hud_dailies_sync,
             self.hud_audio,
             self.hud_layers,
+            self.hud_channel_matrix,
             self.hud_stereo,
             self.hud_ocio,
+            self.hud_metadata,
         ]
         if hasattr(self, "hud_comp_qc") and isinstance(self.hud_comp_qc, FloatingHUDCard):
             cards.append(self.hud_comp_qc)
@@ -5749,6 +6232,138 @@ class MainWindow(QMainWindow):
         target_dock.raise_()
         target_dock.setFocus()
         return target_dock
+
+    # --------------------------------------------------------------------------
+    # Studio Workspaces & Dockable Panels
+    # --------------------------------------------------------------------------
+    def _setup_studio_workspaces(self) -> None:
+        """Initialize Studio Dock Widgets and Workspace Presets Manager."""
+        self.workspace_mgr = StudioWorkspaceManager(self)
+
+        # 1. Initialize Studio Dock Widgets
+        self.scopes_dock = ScopesDockWidget(color_grading=self.viewport.color_grading, parent=self)
+        self.inspector_dock = InspectorDockWidget(self)
+        self.vfx_exr_dock = VFXEXRDockWidget(self)
+        self.color_dock = ColorGradingDockWidget(self.viewport.color_grading, self)
+        self.annotations_dock = AnnotationsDockWidget(
+            annotation_store=self.annotation_store,
+            clock=self.clock,
+            render_frame_callback=self._render_frame_for_export,
+            parent=self,
+        )
+
+        # 2. Add to Dock Areas
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.scopes_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.inspector_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.vfx_exr_dock)
+        # Standalone color dock is removed from layout; interactive color adjustments
+        # are integrated directly into Scopes accordion (sec_color).
+        self.color_dock.hide()
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.annotations_dock)
+
+        # 3. Register scopes with ScopeAsyncEngine
+        if hasattr(self, "scope_engine"):
+            self.scope_engine.register_widgets(self.scopes_dock.hist_widget, self.scopes_dock.waveform_widget, self.scopes_dock.vectorscope_widget)
+            self.scope_engine.register_widgets(self.scopes_dock.all_hist, self.scopes_dock.all_wave, self.scopes_dock.all_vec)
+
+        # 4. Connect Dock Signals & Handlers
+        self.vfx_exr_dock.channel_matrix_widget.mapping_changed.connect(self._on_exr_matrix_mapping_changed)
+        self.vfx_exr_dock.channel_matrix_widget.channel_mode_changed.connect(self._on_exr_channel_mode_changed)
+        self.vfx_exr_dock.channel_matrix_widget.channel_enable_changed.connect(self._on_exr_channel_enable_changed)
+        self.vfx_exr_dock.channel_matrix_widget.normals_remap_toggled.connect(self._on_normals_remap_toggled)
+        self.vfx_exr_dock.layers_widget.layer_changed.connect(self._on_layer_changed)
+        self.vfx_exr_dock.layers_widget.contact_sheet_toggled.connect(self._on_toggle_exr_contact_sheet)
+        self.vfx_exr_dock.layers_widget.view_single_requested.connect(self._on_view_single_exr_pass)
+        self.vfx_exr_dock.layers_widget.export_contact_sheet_requested.connect(self._on_export_exr_contact_sheet)
+        self.vfx_exr_dock.layers_widget.channel_mode_requested.connect(self._on_channel_changed)
+        self.vfx_exr_dock.layers_widget.auto_depth_toggled.connect(self._on_toggle_auto_depth)
+        self.vfx_exr_dock.layers_widget.metadata_requested.connect(self._on_show_active_exr_metadata)
+        self.color_dock.color_adj_widget.colorGradeChanged.connect(self._on_color_adj_changed)
+        if hasattr(self.scopes_dock, "color_adj_widget"):
+            self.scopes_dock.color_adj_widget.colorGradeChanged.connect(self._on_color_adj_changed)
+        self.annotations_dock.annotation_manager_widget.frame_jump_requested.connect(self.clock.set_frame)
+        self.inspector_dock.details_widget.tree_requested.connect(self._on_show_metadata_tree)
+
+        # Connect Inspector Dock Color Inspector to Viewport (+Eyedropper & live cursor sampling)
+        if hasattr(self, "viewport") and hasattr(self.inspector_dock, "inspector_widget"):
+            insp = self.inspector_dock.inspector_widget
+            self.viewport.pixel_inspected.connect(insp.update_pixel)
+            self.viewport.samplers_changed.connect(insp.update_samplers)
+            self.viewport.eyedropper_mode_changed.connect(insp.set_eyedropper_active)
+            insp.eyedropper_toggled.connect(self.viewport.set_eyedropper_mode)
+            insp.aperture_changed.connect(self.viewport.set_inspector_aperture)
+            insp.sampler_remove_requested.connect(self.viewport.remove_color_sampler)
+            insp.samplers_clear_requested.connect(self.viewport.clear_color_samplers)
+            insp.active_sampler_changed.connect(self.viewport.set_active_analyzer_sampler)
+            insp.analyzer_checks_changed.connect(self.viewport.set_pixel_analyzer_checks)
+
+        # Initial source metadata population
+        try:
+            init_info = self._get_current_source_info()
+            if init_info and hasattr(self.inspector_dock, "details_widget"):
+                self.inspector_dock.details_widget.update_info(init_info)
+        except Exception:
+            pass
+
+        # Hide by default until workspace applies
+        self.scopes_dock.hide()
+        self.inspector_dock.hide()
+        self.vfx_exr_dock.hide()
+        self.color_dock.hide()
+        self.annotations_dock.hide()
+
+        # 5. Load persisted custom workspaces
+        custom_ws = getattr(self.pref_mgr.prefs, "custom_workspaces", {})
+        if custom_ws:
+            self.workspace_mgr.import_custom_workspaces(custom_ws)
+
+    def _apply_workspace(self, ws_id: str) -> None:
+        """Apply a studio workspace preset (review, color_qc, vfx_breakdown, cinema, annotations, or custom)."""
+        ok = self.workspace_mgr.apply_workspace(ws_id, self)
+        if ok:
+            ws = self.workspace_mgr.get_workspace(ws_id)
+            name = ws.name if ws else ws_id
+            if hasattr(self, "top_bar") and hasattr(self.top_bar, "set_active_workspace"):
+                self.top_bar.set_active_workspace(ws_id)
+            self.statusBar().showMessage(f"Applied Studio Workspace: {name}", 2500)
+            if ws_id in ("color_qc", "vfx_breakdown", "review"):
+                self._update_metadata_tree_content()
+                if hasattr(self, "inspector_dock") and hasattr(self.inspector_dock, "details_widget"):
+                    try:
+                        self.inspector_dock.details_widget.update_info(self._get_current_source_info())
+                    except Exception:
+                        pass
+                if hasattr(self, "_update_hud_scopes"):
+                    self._update_hud_scopes(getattr(self.viewport, "_image_a", None))
+
+    def _on_save_workspace_as(self) -> None:
+        name, ok = QInputDialog.getText(self, "Save Workspace", "Enter name for custom workspace layout:")
+        if ok and name.strip():
+            ws_id = self.workspace_mgr.save_custom_workspace(name.strip(), self)
+            self.pref_mgr.prefs.custom_workspaces = self.workspace_mgr.export_custom_workspaces()
+            self.pref_mgr.prefs.active_workspace = ws_id
+            self.pref_mgr.save()
+            self.statusBar().showMessage(f"Saved custom workspace: {name.strip()}", 3000)
+
+    def _on_reset_workspace(self) -> None:
+        cur = self.workspace_mgr.current_workspace
+        base_id = cur if cur in ("review", "color_qc", "vfx_breakdown", "cinema", "annotations") else "review"
+        self._apply_workspace(base_id)
+        self.statusBar().showMessage(f"Reset workspace to {base_id.title()}", 2500)
+
+    def _on_delete_custom_workspace(self) -> None:
+        custom_workspaces = self.workspace_mgr.export_custom_workspaces()
+        if not custom_workspaces:
+            QMessageBox.information(self, "Delete Workspace", "No custom workspaces found to delete.")
+            return
+        items = list(custom_workspaces.keys())
+        item, ok = QInputDialog.getItem(self, "Delete Workspace", "Select custom workspace to delete:", items, 0, False)
+        if ok and item:
+            ws_id = "custom_" + "".join(c if c.isalnum() else "_" for c in item.lower())
+            self.workspace_mgr.delete_custom_workspace(ws_id)
+            self.pref_mgr.prefs.custom_workspaces = self.workspace_mgr.export_custom_workspaces()
+            self.pref_mgr.save()
+            self.statusBar().showMessage(f"Deleted workspace: {item}", 2500)
 
     def _on_toggle_console_window(self) -> None:
         """Toggle non-modal Console & Error Log window (Ctrl+Shift+L)."""
@@ -5939,6 +6554,7 @@ class MainWindow(QMainWindow):
             self._current_media_path = viewable.path
             self._current_media_type = viewable.media_type
             self.reader = self._get_reader_for_source(viewable)
+            self._sync_active_exr_channels(viewable.path)
             self.reader_engine.set_reader(self.reader)
             self.clock.set_fps(viewable.fps)
             is_cycling = getattr(self, "_is_cycling_stack", False)
@@ -6229,6 +6845,8 @@ class MainWindow(QMainWindow):
                         self.wipe_widget.btn_wipe.setChecked(comp_mode == ComparisonMode.WIPE)
                         self.wipe_widget.btn_split.setChecked(comp_mode == ComparisonMode.SPLIT)
                         self.wipe_widget.btn_diff.setChecked(comp_mode == ComparisonMode.DIFFERENCE)
+                        if hasattr(self.wipe_widget, "btn_spot"):
+                            self.wipe_widget.btn_spot.setChecked(comp_mode == ComparisonMode.SPOTLIGHT)
                         self.wipe_widget.btn_off.setChecked(comp_mode in (ComparisonMode.OFF, ComparisonMode.OVER))
                     self._update_window_title()
                 else:
@@ -6484,6 +7102,12 @@ class MainWindow(QMainWindow):
             self.viewport.setFocus()
 
     def closeEvent(self, event) -> None:
+        if hasattr(self, "workspace_mgr") and hasattr(self, "pref_mgr"):
+            self.pref_mgr.prefs.active_workspace = self.workspace_mgr.current_workspace
+            self.pref_mgr.prefs.custom_workspaces = self.workspace_mgr.export_custom_workspaces()
+            self.pref_mgr.save()
+        if hasattr(self, "scope_engine"):
+            self.scope_engine.stop()
         self.clock.pause()
         if hasattr(self, "audio_engine") and self.audio_engine:
             self.audio_engine.unload_audio()

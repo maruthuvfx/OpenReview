@@ -29,7 +29,7 @@ class WipeComparisonHUD(QWidget):
         super().__init__(parent)
         self.state = state or ComparisonState()
         self._setup_ui()
-        self.setFixedWidth(250)
+        self.setFixedWidth(270)
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -68,7 +68,34 @@ class WipeComparisonHUD(QWidget):
         self.btn_diff.clicked.connect(lambda: self._set_mode(ComparisonMode.DIFFERENCE))
         mode_layout.addWidget(self.btn_diff)
 
+        self.btn_spot = QPushButton("Spot", self)
+        self.btn_spot.setCheckable(True)
+        self.btn_spot.setChecked(self.state.mode == ComparisonMode.SPOTLIGHT)
+        self.btn_spot.setToolTip("Spotlight / Circle Loupe inspection wipe")
+        self.btn_spot.clicked.connect(lambda: self._set_mode(ComparisonMode.SPOTLIGHT))
+        mode_layout.addWidget(self.btn_spot)
+
         layout.addLayout(mode_layout)
+
+        # Options Row: Divider Line & Turbo Heatmap
+        options_layout = QHBoxLayout()
+        options_layout.setSpacing(4)
+        self.chk_line = QPushButton("Divider Line", self)
+        self.chk_line.setCheckable(True)
+        self.chk_line.setChecked(getattr(self.state, "wipe_show_line", True))
+        self.chk_line.setToolTip("Toggle anti-aliased divider overlay line")
+        self.chk_line.setStyleSheet("font-size: 10px; padding: 2px 4px;")
+        self.chk_line.clicked.connect(self._on_toggle_line)
+        options_layout.addWidget(self.chk_line)
+
+        self.chk_heatmap = QPushButton("Turbo Heatmap", self)
+        self.chk_heatmap.setCheckable(True)
+        self.chk_heatmap.setChecked(getattr(self.state, "diff_heatmap", False))
+        self.chk_heatmap.setToolTip("Toggle perceptual false-color Turbo difference heatmap")
+        self.chk_heatmap.setStyleSheet("font-size: 10px; padding: 2px 4px;")
+        self.chk_heatmap.clicked.connect(self._on_toggle_heatmap)
+        options_layout.addWidget(self.chk_heatmap)
+        layout.addLayout(options_layout)
 
         # 2. Orientation Switcher (Vertical vs Horizontal)
         orient_layout = QHBoxLayout()
@@ -174,6 +201,18 @@ class WipeComparisonHUD(QWidget):
         self.btn_wipe.setChecked(mode == ComparisonMode.WIPE)
         self.btn_split.setChecked(mode == ComparisonMode.SPLIT)
         self.btn_diff.setChecked(mode == ComparisonMode.DIFFERENCE)
+        if hasattr(self, "btn_spot"):
+            self.btn_spot.setChecked(mode == ComparisonMode.SPOTLIGHT)
+        self.comparison_changed.emit(self.state)
+
+    def _on_toggle_line(self) -> None:
+        self.state.toggle_wipe_line()
+        self.chk_line.setChecked(self.state.wipe_show_line)
+        self.comparison_changed.emit(self.state)
+
+    def _on_toggle_heatmap(self) -> None:
+        self.state.toggle_diff_heatmap()
+        self.chk_heatmap.setChecked(self.state.diff_heatmap)
         self.comparison_changed.emit(self.state)
 
     def toggle_wipe(self) -> None:
@@ -190,6 +229,10 @@ class WipeComparisonHUD(QWidget):
         self.angle_slider.setValue(int(round(self.state.wipe_angle_deg)))
         self.angle_slider.blockSignals(False)
         self.angle_val_label.setText(f"{int(round(self.state.wipe_angle_deg))}°")
+        if hasattr(self, "chk_line"):
+            self.chk_line.setChecked(self.state.wipe_show_line)
+        if hasattr(self, "chk_heatmap"):
+            self.chk_heatmap.setChecked(self.state.diff_heatmap)
         self._update_orientation_buttons()
         self.comparison_changed.emit(self.state)
 

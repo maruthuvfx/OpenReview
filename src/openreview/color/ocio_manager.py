@@ -38,6 +38,7 @@ class OCIOManager(QObject):
 
     config_changed = Signal()
     context_changed = Signal()
+    ocio_lut_baked = Signal(object)  # Emits OcioLutBakeResult
 
     def __init__(self, config_path: Optional[str] = None, parent: Optional[QObject] = None):
         super().__init__(parent)
@@ -53,6 +54,10 @@ class OCIOManager(QObject):
         self._color_management_mode: str = "standard"
         self._standard_input_id: int = 0   # linear
         self._standard_view_id: int = 1    # sRGB
+        self._active_bake = None
+        self._gpu_fast_path_enabled: bool = True
+        self._lut_3d_size: int = 32
+        self._shaper_mode: int = 1  # 1: Log2 20-stop [-10, 10] EV
 
         # Parsed text cache (works even without PyOpenColorIO binary)
         self._parsed_info: Dict[str, Any] = {
@@ -152,6 +157,50 @@ class OCIOManager(QObject):
         }
         self.initialize(None)
         self.config_changed.emit()
+
+    def bake_current_display_lut(self, force: bool = False, size: Optional[int] = None, lut_size: Optional[int] = None) -> Any:
+        """Pre-bake the current OCIO display/view color transform into a 3D LUT for GPU upload."""
+        from openreview.color.ocio_baker import bake_display_view_lut
+        cfg_id = self.config_name or "builtin"
+        bake_sz = lut_size or size or self._lut_3d_size
+        bake = bake_display_view_lut(
+            config=self._config,
+            src_space=self._current_input_space,
+            display=self._current_display,
+            view=self._current_view,
+            size=bake_sz,
+            shaper_mode=self._shaper_mode,
+            config_name=cfg_id,
+        )
+        self._active_bake = bake
+        self.ocio_lut_baked.emit(bake)
+        return bake
+
+    def prewarm_adjacent_views(self) -> None:
+        """Asynchronously pre-bake adjacent views for the current display to warm the cache."""
+        import threading
+        views = self.get_views(self._current_display)
+        if not views:
+            return
+        def _worker():
+            for v in views:
+                if v != self._current_view:
+                    try:
+                        from openreview.color.ocio_baker import bake_display_view_lut
+                        cfg_id = self.config_name or "builtin"
+                        bake_display_view_lut(
+                            config=self._config,
+                            src_space=self._current_input_space,
+                            display=self._current_display,
+                            view=v,
+                            size=self._lut_3d_size,
+                            shaper_mode=self._shaper_mode,
+                            config_name=cfg_id,
+                        )
+                    except Exception:
+                        pass
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
 
     def _resolve_defaults(self) -> None:
         displays = self.get_displays()
@@ -412,6 +461,10 @@ class OCIOManager(QObject):
     def color_management_mode(self, mode: str) -> None:
         self._color_management_mode = str(mode)
         self.context_changed.emit()
+        if self._color_management_mode == "ocio":
+            self.bake_current_display_lut()
+        else:
+            self.ocio_lut_baked.emit(None)
 
     @property
     def standard_input_id(self) -> int:
@@ -439,6 +492,8 @@ class OCIOManager(QObject):
     def input_space(self, name: str) -> None:
         self._current_input_space = name
         self.context_changed.emit()
+        if self._color_management_mode == "ocio":
+            self.bake_current_display_lut()
 
     @property
     def display(self) -> str:
@@ -448,6 +503,9 @@ class OCIOManager(QObject):
     def display(self, name: str) -> None:
         self._current_display = name
         self.context_changed.emit()
+        if self._color_management_mode == "ocio":
+            self.bake_current_display_lut()
+            self.prewarm_adjacent_views()
 
     @property
     def view(self) -> str:
@@ -457,6 +515,8 @@ class OCIOManager(QObject):
     def view(self, name: str) -> None:
         self._current_view = name
         self.context_changed.emit()
+        if self._color_management_mode == "ocio":
+            self.bake_current_display_lut()
 
     @property
     def exposure_ev(self) -> float:

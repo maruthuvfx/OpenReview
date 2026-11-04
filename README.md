@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/maruthuvfx/OpenReview/releases/latest"><img src="https://img.shields.io/badge/Release-v1.3.0-007acc?style=flat-square&logo=github" alt="Release v1.3.0" /></a>
+  <a href="https://github.com/maruthuvfx/OpenReview/releases/latest"><img src="https://img.shields.io/badge/Release-v2.0.0-007acc?style=flat-square&logo=github" alt="Release v2.0.0" /></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square" alt="License: MIT" /></a>
   <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg?style=flat-square&logo=python" alt="Python 3.10+" /></a>
   <a href="https://www.qt.io/"><img src="https://img.shields.io/badge/GUI-PySide6%20%7C%20Qt6-green.svg?style=flat-square&logo=qt" alt="PySide6 / Qt6" /></a>
@@ -38,14 +38,14 @@
 
 ## 📦 Binary Downloads & Distribution Matrix
 
-Pre-built standalone distributions for **OpenReview v1.3.0** are hosted directly on **[GitHub Releases](https://github.com/maruthuvfx/OpenReview/releases/tag/v1.3.0)**.
+Pre-built standalone distributions for **OpenReview v2.0.0** are hosted directly on **[GitHub Releases](https://github.com/maruthuvfx/OpenReview/releases/tag/v2.0.0)**.
 
 | Platform / Edition | Package Format | Target Architecture | Description | Download |
 | :--- | :--- | :--- | :--- | :--- |
-| **Windows 64-bit** | `.msi` Installer | `x86_64` (Win 10/11) | Full interactive Windows installer with Start Menu shortcut, desktop icon, and file associations. | [**Download .msi**](https://github.com/maruthuvfx/OpenReview/releases/download/v1.3.0/OpenReview-1.3.0-win64.msi) |
-| **Windows 64-bit Portable** | `.zip` Archive | `x86_64` (Win 10/11) | Zero-install standalone directory. Unzip anywhere and double-click `OpenReview.exe` to run. | [**Download .zip**](https://github.com/maruthuvfx/OpenReview/releases/download/v1.3.0/OpenReview-1.3.0-win64-portable.zip) |
-| **Linux (Debian / Ubuntu)** | `.deb` Package | `amd64` (Ubuntu 20.04+, Debian 11+) | Native Debian package installing desktop integration, `/opt/openreview`, and terminal launcher. | [**Download .deb**](https://github.com/maruthuvfx/OpenReview/releases/download/v1.3.0/openreview_1.3.0_amd64.deb) |
-| **Linux (RHEL / Fedora)** | `.rpm` Package | `x86_64` (RHEL 8/9, Rocky, Fedora) | Standard RedHat package with system desktop entry, MIME types, and icon deployment. | [**Download .rpm**](https://github.com/maruthuvfx/OpenReview/releases/download/v1.3.0/openreview-1.3.0-1.x86_64.rpm) |
+| **Windows 64-bit** | `.msi` Installer | `x86_64` (Win 10/11) | Full interactive Windows installer with Start Menu shortcut, desktop icon, and file associations. | [**Download .msi**](https://github.com/maruthuvfx/OpenReview/releases/download/v2.0.0/OpenReview-2.0.0-win64.msi) |
+| **Windows 64-bit Portable** | `.zip` Archive | `x86_64` (Win 10/11) | Zero-install standalone directory. Unzip anywhere and double-click `OpenReview.exe` to run. | [**Download .zip**](https://github.com/maruthuvfx/OpenReview/releases/download/v2.0.0/OpenReview-2.0.0-win64-portable.zip) |
+| **Linux (Debian / Ubuntu)** | `.deb` Package | `amd64` (Ubuntu 20.04+, Debian 11+) | Native Debian package installing desktop integration, `/opt/openreview`, and terminal launcher. | [**Download .deb**](https://github.com/maruthuvfx/OpenReview/releases/download/v2.0.0/openreview_2.0.0_amd64.deb) |
+| **Linux (RHEL / Fedora)** | `.rpm` Package | `x86_64` (RHEL 8/9, Rocky, Fedora) | Standard RedHat package with system desktop entry, MIME types, and icon deployment. | [**Download .rpm**](https://github.com/maruthuvfx/OpenReview/releases/download/v2.0.0/openreview-2.0.0-1.x86_64.rpm) |
 | **Python Source** | PyPI / Editable | Cross-platform | Run directly from source in any Python 3.10+ virtual environment. | `pip install -e .` |
 
 ---

@@ -160,3 +160,68 @@ def test_reader_engine_cooperative_cancellation(qtbot):
     # Wait a moment to ensure aborted task does not deliver to callback or cache
     time.sleep(0.15)
     assert not cache.has_source_frame("src_test", 2001)
+
+
+def test_viewport_pbo_streaming_engine_modes(qtbot):
+    from openreview.widgets.viewport import ViewportCanvas, PlaybackEngineMode
+    from openreview.core.preferences import PreferencesManager
+
+    vp = ViewportCanvas()
+    qtbot.addWidget(vp)
+
+    # 1. Default with enable_pbo_streaming=True
+    PreferencesManager.instance().prefs.enable_pbo_streaming = True
+    vp.set_playback_engine("opengl_core")
+    assert vp.is_pbo_enabled() is True
+
+    # 2. Explicit ASYNC_PBO
+    vp.set_playback_engine(PlaybackEngineMode.ASYNC_PBO)
+    assert vp.is_pbo_enabled() is True
+
+    # 3. Explicit SOFTWARE_SAFE overrides preference
+    vp.set_playback_engine(PlaybackEngineMode.SOFTWARE_SAFE)
+    assert vp.is_pbo_enabled() is False
+
+    # 4. Disabled via preferences
+    vp.set_playback_engine(PlaybackEngineMode.OPENGL_CORE)
+    PreferencesManager.instance().prefs.enable_pbo_streaming = False
+    assert vp.is_pbo_enabled() is False
+
+    # Restore default
+    PreferencesManager.instance().prefs.enable_pbo_streaming = True
+
+
+def test_viewport_pbo_ping_pong_texture_upload(qtbot):
+    from openreview.widgets.viewport import ViewportCanvas, PlaybackEngineMode
+
+    vp = ViewportCanvas()
+    qtbot.addWidget(vp)
+    vp.show()
+    qtbot.waitExposed(vp)
+
+    vp.makeCurrent()
+    if not vp._shader_program:
+        vp.initializeGL()
+
+    vp.set_playback_engine(PlaybackEngineMode.ASYNC_PBO)
+    assert vp.is_pbo_enabled() is True
+
+    # Render frame 1
+    frame1 = np.ones((128, 128, 4), dtype=np.float16)
+    vp.set_primary_frame(1, frame1)
+    vp._upload_texture_a()
+
+    idx_after_f1 = vp._pbo_a_index
+    assert idx_after_f1 == 1
+
+    # Render frame 2 (should swap ping-pong index back to 0)
+    frame2 = np.ones((128, 128, 4), dtype=np.float16) * 0.5
+    vp.set_primary_frame(2, frame2)
+    vp._upload_texture_a()
+
+    idx_after_f2 = vp._pbo_a_index
+    assert idx_after_f2 == 0
+
+    # Both PBO buffers in the double-buffer pair must be allocated
+    assert vp._pbo_a[0] is not None and vp._pbo_a[0].isCreated()
+    assert vp._pbo_a[1] is not None and vp._pbo_a[1].isCreated()

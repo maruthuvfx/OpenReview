@@ -1,7 +1,7 @@
 """
 EXR Metadata & Header Details Dialog.
 Provides comprehensive breakdown of OpenEXR header attributes, data/display windows,
-compression, and embedded channel specifications.
+compression, and embedded channel specifications via an interactive attribute tree.
 """
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 
 from openreview.core.exr_contact_sheet import extract_exr_detailed_metadata
 from openreview.resources.svg_icons import get_svg_icon
+from openreview.widgets.metadata_tree_widget import MetadataTreeWidget
 
 
 class EXRMetadataDialog(QDialog):
@@ -32,7 +33,7 @@ class EXRMetadataDialog(QDialog):
     def __init__(self, exr_path: str, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.setWindowTitle(f"EXR Header Details - {exr_path.split('/')[-1].split(chr(92))[-1]}")
-        self.resize(650, 480)
+        self.resize(780, 560)
         self._exr_path = exr_path
         self._meta = extract_exr_detailed_metadata(exr_path)
         self._setup_ui()
@@ -115,7 +116,12 @@ class EXRMetadataDialog(QDialog):
         # Tabs
         tabs = QTabWidget(self)
 
-        # Tab 1: Summary & Windows
+        # Tab 1: Interactive Attribute Tree
+        self.tree_widget = MetadataTreeWidget(self)
+        self.tree_widget.set_media(self._exr_path)
+        tabs.addTab(self.tree_widget, "Interactive Attribute Tree")
+
+        # Tab 2: Summary & Windows
         tab_summary = QWidget()
         form = QFormLayout(tab_summary)
         form.setContentsMargins(12, 12, 12, 12)
@@ -146,7 +152,7 @@ class EXRMetadataDialog(QDialog):
 
         tabs.addTab(tab_summary, "Summary")
 
-        # Tab 2: Channels Table
+        # Tab 3: Channels Table
         tab_channels = QWidget()
         chan_layout = QVBoxLayout(tab_channels)
         chan_layout.setContentsMargins(4, 4, 4, 4)
@@ -168,7 +174,7 @@ class EXRMetadataDialog(QDialog):
         chan_layout.addWidget(tbl_chans)
         tabs.addTab(tab_channels, f"Channels ({len(channels)})")
 
-        # Tab 3: Custom Attributes Table
+        # Tab 4: Custom Attributes Table
         tab_attrs = QWidget()
         attr_layout = QVBoxLayout(tab_attrs)
         attr_layout.setContentsMargins(4, 4, 4, 4)
@@ -186,7 +192,7 @@ class EXRMetadataDialog(QDialog):
             tbl_attrs.setItem(r, 1, QTableWidgetItem(str(v)))
 
         attr_layout.addWidget(tbl_attrs)
-        tabs.addTab(tab_attrs, f"Attributes ({len(attrs)})")
+        tabs.addTab(tab_attrs, f"Raw Attributes ({len(attrs)})")
 
         layout.addWidget(tabs, stretch=1)
 

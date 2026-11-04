@@ -19,7 +19,7 @@ from pathlib import Path
 
 
 PKG_NAME = "openreview"
-PKG_VERSION = "1.3.0"
+PKG_VERSION = "2.0.0"
 PKG_RELEASE = "1"
 PKG_ARCH_DEB = "amd64"
 PKG_ARCH_RPM = "x86_64"

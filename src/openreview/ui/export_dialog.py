@@ -138,6 +138,7 @@ class ExportWorker(QThread):
             elif export_type == "video":
                 codec = self.config.get("codec", "Apple ProRes 422 HQ")
                 crf = int(self.config.get("crf", 18))
+                hwaccel = self.config.get("hwaccel", "auto")
                 MediaExporter.export_video_ffmpeg(
                     _frame_provider,
                     frames,
@@ -145,6 +146,7 @@ class ExportWorker(QThread):
                     fps=fps,
                     codec=codec,
                     crf=crf,
+                    hwaccel=hwaccel,
                     progress_callback=_progress_cb,
                     cancel_token=self.is_cancelled,
                 )
@@ -320,12 +322,26 @@ class ExportDialog(QDialog):
             "Apple ProRes 422 HQ",
             "Apple ProRes 422",
             "Apple ProRes 4444",
+            "Apple ProRes 4444 XQ",
+            "Apple ProRes 422 LT",
             "Apple ProRes 422 Proxy",
             "H.264",
             "H.265 (HEVC)",
         ])
         self.combo_mov_codec.currentIndexChanged.connect(self._on_codec_changed)
         form_mov.addRow("Video Codec:", self.combo_mov_codec)
+
+        self.combo_mov_hwaccel = QComboBox()
+        self.combo_mov_hwaccel.addItems([
+            "Auto (GPU Accelerated)",
+            "NVIDIA NVENC",
+            "Intel QuickSync",
+            "AMD AMF",
+            "Apple VideoToolbox",
+            "CPU Software",
+        ])
+        form_mov.addRow("Hardware Accel:", self.combo_mov_hwaccel)
+
         self.spin_mov_crf = QSpinBox()
         self.spin_mov_crf.setRange(0, 51)
         self.spin_mov_crf.setValue(18)
@@ -340,6 +356,18 @@ class ExportDialog(QDialog):
         self.combo_mp4_codec = QComboBox()
         self.combo_mp4_codec.addItems(["H.264", "H.265 (HEVC)"])
         form_mp4.addRow("Video Codec:", self.combo_mp4_codec)
+
+        self.combo_mp4_hwaccel = QComboBox()
+        self.combo_mp4_hwaccel.addItems([
+            "Auto (GPU Accelerated)",
+            "NVIDIA NVENC",
+            "Intel QuickSync",
+            "AMD AMF",
+            "Apple VideoToolbox",
+            "CPU Software",
+        ])
+        form_mp4.addRow("Hardware Accel:", self.combo_mp4_hwaccel)
+
         self.spin_mp4_crf = QSpinBox()
         self.spin_mp4_crf.setRange(0, 51)
         self.spin_mp4_crf.setValue(18)
@@ -646,6 +674,11 @@ class ExportDialog(QDialog):
         self.btn_export.clicked.connect(self._on_export_clicked)
         btn_row.addWidget(self.btn_export)
 
+        self.btn_batch = QPushButton("Add to Batch Queue...")
+        self.btn_batch.setStyleSheet("background-color: #2c3e50; border-color: #34495e; color: #ffffff; font-weight: bold;")
+        self.btn_batch.clicked.connect(self._on_add_to_batch_clicked)
+        btn_row.addWidget(self.btn_batch)
+
         self.btn_close = QPushButton("Close")
         self.btn_close.clicked.connect(self.reject)
         btn_row.addWidget(self.btn_close)
@@ -863,14 +896,30 @@ class ExportDialog(QDialog):
             "is_custom_res": self.combo_res_preset.currentData() not in ("100",),
         }
 
+        def _parse_hwaccel(combo):
+            txt = combo.currentText().lower()
+            if "nvenc" in txt:
+                return "nvenc"
+            if "qsv" in txt or "quicksync" in txt:
+                return "qsv"
+            if "amf" in txt:
+                return "amf"
+            if "videotoolbox" in txt:
+                return "videotoolbox"
+            if "cpu" in txt or "software" in txt:
+                return "cpu"
+            return "auto"
+
         if fmt == "mov":
             config["export_type"] = "video"
             config["codec"] = self.combo_mov_codec.currentText()
             config["crf"] = self.spin_mov_crf.value()
+            config["hwaccel"] = _parse_hwaccel(self.combo_mov_hwaccel)
         elif fmt == "mp4":
             config["export_type"] = "video"
             config["codec"] = self.combo_mp4_codec.currentText()
             config["crf"] = self.spin_mp4_crf.value()
+            config["hwaccel"] = _parse_hwaccel(self.combo_mp4_hwaccel)
         elif fmt == "single":
             config["export_type"] = "single"
             ext = self.combo_single_fmt.currentData()
@@ -985,6 +1034,45 @@ class ExportDialog(QDialog):
         self.btn_export.setEnabled(True)
         self.btn_close.setEnabled(True)
         QMessageBox.critical(self, "Export Failed", f"Export failed:\n{err_msg}")
+
+    def _on_add_to_batch_clicked(self) -> None:
+        config = self._build_export_config()
+        if not config:
+            return
+
+        from openreview.core.batch_export import BatchExportEngine, BatchExportJob
+        from openreview.ui.batch_export_dialog import BatchExportDialog
+
+        name = Path(config["destination"]).stem or "Export_Job"
+        job = BatchExportJob(
+            name=name,
+            output_path=config["destination"],
+            export_type=config["export_type"],
+            format=self.combo_format.currentData(),
+            codec=config.get("codec", "Apple ProRes 422 HQ"),
+            hwaccel=config.get("hwaccel", "auto"),
+            frames=config["frames"],
+            fps=config["fps"],
+            target_resolution=(config["target_width"], config["target_height"]),
+            colorspace=config["colorspace"],
+            burn_grade=config["burn_grade"],
+            burn_annotations=config["burn_annotations"],
+            crf=config.get("crf", 18),
+            frame_provider=self.raw_frame_reader,
+        )
+
+        engine = BatchExportEngine.instance()
+        engine.add_job(job)
+
+        QMessageBox.information(
+            self,
+            "Added to Batch Queue",
+            f"Job '{name}' has been added to the Batch Export Queue.\nOpening Batch Queue Manager..."
+        )
+        self.accept()
+
+        batch_dlg = BatchExportDialog(engine=engine, parent=self.parent())
+        batch_dlg.exec()
 
     def closeEvent(self, event) -> None:
         if self._worker and self._worker.isRunning():

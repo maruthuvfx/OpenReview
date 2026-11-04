@@ -142,9 +142,8 @@ class TestMainWindowGpuIntegration:
 
         win = MainWindow()
         try:
-            # Check initial engine status label
-            assert hasattr(win, "gpu_engine_status_label")
-            assert "Engine:" in win.gpu_engine_status_label.text()
+            # Verify GPU engine status label was removed from status bar
+            assert not hasattr(win, "gpu_engine_status_label")
 
             # Simulate dynamic preferences change to ASYNC_PBO
             new_prefs = win.pref_mgr.prefs
@@ -154,18 +153,15 @@ class TestMainWindowGpuIntegration:
 
             assert win.viewport.playback_engine == PlaybackEngineMode.ASYNC_PBO
             assert win.viewport.vsync_enabled is True
-            assert "Async PBO" in win.gpu_engine_status_label.text()
 
             # Switch to SOFTWARE_SAFE
             new_prefs.playback_engine = "software_safe"
             win.pref_mgr.preferences_changed.emit(new_prefs)
             assert win.viewport.playback_engine == PlaybackEngineMode.SOFTWARE_SAFE
-            assert "Software Safe" in win.gpu_engine_status_label.text()
 
             # Switch back to OPENGL_CORE
             new_prefs.playback_engine = "opengl_core"
             win.pref_mgr.preferences_changed.emit(new_prefs)
             assert win.viewport.playback_engine == PlaybackEngineMode.OPENGL_CORE
-            assert "OpenGL Core" in win.gpu_engine_status_label.text()
         finally:
             win.close()

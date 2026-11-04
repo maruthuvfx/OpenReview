@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QFrame,
+    QSizePolicy,
 )
 
 
@@ -34,16 +35,57 @@ class VectorscopeCanvas(QWidget):
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.setFixedSize(224, 224)
+        self.setMinimumSize(160, 160)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._trace_img: Optional[QImage] = None
 
-        self._cx = 112.0
-        self._cy = 112.0
-        self._r_100 = 88.0
-        self._r_75 = 66.0
-        self._scale = 146.0
+    def _calc_metrics(self) -> tuple[float, float, float, float, float]:
+        w = float(self.width())
+        h = float(self.height())
+        cx = w / 2.0
+        cy = h / 2.0
+        radius = max(20.0, min(w, h) * 0.44)
+        r_100 = radius
+        r_75 = radius * 0.75
+        scale = radius * 1.66
+        return cx, cy, r_100, r_75, scale
+
+    @property
+    def _cx(self) -> float:
+        return self._calc_metrics()[0]
+
+    @property
+    def _cy(self) -> float:
+        return self._calc_metrics()[1]
+
+    @property
+    def _r_100(self) -> float:
+        return self._calc_metrics()[2]
+
+    @property
+    def _r_75(self) -> float:
+        return self._calc_metrics()[3]
+
+    @property
+    def _scale(self) -> float:
+        return self._calc_metrics()[4]
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.update()
+
+    def set_trace_image(self, img: Optional[QImage]) -> None:
+        """Set pre-computed trace image from asynchronous compute worker (thread-safe UI update)."""
+        self._trace_img = img
+        self.update()
 
     def update_data(self, image_data: Optional[np.ndarray]) -> None:
+        if image_data is not None and image_data.ndim >= 2:
+            ih, iw = image_data.shape[:2]
+            step = 4 if (iw >= 3840 or ih >= 2160) else (2 if (iw >= 1920 or ih >= 1080) else 1)
+            if step > 1:
+                image_data = image_data[::step, ::step]
+
         if image_data is None or image_data.size == 0:
             self._trace_img = None
             self.update()
@@ -158,7 +200,13 @@ class VectorscopeCanvas(QWidget):
 
         # Draw signal phosphor trace
         if self._trace_img is not None and not self._trace_img.isNull():
-            painter.drawImage(0, 0, self._trace_img)
+            if self._trace_img.width() == w and self._trace_img.height() == h:
+                painter.drawImage(0, 0, self._trace_img)
+            else:
+                sq = min(w, h)
+                cx, cy, _, _, _ = self._calc_metrics()
+                rect = QRectF(cx - sq / 2.0, cy - sq / 2.0, sq, sq)
+                painter.drawImage(rect, self._trace_img)
 
         # Outer border
         painter.setPen(QPen(QColor(42, 42, 42), 1))
@@ -177,7 +225,7 @@ class VectorscopeHUD(QWidget):
 
         # Canvas
         self.canvas = VectorscopeCanvas(self)
-        layout.addWidget(self.canvas)
+        layout.addWidget(self.canvas, 1)
 
         # Bottom info status bar
         info_frame = QFrame(self)
@@ -188,7 +236,11 @@ class VectorscopeHUD(QWidget):
         self.info_label = QLabel("Rec.709 | 75% & 100% Targets | Skin Line", self)
         self.info_label.setStyleSheet("color: #777777; font-family: monospace; font-size: 9.5px;")
         info_layout.addWidget(self.info_label)
-        layout.addWidget(info_frame)
+        layout.addWidget(info_frame, 0)
+
+    def set_trace_image(self, img: Optional[QImage]) -> None:
+        """Set pre-computed trace image asynchronously."""
+        self.canvas.set_trace_image(img)
 
     def update_frame(self, image_data: Optional[np.ndarray]) -> None:
         self.canvas.update_data(image_data)

@@ -41,23 +41,14 @@ def test_set_handles_dropdown(qtbot):
 
 
 def test_cache_dropdown_and_progress_bar(qtbot):
-    """Test cache mode dropdown selection and cache progress bar update."""
+    """Test cache progress bar update and mode display."""
     clock = PlaybackClock(start_frame=1001, end_frame=1050, fps=24.0)
     timeline = TimelineWidget(clock)
     qtbot.addWidget(timeline)
 
-    # Default is Cache: OFF
-    assert timeline.combo_cache_mode.currentText() == "Cache: OFF"
-
-    # Listen for cache mode signal
-    modes_received = []
-    timeline.cache_mode_selected.connect(modes_received.append)
-
-    # Change combo to Region then Off
-    timeline.combo_cache_mode.setCurrentIndex(2)  # In/Out Region
-    assert "region" in modes_received
-    timeline.combo_cache_mode.setCurrentIndex(0)  # Cache: OFF
-    assert "off" in modes_received
+    # Cache bar present and default mode is off
+    assert timeline.cache_bar is not None
+    assert timeline.cache_bar._cache_mode == "off"
 
     # Update cache display with data
     timeline.update_cache_display({1001, 1002, 1003}, 15.0, cache_mode="region")

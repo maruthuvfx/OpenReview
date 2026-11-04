@@ -9,7 +9,7 @@ import os
 import json
 import time
 from typing import Optional, Dict, Any
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
     QDialog,
@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QMenu,
     QFileDialog,
+    QSizePolicy,
 )
 
 from openreview.widgets.draggable_scroll_area import BlenderScrollArea
@@ -58,11 +59,14 @@ class MetaTableWidget(QTableWidget):
 class ImageInfoWidget(QWidget):
     """Studio Image Info and Source Media Details Widget."""
 
+    tree_requested = Signal()
+
     def __init__(self, media_info: Optional[Dict[str, Any]] = None, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.info = media_info or {}
-        self.setMinimumWidth(480)
-        self.setMinimumHeight(520)
+        self.setMinimumWidth(0)
+        self.setMinimumHeight(180)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.filter_edit: Optional[QLineEdit] = None
         self.meta_table: Optional[MetaTableWidget] = None
         self.tag_grp: Optional[QGroupBox] = None
@@ -94,7 +98,7 @@ class ImageInfoWidget(QWidget):
                 color: #888888;
                 font-size: 11px;
                 font-weight: bold;
-                min-width: 120px;
+                min-width: 80px;
             }
             QLabel#val {
                 color: #e0e0e0;
@@ -179,28 +183,40 @@ class ImageInfoWidget(QWidget):
         self._scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
         self._main_layout.addWidget(self._scroll_area, stretch=1)
 
-        # Bottom Button Bar created ONCE
-        btn_box = QHBoxLayout()
-        btn_box.setSpacing(8)
+        # Bottom Action Buttons Bar (Compact 2-row layout for dock panels)
+        btn_layout = QVBoxLayout()
+        btn_layout.setSpacing(4)
+        btn_layout.setContentsMargins(0, 4, 0, 0)
 
+        row1 = QHBoxLayout()
+        row1.setSpacing(6)
         self.btn_copy = QPushButton("Copy All to Clipboard", self)
         self.btn_copy.setObjectName("btn_copy")
         self.btn_copy.clicked.connect(self._on_copy_all)
-        btn_box.addWidget(self.btn_copy)
+        row1.addWidget(self.btn_copy)
 
         self.btn_export = QPushButton("Export JSON", self)
         self.btn_export.setObjectName("btn_copy")
         self.btn_export.clicked.connect(self._on_export_json)
-        btn_box.addWidget(self.btn_export)
+        row1.addWidget(self.btn_export)
+        btn_layout.addLayout(row1)
 
-        btn_box.addStretch()
+        row2 = QHBoxLayout()
+        row2.setSpacing(6)
+        self.btn_tree = QPushButton("View Metadata Tree", self)
+        self.btn_tree.setObjectName("btn_copy")
+        self.btn_tree.setToolTip("Open Interactive OpenEXR & ExifTool Attribute Tree (Alt+I)")
+        self.btn_tree.clicked.connect(self.tree_requested.emit)
+        row2.addWidget(self.btn_tree)
 
         self.btn_close = QPushButton("Close", self)
         self.btn_close.setObjectName("btn")
         self.btn_close.clicked.connect(self._on_close_clicked)
-        btn_box.addWidget(self.btn_close)
+        self.btn_close.hide()  # Hidden by default when embedded inside dock
+        row2.addWidget(self.btn_close)
+        btn_layout.addLayout(row2)
 
-        self._main_layout.addLayout(btn_box)
+        self._main_layout.addLayout(btn_layout)
 
         # Populate initial content
         self._rebuild_content()
@@ -558,6 +574,16 @@ class ImageInfoWidget(QWidget):
 
     def _on_copy_all(self) -> None:
         """Copy formatted metadata string to system clipboard."""
+        if not self.info:
+            app = QApplication.instance()
+            if app:
+                for w in app.topLevelWidgets():
+                    if hasattr(w, "_get_current_source_info"):
+                        self.info = w._get_current_source_info()
+                        if self.info:
+                            self._rebuild_content()
+                            break
+
         lines = ["=== OpenReview Source Media Details ==="]
         for k, v in sorted(self.info.items(), key=lambda x: str(x[0]).lower()):
             if isinstance(v, dict):
@@ -574,10 +600,26 @@ class ImageInfoWidget(QWidget):
         QApplication.clipboard().setText(text)
         self.btn_copy.setText("✓ Copied!")
         from PySide6.QtCore import QTimer
-        QTimer.singleShot(1800, lambda: self.btn_copy.setText("Copy All to Clipboard"))
+        def _safe_reset_copy():
+            try:
+                if hasattr(self, 'btn_copy') and self.btn_copy:
+                    self.btn_copy.setText("Copy All to Clipboard")
+            except RuntimeError:
+                pass
+        QTimer.singleShot(1800, _safe_reset_copy)
 
     def _on_export_json(self) -> None:
         """Export all source metadata to a JSON file."""
+        if not self.info:
+            app = QApplication.instance()
+            if app:
+                for w in app.topLevelWidgets():
+                    if hasattr(w, "_get_current_source_info"):
+                        self.info = w._get_current_source_info()
+                        if self.info:
+                            self._rebuild_content()
+                            break
+
         initial_name = "metadata.json"
         if self.info.get("file_name"):
             base = os.path.splitext(self.info["file_name"])[0]
@@ -595,11 +637,23 @@ class ImageInfoWidget(QWidget):
                     json.dump(self.info, f, indent=2, default=str)
                 self.btn_export.setText("✓ Exported!")
                 from PySide6.QtCore import QTimer
-                QTimer.singleShot(1800, lambda: self.btn_export.setText("Export JSON"))
+                def _safe_reset_exp():
+                    try:
+                        if hasattr(self, 'btn_export') and self.btn_export:
+                            self.btn_export.setText("Export JSON")
+                    except RuntimeError:
+                        pass
+                QTimer.singleShot(1800, _safe_reset_exp)
             except Exception:
                 self.btn_export.setText("Export Failed")
                 from PySide6.QtCore import QTimer
-                QTimer.singleShot(1800, lambda: self.btn_export.setText("Export JSON"))
+                def _safe_reset_fail():
+                    try:
+                        if hasattr(self, 'btn_export') and self.btn_export:
+                            self.btn_export.setText("Export JSON")
+                    except RuntimeError:
+                        pass
+                QTimer.singleShot(1800, _safe_reset_fail)
 
     def _on_close_clicked(self) -> None:
         p = self.parent()

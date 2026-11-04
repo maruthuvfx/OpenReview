@@ -65,11 +65,37 @@ try:
 except ImportError:
     pass
 
+# High-Performance Video Engine (PyAV / FFmpeg)
+try:
+    import av
+    hidden_imports.extend(["av", "av.video", "av.codec", "av.format", "av.packet", "av.stream"])
+except ImportError:
+    pass
+
+# Native Rust Acceleration Engine
+try:
+    import openreview_engine
+    hidden_imports.append("openreview_engine")
+except ImportError:
+    pass
+
 binaries = []
 site_packages = Path(sys.prefix) / "Lib" / "site-packages"
 if site_packages.is_dir():
     for dll_path in site_packages.glob("msvcp140*.dll"):
         binaries.append((str(dll_path), "."))
+
+# Bundle native openreview_engine binaries and package files
+try:
+    import openreview_engine
+    engine_pkg_dir = Path(openreview_engine.__file__).parent
+    for pyd_file in engine_pkg_dir.glob("*.pyd"):
+        binaries.append((str(pyd_file), "openreview_engine"))
+    init_py = engine_pkg_dir / "__init__.py"
+    if init_py.exists():
+        datas.append((str(init_py), "openreview_engine"))
+except Exception:
+    pass
 
 a = Analysis(
     [str(src_dir / "openreview" / "app.py")],

@@ -27,6 +27,9 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QSplitter,
     QComboBox,
+    QLineEdit,
+    QGridLayout,
+    QSizePolicy,
     QProgressDialog,
     QApplication,
 )
@@ -327,8 +330,8 @@ class AnnotationManagerWidget(QWidget):
         if isinstance(parent, str) and not source_path:
             source_path, parent = parent, None
         super().__init__(parent)
-        self.setMinimumSize(480, 360)
-        self.setMaximumHeight(520)
+        self.setMinimumWidth(260)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         self.store = annotation_store
         self.clock = clock
@@ -483,52 +486,87 @@ class AnnotationManagerWidget(QWidget):
         self.edit_note.textChanged.connect(self._on_note_text_changed)
         bottom_layout.addWidget(self.edit_note)
 
+        # Dedicated Text Annotations on Canvas Management Section
+        text_grp = QGroupBox("Text Annotations (On Canvas)", bottom_widget)
+        text_layout = QVBoxLayout(text_grp)
+        text_layout.setContentsMargins(6, 6, 6, 6)
+        text_layout.setSpacing(4)
+
+        t_row1 = QHBoxLayout()
+        self.combo_text_annots = QComboBox(text_grp)
+        self.combo_text_annots.addItem("No text annotations on frame", -1)
+        self.combo_text_annots.currentIndexChanged.connect(self._on_text_annot_selected)
+        t_row1.addWidget(self.combo_text_annots, 1)
+
+        self.btn_delete_text_annot = QPushButton("Delete", text_grp)
+        self.btn_delete_text_annot.setObjectName("danger_btn")
+        self.btn_delete_text_annot.setToolTip("Delete selected text annotation from canvas")
+        self.btn_delete_text_annot.setEnabled(False)
+        self.btn_delete_text_annot.clicked.connect(self._on_delete_text_annot_clicked)
+        t_row1.addWidget(self.btn_delete_text_annot)
+        text_layout.addLayout(t_row1)
+
+        t_row2 = QHBoxLayout()
+        self.edit_text_annot = QLineEdit(text_grp)
+        self.edit_text_annot.setPlaceholderText("Edit annotation text...")
+        self.edit_text_annot.setEnabled(False)
+        self.edit_text_annot.returnPressed.connect(self._on_update_text_annot_clicked)
+        t_row2.addWidget(self.edit_text_annot, 1)
+
+        self.btn_update_text_annot = QPushButton("Update", text_grp)
+        self.btn_update_text_annot.setToolTip("Update text on canvas for this annotation")
+        self.btn_update_text_annot.setEnabled(False)
+        self.btn_update_text_annot.clicked.connect(self._on_update_text_annot_clicked)
+        t_row2.addWidget(self.btn_update_text_annot)
+        text_layout.addLayout(t_row2)
+
+        bottom_layout.addWidget(text_grp)
+
         splitter.addWidget(bottom_widget)
-        splitter.setSizes([320, 160])
+        splitter.setSizes([320, 220])
         main_layout.addWidget(splitter)
 
-        # Bottom Action Bar
-        btn_bar = QHBoxLayout()
-        btn_bar.setSpacing(8)
+        # Bottom Action Bar (Clean 2-Row Responsive Grid)
+        btn_grid = QGridLayout()
+        btn_grid.setSpacing(6)
+        btn_grid.setContentsMargins(0, 4, 0, 0)
 
         self.btn_jump = QPushButton("Jump to Frame", self)
         self.btn_jump.setToolTip("Seek timeline to selected annotated frame")
         self.btn_jump.clicked.connect(self._on_jump_clicked)
-        btn_bar.addWidget(self.btn_jump)
+        btn_grid.addWidget(self.btn_jump, 0, 0)
 
         self.btn_clear_frame = QPushButton("Clear Frame", self)
         self.btn_clear_frame.setIcon(get_vfx_icon("delete"))
         self.btn_clear_frame.setObjectName("danger_btn")
         self.btn_clear_frame.setToolTip("Clear annotations on the selected frame")
         self.btn_clear_frame.clicked.connect(self._on_clear_selected_frame)
-        btn_bar.addWidget(self.btn_clear_frame)
+        btn_grid.addWidget(self.btn_clear_frame, 0, 1)
 
-        self.btn_clear_all = QPushButton("Clear All...", self)
+        self.btn_clear_all = QPushButton("Clear All", self)
         self.btn_clear_all.setIcon(get_vfx_icon("delete"))
         self.btn_clear_all.setObjectName("danger_btn")
         self.btn_clear_all.setToolTip("Purge all annotations across the entire clip")
         self.btn_clear_all.clicked.connect(self._on_clear_all_clicked)
-        btn_bar.addWidget(self.btn_clear_all)
-
-        btn_bar.addStretch()
+        btn_grid.addWidget(self.btn_clear_all, 0, 2)
 
         self.btn_export = QPushButton("Export...", self)
         self.btn_export.setIcon(get_vfx_icon("export"))
         self.btn_export.setToolTip("Export annotations to JSON, Report, or Burned-in Images")
         self.btn_export.clicked.connect(self._on_export_clicked)
-        btn_bar.addWidget(self.btn_export)
+        btn_grid.addWidget(self.btn_export, 1, 0)
 
         self.btn_import = QPushButton("Import...", self)
         self.btn_import.setIcon(get_vfx_icon("import"))
         self.btn_import.setToolTip("Import vector annotations from JSON")
         self.btn_import.clicked.connect(self._on_import_clicked)
-        btn_bar.addWidget(self.btn_import)
+        btn_grid.addWidget(self.btn_import, 1, 1)
 
         self.btn_close = QPushButton("Close", self)
         self.btn_close.clicked.connect(self._on_close_clicked)
-        btn_bar.addWidget(self.btn_close)
+        btn_grid.addWidget(self.btn_close, 1, 2)
 
-        main_layout.addLayout(btn_bar)
+        main_layout.addLayout(btn_grid)
 
     def _on_close_clicked(self) -> None:
         p = self.parent()
@@ -630,11 +668,93 @@ class AnnotationManagerWidget(QWidget):
             self.edit_note.blockSignals(True)
             self.edit_note.setPlainText(note)
             self.edit_note.blockSignals(False)
+            self._refresh_text_annotations(frame)
         else:
             self.lbl_selected_frame.setText("Selected Frame: None")
             self.edit_note.blockSignals(True)
             self.edit_note.clear()
             self.edit_note.blockSignals(False)
+            self._refresh_text_annotations(None)
+
+    def _refresh_text_annotations(self, frame: Optional[int] = None) -> None:
+        """Update the text annotations dropdown and editing input for the selected frame."""
+        if frame is None:
+            frame = self.get_selected_frame()
+        self.combo_text_annots.blockSignals(True)
+        self.combo_text_annots.clear()
+        if frame is None:
+            self.combo_text_annots.addItem("No frame selected", -1)
+            self.combo_text_annots.setEnabled(False)
+            self.edit_text_annot.clear()
+            self.edit_text_annot.setEnabled(False)
+            self.btn_update_text_annot.setEnabled(False)
+            self.btn_delete_text_annot.setEnabled(False)
+            self.combo_text_annots.blockSignals(False)
+            return
+
+        text_strokes = self.store.get_text_strokes(frame)
+        if not text_strokes:
+            self.combo_text_annots.addItem("No text annotations on frame", -1)
+            self.combo_text_annots.setEnabled(False)
+            self.edit_text_annot.clear()
+            self.edit_text_annot.setEnabled(False)
+            self.btn_update_text_annot.setEnabled(False)
+            self.btn_delete_text_annot.setEnabled(False)
+            self.combo_text_annots.blockSignals(False)
+            return
+
+        for num, (orig_idx, stroke) in enumerate(text_strokes, start=1):
+            snippet = stroke.text.replace("\n", " ").strip()
+            if len(snippet) > 28:
+                snippet = snippet[:25] + "..."
+            label = f"#{num}: \"{snippet}\""
+            self.combo_text_annots.addItem(label, orig_idx)
+
+        self.combo_text_annots.setEnabled(True)
+        self.edit_text_annot.setEnabled(True)
+        self.btn_update_text_annot.setEnabled(True)
+        self.btn_delete_text_annot.setEnabled(True)
+        self.combo_text_annots.blockSignals(False)
+
+        # Set text input from currently selected combo item
+        self._on_text_annot_selected(self.combo_text_annots.currentIndex())
+
+    def _on_text_annot_selected(self, idx: int) -> None:
+        frame = self.get_selected_frame()
+        orig_idx = self.combo_text_annots.currentData()
+        if frame is None or orig_idx is None or orig_idx < 0:
+            self.edit_text_annot.clear()
+            self.edit_text_annot.setEnabled(False)
+            self.btn_update_text_annot.setEnabled(False)
+            self.btn_delete_text_annot.setEnabled(False)
+            return
+
+        strokes = self.store.get_strokes(frame)
+        if 0 <= orig_idx < len(strokes):
+            self.edit_text_annot.setEnabled(True)
+            self.btn_update_text_annot.setEnabled(True)
+            self.btn_delete_text_annot.setEnabled(True)
+            self.edit_text_annot.setText(strokes[orig_idx].text)
+
+    def _on_update_text_annot_clicked(self) -> None:
+        frame = self.get_selected_frame()
+        orig_idx = self.combo_text_annots.currentData()
+        if frame is None or orig_idx is None or orig_idx < 0:
+            return
+        new_text = self.edit_text_annot.text().strip()
+        if new_text:
+            self.store.update_stroke_text(frame, orig_idx, new_text)
+        else:
+            self.store.remove_stroke(frame, orig_idx)
+        self._refresh_text_annotations(frame)
+
+    def _on_delete_text_annot_clicked(self) -> None:
+        frame = self.get_selected_frame()
+        orig_idx = self.combo_text_annots.currentData()
+        if frame is None or orig_idx is None or orig_idx < 0:
+            return
+        self.store.remove_stroke(frame, orig_idx)
+        self._refresh_text_annotations(frame)
 
     def _on_table_double_clicked(self, item: QTableWidgetItem) -> None:
         self._on_jump_clicked()

@@ -37,6 +37,10 @@ OpenRV_2.0.0_Win10_x64/
 *.manifest
 *.spec.bak
 
+# Rust build artifacts
+target/
+*.whl
+
 # Unit test / coverage
 .pytest_cache/
 .tox/

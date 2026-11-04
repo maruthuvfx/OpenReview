@@ -182,11 +182,52 @@ def extract_media_metadata(file_path: Optional[str]) -> Dict[str, Any]:
         except Exception as e:
             meta["ffprobe_error"] = str(e)
 
-    # 3. OpenCV Fallback for Video Files if ffprobe unavailable or partial
-    from openreview.core.video_reader import is_video_file, get_video_codec_info
+    # 3. PyAV & OpenCV Fallback for Video Files if ffprobe unavailable or partial
+    from openreview.core.video_reader import is_video_file, get_video_codec_info, HAS_AV
     from openreview.core.image_io import is_image_file
 
-    if not ffprobe_success and HAS_CV2 and is_video_file(actual_path):
+    if not ffprobe_success and is_video_file(actual_path):
+        if HAS_AV:
+            try:
+                import av
+                with av.open(actual_path) as container:
+                    if container.streams.video:
+                        v_st = container.streams.video[0]
+                        ctx = v_st.codec_context
+                        if "width" not in meta or not meta["width"]:
+                            meta["width"] = int(ctx.width or v_st.width or 0)
+                        if "height" not in meta or not meta["height"]:
+                            meta["height"] = int(ctx.height or v_st.height or 0)
+                        rate = v_st.guessed_rate or v_st.average_rate
+                        if "fps" not in meta and rate:
+                            meta["fps"] = float(rate)
+                        if "nb_frames" not in meta or not meta["nb_frames"]:
+                            if v_st.frames and v_st.frames > 0:
+                                meta["nb_frames"] = v_st.frames
+                            elif container.duration:
+                                meta["nb_frames"] = max(1, int(round((container.duration / av.time_base) * (meta.get("fps") or 24.0))))
+                        if "video_codec" not in meta:
+                            codec_name = ctx.name or ""
+                            dec_name, family_desc = get_video_codec_info(codec_name)
+                            meta["video_codec"] = f"{family_desc} ({codec_name})"
+                            meta["video_codec_short"] = dec_name
+                            meta["video_codec_tag"] = getattr(ctx, "codec_tag", "") or codec_name
+                        if "pixel_format" not in meta and ctx.pix_fmt:
+                            meta["pixel_format"] = str(ctx.pix_fmt)
+                        if "video_profile" not in meta and ctx.profile:
+                            meta["video_profile"] = str(ctx.profile)
+                    if container.streams.audio and "audio_codec" not in meta:
+                        a_st = container.streams.audio[0]
+                        a_ctx = a_st.codec_context
+                        meta["audio_codec"] = a_ctx.name or ""
+                        meta["audio_sample_rate"] = str(a_ctx.sample_rate or "")
+                        meta["audio_channels"] = a_ctx.channels or 0
+                    if container.bit_rate and "overall_bitrate_str" not in meta:
+                        meta["overall_bitrate_str"] = f"{container.bit_rate // 1000} kbps"
+            except Exception:
+                pass
+
+    if not ffprobe_success and HAS_CV2 and is_video_file(actual_path) and ("width" not in meta or not meta["width"]):
         try:
             cap = cv2.VideoCapture(actual_path)
             if cap.isOpened():

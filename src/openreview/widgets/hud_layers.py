@@ -65,7 +65,7 @@ class HUDLayersWidget(QWidget):
 
         # 1. Search / Filter Input
         self.search_input = QLineEdit(self)
-        self.search_input.setPlaceholderText("Filter passes (e.g. diff, spec, crypto)...")
+        self.search_input.setPlaceholderText("Filter passes (press Enter to solo)...")
         self.search_input.setClearButtonEnabled(True)
         self.search_input.setStyleSheet("""
             QLineEdit {
@@ -81,6 +81,7 @@ class HUDLayersWidget(QWidget):
             }
         """)
         self.search_input.textChanged.connect(self._filter_layers)
+        self.search_input.returnPressed.connect(self._on_search_return_pressed)
         layout.addWidget(self.search_input)
 
         # 2. Main Passes List
@@ -235,6 +236,26 @@ class HUDLayersWidget(QWidget):
         for i in range(self.list_layers.count()):
             item = self.list_layers.item(i)
             item.setHidden(bool(q and q not in item.text().lower()))
+
+    def _on_search_return_pressed(self) -> None:
+        """Instant solo top filtered pass when user presses Enter in search box."""
+        q = self.search_input.text().strip().lower()
+        if not q:
+            return
+        # 1. Exact match takes top priority
+        for i in range(self.list_layers.count()):
+            item = self.list_layers.item(i)
+            if item.text().lower() == q:
+                self.list_layers.setCurrentItem(item)
+                self._on_item_clicked(item)
+                return
+        # 2. First visible item
+        for i in range(self.list_layers.count()):
+            item = self.list_layers.item(i)
+            if not item.isHidden():
+                self.list_layers.setCurrentItem(item)
+                self._on_item_clicked(item)
+                break
 
     def set_current_layer(self, layer: str) -> None:
         self._current_layer = layer

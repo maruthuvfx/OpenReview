@@ -163,19 +163,19 @@ def test_shift_c_toggle_cache_starts_and_stops(qtbot):
     assert win._cache_started is False
     assert win.reader_engine.is_paused is True
 
-    # 1. First Shift+C press: starts Region caching, unpauses reader engine, syncs timeline combo
+    # 1. First Shift+C press: starts Region caching, unpauses reader engine
     win._on_toggle_cache()
     assert win.cache.mode == CacheMode.REGION
     assert win._cache_started is True
     assert win.reader_engine.is_paused is False
-    assert win.timeline.combo_cache_mode.currentData() == "region"
+    assert win.timeline.cache_bar._cache_mode == "region"
 
     # 2. Second Shift+C press: turns Cache OFF and pauses reader engine
     win._on_toggle_cache()
     assert win.cache.mode == CacheMode.OFF
     assert win._cache_started is False
     assert win.reader_engine.is_paused is True
-    assert win.timeline.combo_cache_mode.currentData() == "off"
+    assert win.timeline.cache_bar._cache_mode == "off"
 
     win.close()
 

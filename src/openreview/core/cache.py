@@ -19,6 +19,8 @@ from typing import Dict, List, Optional, Set, Tuple, Union, Any
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 
+from openreview.core.buffer_pool import FrameBufferPool
+
 
 def get_system_ram_stats_mb() -> Tuple[float, float]:
     """
@@ -450,9 +452,27 @@ class RingBufferCache(QObject):
             auto_cleanup=True,
         )
 
+        # Tier 0 Native Accelerator: Rust PyO3 Engine (Zero-GIL parallel decoding & tiered cache)
+        self._rust_engine = None
+        try:
+            import openreview_engine
+            ram_mb = int(self._max_memory_bytes / (1024 * 1024))
+            self._rust_engine = openreview_engine.OpenReviewEngine(ram_limit_mb=max(1024, ram_mb))
+        except Exception:
+            self._rust_engine = None
+
     # --------------------------------------------------------------------------
     # Configuration
     # --------------------------------------------------------------------------
+    def _is_rust_enabled(self) -> bool:
+        if self._rust_engine is None:
+            return False
+        try:
+            from openreview.core.preferences import PreferencesManager
+            return getattr(PreferencesManager.instance().prefs, "enable_rust_engine", True)
+        except Exception:
+            return True
+
     @property
     def mode(self) -> CacheMode:
         return self._mode
@@ -569,6 +589,11 @@ class RingBufferCache(QObject):
             self._max_memory_bytes = int(max(1.0, mb) * 1024 * 1024)
             self._max_layer_memory_bytes = int(self._max_memory_bytes * 0.5)
             self._evict_if_needed(self._current_playhead)
+            if self._rust_engine is not None:
+                try:
+                    self._rust_engine.set_ram_limit_mb(int(max(1.0, mb)))
+                except Exception:
+                    pass
         self._emit_status()
 
     def set_prefetch_range(self, lookahead: int, lookbehind: int) -> None:
@@ -718,10 +743,12 @@ class RingBufferCache(QObject):
                     to_remove.append(k)
             for k in to_remove:
                 b = self._frame_bytes.pop(k, 0)
-                self._frames.pop(k, None)
+                frame_data = self._frames.pop(k, None)
                 self._frame_mtimes.pop(k, None)
                 self._proxy_keys.discard(k)
                 self._used_bytes -= b
+                if isinstance(frame_data, np.ndarray):
+                    FrameBufferPool.instance().release(frame_data)
         self._emit_status()
 
     def release_all_cached_images(self) -> None:
@@ -732,11 +759,20 @@ class RingBufferCache(QObject):
     # Source-Level Cache Access
     # --------------------------------------------------------------------------
     def is_source_frame_proxy(self, source_id: str, frame: int) -> bool:
-        """Check if a specific source frame in RAM is a downsampled proxy."""
+        """Check if a specific source frame in RAM or Rust cache is a downsampled proxy."""
         if not source_id:
             return False
         with self._lock:
-            return (source_id, frame) in self._proxy_keys
+            if (source_id, frame) in self._proxy_keys:
+                return True
+        if self._is_rust_enabled():
+            rust_eng = self._rust_engine
+            try:
+                if frame in rust_eng.get_cached_proxy_frames(source_id):
+                    return True
+            except Exception:
+                pass
+        return False
 
     def is_frame_proxy(self, frame: int, source_id: Optional[str] = None) -> bool:
         """Check if a cached frame is a downsampled proxy."""
@@ -744,10 +780,26 @@ class RingBufferCache(QObject):
             sid = source_id or self._active_source_id
             if sid and (sid, frame) in self._proxy_keys:
                 return True
-            return frame in self._proxy_keys
+            if frame in self._proxy_keys:
+                return True
+        rust_eng = getattr(self, "_rust_engine", None)
+        if rust_eng is not None:
+            try:
+                sid = source_id or self._active_source_id or ""
+                if frame in rust_eng.get_cached_proxy_frames(sid):
+                    return True
+            except Exception:
+                pass
+        return False
 
-    def get_source_frame(self, source_id: str, frame: int, allow_proxy: bool = True) -> Optional[np.ndarray]:
-        """Retrieve a cached frame for a specific input source (RAM first, then Temp Disk)."""
+    def get_source_frame(
+        self,
+        source_id: str,
+        frame: int,
+        allow_proxy: bool = True,
+        prefer_proxy: bool = False,
+    ) -> Optional[np.ndarray]:
+        """Retrieve a cached frame for a specific input source (RAM first, Rust Tiered Cache, then Temp Disk)."""
         if not source_id:
             return None
         with self._lock:
@@ -756,6 +808,31 @@ class RingBufferCache(QObject):
                 ram_res = self._frames.get(key)
                 if ram_res is not None:
                     return ram_res
+
+        # Check native Rust Tiered Cache (Zero-GIL, fast f16 RAM ring + LZ4 disk)
+        if self._is_rust_enabled():
+            rust_eng = self._rust_engine
+            try:
+                # Prioritize lightweight proxy during real-time playback or scrub on constrained hardware
+                if prefer_proxy:
+                    proxy_frame = rust_eng.get_proxy_frame(source_id, frame)
+                    if proxy_frame is not None:
+                        dtype = np.float16 if proxy_frame.is_f16 else np.float32
+                        return np.frombuffer(proxy_frame.as_memoryview(), dtype=dtype).reshape((proxy_frame.height, proxy_frame.width, 4))
+
+                cached = rust_eng.get_frame(source_id, frame)
+                if cached is not None:
+                    dtype = np.float16 if cached.is_f16 else np.float32
+                    return np.frombuffer(cached.as_memoryview(), dtype=dtype).reshape((cached.height, cached.width, 4))
+                # Check for lightweight proxy frame if scrubbing or proxy allowed
+                if allow_proxy:
+                    proxy_frame = rust_eng.get_proxy_frame(source_id, frame)
+                    if proxy_frame is not None:
+                        dtype = np.float16 if proxy_frame.is_f16 else np.float32
+                        return np.frombuffer(proxy_frame.as_memoryview(), dtype=dtype).reshape((proxy_frame.height, proxy_frame.width, 4))
+            except Exception:
+                pass
+
         if self._disk_cache_enabled and self._disk_cache:
             disk_res = self._disk_cache.get(source_id, frame)
             if disk_res is not None:
@@ -763,7 +840,7 @@ class RingBufferCache(QObject):
         return None
 
     def has_source_frame(self, source_id: str, frame: int, allow_proxy: bool = True) -> bool:
-        """Check if a specific source frame is in RAM or Temp Disk cache."""
+        """Check if a specific source frame is in RAM, Rust cache, or Temp Disk cache."""
         if not source_id:
             return False
         with self._lock:
@@ -771,16 +848,37 @@ class RingBufferCache(QObject):
             if key in self._frames:
                 if allow_proxy or (key not in self._proxy_keys):
                     return True
+
+        if self._is_rust_enabled():
+            rust_eng = self._rust_engine
+            try:
+                if frame in rust_eng.get_cached_frames(source_id):
+                    return True
+                if allow_proxy and frame in rust_eng.get_cached_proxy_frames(source_id):
+                    return True
+            except Exception:
+                pass
+
         if self._disk_cache_enabled and self._disk_cache:
             return self._disk_cache.has(source_id, frame)
         return False
 
     def has_source_frame_ram(self, source_id: str, frame: int) -> bool:
-        """Check if frame is in Tier-1 RAM cache specifically."""
+        """Check if frame is in Tier-1 RAM cache specifically (Python RAM or Rust Tiered Cache)."""
         if not source_id:
             return False
         with self._lock:
-            return (source_id, frame) in self._frames
+            if (source_id, frame) in self._frames:
+                return True
+        if self._is_rust_enabled():
+            try:
+                if frame in self._rust_engine.get_cached_frames(source_id):
+                    return True
+                if frame in self._rust_engine.get_cached_proxy_frames(source_id):
+                    return True
+            except Exception:
+                pass
+        return False
 
     def has_source_frame_disk(self, source_id: str, frame: int) -> bool:
         """Check if frame is in Tier-2 Temp Disk cache specifically."""
@@ -800,6 +898,17 @@ class RingBufferCache(QObject):
         """Store a frame for a specific source into the shared RAM pool (and optionally Temp Disk)."""
         if self._mode == CacheMode.OFF or not source_id or image_data is None:
             return
+
+        # Zero-loss RAM compression: Float32 frames are stored as Float16 (half-float),
+        # cutting memory consumption by 50% and matching native OpenGL RGBA16F texture upload (0ms CPU conversion).
+        if isinstance(image_data, np.ndarray) and image_data.dtype == np.float32:
+            try:
+                from openreview.core.preferences import PreferencesManager
+                mode = PreferencesManager.instance().get_effective_texture_mode()
+                if mode != "rgba32f":
+                    image_data = image_data.astype(np.float16, copy=False)
+            except Exception:
+                image_data = image_data.astype(np.float16, copy=False)
 
         byte_size = image_data.nbytes if isinstance(image_data, np.ndarray) else 0
         if byte_size == 0:
@@ -866,6 +975,15 @@ class RingBufferCache(QObject):
         if self._mode == CacheMode.OFF or not source_id or not layer or image_data is None:
             return
 
+        if isinstance(image_data, np.ndarray) and image_data.dtype == np.float32:
+            try:
+                from openreview.core.preferences import PreferencesManager
+                mode = PreferencesManager.instance().get_effective_texture_mode()
+                if mode != "rgba32f":
+                    image_data = image_data.astype(np.float16, copy=False)
+            except Exception:
+                image_data = image_data.astype(np.float16, copy=False)
+
         byte_size = image_data.nbytes if isinstance(image_data, np.ndarray) else 0
         if byte_size == 0:
             return
@@ -901,14 +1019,18 @@ class RingBufferCache(QObject):
             keys_to_remove = [k for k in self._frames.keys() if isinstance(k, tuple) and k[0] == source_id]
             for k in keys_to_remove:
                 self._used_bytes -= self._frame_bytes.pop(k, 0)
-                self._frames.pop(k, None)
+                frame_data = self._frames.pop(k, None)
                 self._frame_mtimes.pop(k, None)
                 self._proxy_keys.discard(k)
+                if isinstance(frame_data, np.ndarray):
+                    FrameBufferPool.instance().release(frame_data)
 
             layer_keys = [k for k in self._layer_cache.keys() if k[0] == source_id]
             for k in layer_keys:
                 self._layer_used_bytes -= self._layer_bytes.pop(k, 0)
-                self._layer_cache.pop(k, None)
+                layer_data = self._layer_cache.pop(k, None)
+                if isinstance(layer_data, np.ndarray):
+                    FrameBufferPool.instance().release(layer_data)
 
         if self._disk_cache:
             self._disk_cache.clear_source(source_id)
@@ -920,9 +1042,11 @@ class RingBufferCache(QObject):
         with self._lock:
             if key in self._frames:
                 self._used_bytes -= self._frame_bytes.pop(key, 0)
-                self._frames.pop(key, None)
+                frame_data = self._frames.pop(key, None)
                 self._frame_mtimes.pop(key, None)
                 self._proxy_keys.discard(key)
+                if isinstance(frame_data, np.ndarray):
+                    FrameBufferPool.instance().release(frame_data)
         if self._disk_cache:
             self._disk_cache.delete(source_id, frame)
         self._emit_status()
@@ -934,14 +1058,38 @@ class RingBufferCache(QObject):
             return self._frame_mtimes.get(key)
 
     def get_source_cached_frames(self, source_id: str, allow_proxy: bool = True) -> Set[int]:
-        """Return the set of RAM-cached frame numbers for a specific source."""
+        """Return the set of RAM-cached frame numbers for a specific source (Python RAM + Rust Tiered Cache)."""
         if not source_id:
             return set()
         with self._lock:
-            return {
+            frames = {
                 k[1] for k in self._frames.keys()
                 if isinstance(k, tuple) and k[0] == source_id and (allow_proxy or k not in self._proxy_keys)
             }
+        if self._is_rust_enabled():
+            try:
+                frames |= set(self._rust_engine.get_cached_frames(source_id))
+                if allow_proxy:
+                    frames |= set(self._rust_engine.get_cached_proxy_frames(source_id))
+            except Exception:
+                pass
+        return frames
+
+    def get_source_proxy_cached_frames(self, source_id: str) -> Set[int]:
+        """Return the set of downsampled proxy-cached frames for a specific source."""
+        if not source_id:
+            return set()
+        with self._lock:
+            frames = {
+                k[1] for k in self._frames.keys()
+                if isinstance(k, tuple) and k[0] == source_id and k in self._proxy_keys
+            }
+        if self._is_rust_enabled():
+            try:
+                frames |= set(self._rust_engine.get_cached_proxy_frames(source_id))
+            except Exception:
+                pass
+        return frames
 
     def get_source_disk_cached_frames(self, source_id: str) -> Set[int]:
         """Return the set of Temp-disk-cached frame numbers for a specific source."""
@@ -992,10 +1140,25 @@ class RingBufferCache(QObject):
                 return allow_proxy or (frame not in self._proxy_keys)
             return False
 
-    def put_frame(self, frame: int, image_data: Union[np.ndarray, tuple], is_proxy: bool = False) -> None:
+    def put_frame(self, frame: int, image_data: Union[np.ndarray, tuple], is_proxy: bool = False, compress_f16: bool = False) -> None:
         """Store a frame array or (primary, reference) tuple into the cache."""
         if self._mode == CacheMode.OFF:
             return
+
+        if compress_f16:
+            try:
+                from openreview.core.preferences import PreferencesManager
+                mode = PreferencesManager.instance().get_effective_texture_mode()
+                if mode != "rgba32f":
+                    if isinstance(image_data, np.ndarray) and image_data.dtype == np.float32:
+                        image_data = image_data.astype(np.float16, copy=False)
+                    elif isinstance(image_data, tuple):
+                        image_data = tuple(
+                            x.astype(np.float16, copy=False) if (isinstance(x, np.ndarray) and x.dtype == np.float32) else x
+                            for x in image_data
+                        )
+            except Exception:
+                pass
 
         if isinstance(image_data, np.ndarray):
             byte_size = image_data.nbytes
@@ -1030,21 +1193,39 @@ class RingBufferCache(QObject):
     def clear(self) -> None:
         """Clear all cached frames from memory and temp disk."""
         with self._lock:
+            for arr in self._frames.values():
+                if isinstance(arr, np.ndarray):
+                    FrameBufferPool.instance().release(arr)
             self._frames.clear()
             self._frame_bytes.clear()
             self._frame_mtimes.clear()
             self._proxy_keys.clear()
             self._used_bytes = 0
+            for arr in self._layer_cache.values():
+                if isinstance(arr, np.ndarray):
+                    FrameBufferPool.instance().release(arr)
             self._layer_cache.clear()
             self._layer_bytes.clear()
             self._layer_used_bytes = 0
         if self._disk_cache:
             self._disk_cache.clear()
+        rust_eng = getattr(self, "_rust_engine", None)
+        if rust_eng is not None:
+            try:
+                rust_eng.clear_cache()
+            except Exception:
+                pass
         self._emit_status()
 
     def update_playhead(self, playhead: int) -> None:
         """Inform the cache of the current playhead position to prioritize prefetch/retention."""
         self._current_playhead = playhead
+        rust_eng = getattr(self, "_rust_engine", None)
+        if rust_eng is not None:
+            try:
+                rust_eng.update_playhead(playhead)
+            except Exception:
+                pass
 
     def get_cached_frames(self, allow_proxy: bool = True) -> Set[int]:
         """Return cached frame numbers for the active source context or flat keys."""
@@ -1058,6 +1239,18 @@ class RingBufferCache(QObject):
                         out.add(k[1])
                 elif isinstance(k, int):
                     out.add(k)
+
+            rust_eng = getattr(self, "_rust_engine", None)
+            if rust_eng is not None and self._active_source_id:
+                try:
+                    for frm in rust_eng.get_cached_frames(self._active_source_id):
+                        out.add(frm)
+                    if allow_proxy:
+                        for frm in rust_eng.get_cached_proxy_frames(self._active_source_id):
+                            out.add(frm)
+                except Exception:
+                    pass
+
             return out
 
     def get_prefetch_targets(
@@ -1090,12 +1283,19 @@ class RingBufferCache(QObject):
         return window_start, window_end
 
     def get_memory_stats(self) -> Tuple[float, float, float]:
-        """Return (used_mb, max_mb, percent_used)."""
+        """Return (used_mb, max_mb, percent_used) including native Rust cache RAM."""
         with self._lock:
-            used_mb = self._used_bytes / (1024.0 * 1024.0)
-            max_mb = self._max_memory_bytes / (1024.0 * 1024.0)
-            pct = (self._used_bytes / self._max_memory_bytes) * 100.0 if self._max_memory_bytes > 0 else 0.0
-            return used_mb, max_mb, pct
+            total_used_bytes = self._used_bytes
+            max_bytes = self._max_memory_bytes
+        if self._is_rust_enabled():
+            try:
+                total_used_bytes += self._rust_engine.get_used_ram_bytes()
+            except Exception:
+                pass
+        used_mb = total_used_bytes / (1024.0 * 1024.0)
+        max_mb = max_bytes / (1024.0 * 1024.0)
+        pct = (total_used_bytes / max_bytes) * 100.0 if max_bytes > 0 else 0.0
+        return used_mb, max_mb, pct
 
     # --------------------------------------------------------------------------
     # Internal Eviction
@@ -1173,10 +1373,12 @@ class RingBufferCache(QObject):
                         pass
 
             b = self._frame_bytes.pop(k, 0)
-            self._frames.pop(k, None)
+            frame_data = self._frames.pop(k, None)
             self._frame_mtimes.pop(k, None)
             self._proxy_keys.discard(k)
             self._used_bytes -= b
+            if isinstance(frame_data, np.ndarray):
+                FrameBufferPool.instance().release(frame_data)
 
     def _emit_status(self, force: bool = False) -> None:
         now = time.monotonic()

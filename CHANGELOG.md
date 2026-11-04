@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.0.0] - 2026-11-04
+
+### Architecture Milestone: Native Rust Engine
+- **Native Rust Acceleration Engine (`crates/openreview-engine`)**: Major architecture transition incorporating compiled Rust extensions (`openreview_engine`) with PyO3, Rayon parallel work-stealing decoders, memory-mapped I/O (`memmap2`), and LZ4 NVMe cache streaming.
+- **50% RAM Savings**: Native half-float (`f16`) RGBA frame buffers in memory reducing memory consumption from 31.6 MB/frame down to 15.8 MB/frame on 1080p HDR plates.
+
+### Performance Benchmark Results (v2.0.0 Rust vs v1.3.0 Python)
+| Performance Metric | v1.3.0 (Python Baseline) | v2.0.0 (Native Rust Engine) | Speedup / Improvement |
+| :--- | :--- | :--- | :--- |
+| **Multi-Channel Contact Sheet (8 passes)** | 63.05 ms / sheet | **12.14 ms / sheet** | **5.2x Faster** (Direct Rayon single-pass parse) |
+| **VFX Sequence Discovery (1,200 frames)** | 6.18 ms | **1.91 ms** | **3.2x Faster** (Native parallel directory scanner) |
+| **Frame Buffer Allocation Overhead** | 27.00 us / frame | **3.96 us / frame** | **7.0x Faster** (92.6% pool hit ratio, Zero GC) |
+| **Async Scopes GUI Dispatch Stall** | 247.37 ms (GUI Frozen) | **0.11 ms** | **2,138x Latency Reduction** (Drop-free 60 FPS) |
+| **Video Reverse Scrubbing (GOP Cache)** | 39.73 ms / frame | **0.11 ms / frame** | **355.9x Faster** (Instant in-memory GOP seek) |
+| **GPU Texture Upload Dispatch (PBO DMA)** | 66.25 ms / frame | **3.09 us / frame** | **21,441x Latency Reduction** (Decoupled DMA) |
+| **HDR Frame Memory Footprint (1080p)** | 31.6 MB / frame (f32) | **15.8 MB / frame (f16)** | **50% Memory Savings** |
+
+### Added
+- **Multi-Channel EXR Matrix & Routing (`hud_channel_matrix.py`, `exr_matrix.py`)**: Interactive matrix grid for routing arbitrary EXR channels (Color, Diffuse, Specular, Normals, Depth, Cryptomatte) to RGBA viewports with quick soloing presets.
+- **Batch Media Export Queue & Deliverables Manager (`batch_export_dialog.py`, `batch_export.py`)**: Dedicated batch export manager supporting multi-job queues, Apple ProRes (422/4444), H.264, H.265, and image sequence deliverables with hardware acceleration autodetection (NVENC, QSV, AMF, VideoToolbox).
+- **Studio Workspaces Manager (`workspaces.py`)**: Built-in production layout presets including "Review & Dailies", "Color & QC", "Comp Analysis", and "Multi-Channel EXR", with persistent custom workspace creation and hotkey switching.
+- **Interactive Color Sliders Overlay (`color_sliders_overlay.py`)**: Dynamic viewport overlay with precision ruler sliders for Gain, Gamma, Saturation, and Hue, supporting live two-way synchronization with the top control bar.
+- **Hierarchical Metadata Tree Inspector (`metadata_tree_widget.py`, `metadata_tree.py`)**: Unified multi-domain attribute inspector organizing production metadata into Pinned Key Attributes, OpenEXR Headers, ExifTool camera tags, Video Codecs, and OCIO transforms with instant text filtering.
+- **Asynchronous Off-Thread Scopes Engine (`hud_scopes_async.py`)**: Decoupled background calculation for Waveform, Vectorscope, and Histogram monitors, completely eliminating main GUI thread stalls during 4K/8K playback.
+- **Audio Micro-Scrubber with De-Clicking (`micro_scrubber.py`)**: Sub-frame accurate audio transport engine featuring cosine attack/decay envelopes to eliminate playback audio pop/click artifacts during scrub.
+- **Zero-Copy Frame Buffer Pool (`buffer_pool.py`)**: High-throughput memory pool recycling large image array buffers across decode and playback cycles.
+- **OCIO 3D LUT Baker (`ocio_baker.py`)**: High-speed LUT baking engine with analytical ACES support, multi-view prewarming, and LRU cache eviction.
+
+---
+
 ## [1.3.0] - 2026-11-01
 
 ### Added

@@ -577,9 +577,11 @@ class CompactCacheBar(QWidget):
         cache_mode: str = "off",
         disk_cached_frames: Optional[Set[int]] = None,
         disk_pct_used: float = 0.0,
+        proxy_cached_frames: Optional[Set[int]] = None,
     ) -> None:
         self._cached_frames = cached_frames
         self._disk_cached_frames = set(disk_cached_frames) if disk_cached_frames is not None else set()
+        self._proxy_cached_frames = set(proxy_cached_frames) if proxy_cached_frames is not None else set()
         self._percent_used = pct_used
         self._disk_percent_used = disk_pct_used
         self._cache_mode = cache_mode
@@ -638,7 +640,19 @@ class CompactCacheBar(QWidget):
                     seg_w = max(1, int(inner_w / float(span)) + 1)
                     painter.fillRect(x, 2, seg_w, h - 4, QColor(230, 126, 34, 200))
 
-        # 2. Draw RAM cached frames (Emerald Green)
+        # 1.5. Draw Proxy cached frames (Cyan / Sky Blue)
+        proxy_frames = getattr(self, "_proxy_cached_frames", None)
+        if proxy_frames:
+            proxy_color = QColor(0, 188, 212, 210)  # Cyan
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(proxy_color)
+            for f in proxy_frames:
+                if start <= f <= end and f not in self._cached_frames:
+                    x = 2 + int(((f - start) / float(span)) * inner_w)
+                    seg_w = max(1, int(inner_w / float(span)) + 1)
+                    painter.fillRect(x, 2, seg_w, h - 4, proxy_color)
+
+        # 2. Draw RAM full-resolution cached frames (Emerald Green)
         painter.setPen(Qt.PenStyle.NoPen)
         seg_color = QColor(46, 204, 113, 220) if self._cache_mode != "region" else QColor(39, 174, 96, 230)
         painter.setBrush(seg_color)
@@ -972,6 +986,8 @@ class TimelineWidget(QFrame):
         self.fps_spin = QDoubleSpinBox(self)
         self.fps_spin.setRange(0.1, 240.0)
         self.fps_spin.setValue(self.clock.fps)
+        self.fps_spin.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.fps_spin.wheelEvent = lambda event: event.ignore()
         self.fps_spin.hide()
         self.fps_spin.valueChanged.connect(lambda v: self.clock.set_fps(float(v)))
 
@@ -995,20 +1011,7 @@ class TimelineWidget(QFrame):
         # Divider
         transport_row.addSpacing(6)
 
-        # Cache Mode Dropdown (Defaults to Cache: OFF)
-        self.combo_cache_mode = QComboBox(self)
-        self.combo_cache_mode.setToolTip("RAM Cache Mode")
-        self.combo_cache_mode.setMinimumWidth(105)
-        self.combo_cache_mode.setMaximumWidth(125)
-        self.combo_cache_mode.addItem("Cache: OFF", "off")
-        self.combo_cache_mode.addItem("Play-Ahead", "play_ahead")
-        self.combo_cache_mode.addItem("In/Out Region", "region")
-        self.combo_cache_mode.addItem("Full Sequence", "all")
-        self.combo_cache_mode.setCurrentIndex(0)  # Default to Cache: OFF
-        self.combo_cache_mode.currentIndexChanged.connect(self._on_cache_combo_changed)
-        transport_row.addWidget(self.combo_cache_mode)
-
-        # Cache Status / Progress Bar next to the dropdown menu
+        # Cache Status / Progress Bar on transport row
         self.cache_bar = CompactCacheBar(self.clock, self)
         self.compact_cache_bar = self.cache_bar
         self.cache_bar.cycle_mode_requested.connect(self.cache_mode_cycle_requested.emit)
@@ -1156,6 +1159,10 @@ class TimelineWidget(QFrame):
             self.magnified_popup.show()
             self.magnified_popup.raise_()
             self.magnified_popup.update()
+        if target_parent and hasattr(target_parent, "children"):
+            for child in target_parent.children():
+                if hasattr(child, "auto_center_in_parent") and child != self.magnified_popup:
+                    child.auto_center_in_parent()
 
     def focus_goto_frame(self) -> None:
         """Focus Goto Frame spinbox and select all text for immediate typing (Ctrl+G)."""
@@ -1297,10 +1304,7 @@ class TimelineWidget(QFrame):
             self.btn_loop.setIcon(get_svg_icon("loop_once", color_normal="#cccccc", color_active="#e5a823", size=14))
             self.btn_loop.setToolTip("Loop Mode: Play Once (Stop at Out)")
 
-    def _on_cache_combo_changed(self, idx: int) -> None:
-        mode_val = self.combo_cache_mode.itemData(idx)
-        if mode_val:
-            self.cache_mode_selected.emit(str(mode_val))
+
 
     def _on_handles_applied(self) -> None:
         text = self.combo_handles.currentText().strip()
@@ -1336,19 +1340,16 @@ class TimelineWidget(QFrame):
         cache_mode: str = "off",
         disk_cached_frames: Optional[Set[int]] = None,
         disk_pct_used: float = 0.0,
+        proxy_cached_frames: Optional[Set[int]] = None,
     ) -> None:
-        mode_idx_map = {"off": 0, "play_ahead": 1, "region": 2, "all": 3}
-        idx = mode_idx_map.get(cache_mode, 0)
-        if hasattr(self, "combo_cache_mode") and self.combo_cache_mode.currentIndex() != idx:
-            self.combo_cache_mode.blockSignals(True)
-            self.combo_cache_mode.setCurrentIndex(idx)
-            self.combo_cache_mode.blockSignals(False)
+
         self.cache_bar.update_cache_data(
             cached_frames,
             pct_used,
             cache_mode,
             disk_cached_frames=disk_cached_frames,
             disk_pct_used=disk_pct_used,
+            proxy_cached_frames=proxy_cached_frames,
         )
         self.ruler.set_cached_frames(cached_frames, disk_frames=disk_cached_frames)
 

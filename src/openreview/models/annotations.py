@@ -128,6 +128,37 @@ class AnnotationStore(QObject):
             self._redo_stack[frame].clear()
         self.annotations_changed.emit(frame)
 
+    def update_stroke_text(self, frame: int, stroke_index: int, new_text: str) -> bool:
+        """Update the text content of a specific text stroke on given frame with undo support."""
+        strokes = self._strokes_by_frame.get(frame)
+        if not strokes or not (0 <= stroke_index < len(strokes)):
+            return False
+        if strokes[stroke_index].shape_type != ShapeType.TEXT:
+            return False
+        self._save_undo_state(frame)
+        strokes[stroke_index].text = new_text
+        if frame in self._redo_stack:
+            self._redo_stack[frame].clear()
+        self.annotations_changed.emit(frame)
+        return True
+
+    def remove_stroke(self, frame: int, stroke_index: int) -> bool:
+        """Remove a specific stroke on given frame with undo support."""
+        strokes = self._strokes_by_frame.get(frame)
+        if not strokes or not (0 <= stroke_index < len(strokes)):
+            return False
+        self._save_undo_state(frame)
+        strokes.pop(stroke_index)
+        if frame in self._redo_stack:
+            self._redo_stack[frame].clear()
+        self.annotations_changed.emit(frame)
+        return True
+
+    def get_text_strokes(self, frame: int) -> List[Tuple[int, Stroke]]:
+        """Return list of (original_index, stroke) for all text strokes on frame."""
+        strokes = self._strokes_by_frame.get(frame, [])
+        return [(i, s) for i, s in enumerate(strokes) if s.shape_type == ShapeType.TEXT]
+
     def clear_frame(self, frame: int, clear_note: bool = False) -> None:
         """Clear all strokes on the specified frame, optionally clearing note."""
         changed = False
@@ -144,7 +175,7 @@ class AnnotationStore(QObject):
     def undo(self, frame: int) -> None:
         """Undo last action on current frame."""
         if frame in self._undo_stack and self._undo_stack[frame]:
-            current = self.get_strokes(frame)
+            current = [Stroke.from_dict(s.to_dict()) for s in self.get_strokes(frame)]
             if frame not in self._redo_stack:
                 self._redo_stack[frame] = []
             self._redo_stack[frame].append(current)
@@ -156,7 +187,7 @@ class AnnotationStore(QObject):
     def redo(self, frame: int) -> None:
         """Redo last undone action on current frame."""
         if frame in self._redo_stack and self._redo_stack[frame]:
-            current = self.get_strokes(frame)
+            current = [Stroke.from_dict(s.to_dict()) for s in self.get_strokes(frame)]
             if frame not in self._undo_stack:
                 self._undo_stack[frame] = []
             self._undo_stack[frame].append(current)
@@ -182,8 +213,9 @@ class AnnotationStore(QObject):
     def _save_undo_state(self, frame: int) -> None:
         if frame not in self._undo_stack:
             self._undo_stack[frame] = []
-        # Save shallow copy of list of strokes
-        self._undo_stack[frame].append(list(self._strokes_by_frame.get(frame, [])))
+        # Save deep copy of strokes so stroke property updates are properly restored on undo
+        copied = [Stroke.from_dict(s.to_dict()) for s in self._strokes_by_frame.get(frame, [])]
+        self._undo_stack[frame].append(copied)
 
     def clear_all(self) -> None:
         """Clear annotations and notes across all frames."""

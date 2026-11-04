@@ -97,6 +97,37 @@ def detect_image_sequence(target_path: str) -> Optional[SequenceInfo]:
     if norm_target in _SEQUENCE_CACHE:
         return _SEQUENCE_CACHE[norm_target]
 
+    # Tier 0 Native Acceleration: Multi-threaded Rust directory scanner
+    try:
+        from openreview.core.preferences import PreferencesManager
+        enable_rust = getattr(PreferencesManager.instance().prefs, "enable_rust_engine", True)
+    except Exception:
+        enable_rust = True
+
+    if enable_rust:
+        try:
+            import openreview_engine
+            native_info = openreview_engine.scan_sequence(norm_target)
+            if native_info is not None:
+                seq_info = SequenceInfo(
+                    directory=native_info.directory,
+                    prefix=native_info.prefix,
+                    separator=native_info.separator,
+                    padding=native_info.padding,
+                    extension=native_info.extension,
+                    start_frame=native_info.start_frame,
+                    end_frame=native_info.end_frame,
+                    available_frames=set(native_info.available_frames),
+                    missing_frames=set(native_info.missing_frames),
+                )
+                _SEQUENCE_CACHE[norm_target] = seq_info
+                for f in list(seq_info.available_frames)[:100]:
+                    fp = os.path.normpath(seq_info.frame_path(f))
+                    _SEQUENCE_CACHE[fp] = seq_info
+                return seq_info
+        except Exception:
+            pass
+
     if os.path.isdir(target_path):
         directory = target_path
         sample_file = None
@@ -180,6 +211,12 @@ class DiskSequenceReader(MediaReader):
     def __init__(self, sequence_info: SequenceInfo, active_layer: Optional[str] = None):
         self.seq = sequence_info
         self.active_layer = active_layer
+        self.active_mapping = None
+
+    def set_matrix_mapping(self, mapping: Optional[Any]) -> None:
+        self.active_mapping = mapping
+        self._last_valid_frame_data = None
+        self._last_valid_frame_idx = None
         self._last_valid_frame_data: Optional[np.ndarray] = None
         self._last_valid_frame_idx: Optional[int] = None
         self._cached_width = 1920
@@ -196,7 +233,7 @@ class DiskSequenceReader(MediaReader):
 
         if os.path.exists(path):
             from openreview.core.image_io import read_image_file
-            arr = read_image_file(path, layer=self.active_layer)
+            arr = read_image_file(path, layer=self.active_layer, as_f16=True, mapping=self.active_mapping)
             if arr is not None:
                 self._last_valid_frame_data = arr
                 self._last_valid_frame_idx = frame
