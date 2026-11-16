@@ -351,6 +351,26 @@ QSplitter::handle:hover {
     background: #e5a823;
 }
 
+/* Tables and Item Views */
+QTableWidget, QTableView {
+    background-color: #141414;
+    alternate-background-color: #1c1c1c;
+    color: #e0e0e0;
+    gridline-color: #262626;
+    selection-background-color: #3d3215;
+    selection-color: #ffffff;
+}
+
+QTableWidget::item:selected, QTableView::item:selected {
+    background-color: #3d3215;
+    color: #ffffff;
+}
+
+QTableWidget::item:selected:!active, QTableView::item:selected:!active {
+    background-color: #2e2612;
+    color: #ffffff;
+}
+
 /* Tabified Dock Tabs */
 QDockWidget {
     color: #d8d8d8;

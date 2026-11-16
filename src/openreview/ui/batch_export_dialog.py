@@ -119,11 +119,20 @@ class BatchExportDialog(QDialog):
             }
             QTableWidget {
                 background-color: #141414;
+                alternate-background-color: #1c1c1c;
                 border: 1px solid #333333;
                 gridline-color: #242424;
                 color: #e0e0e0;
-                selection-background-color: #3a321a;
+                selection-background-color: #3d3215;
                 selection-color: #ffffff;
+            }
+            QTableWidget::item:selected {
+                background-color: #3d3215;
+                color: #ffffff;
+            }
+            QTableWidget::item:selected:!active {
+                background-color: #2e2612;
+                color: #ffffff;
             }
             QHeaderView::section {
                 background-color: #222222;

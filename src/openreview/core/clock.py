@@ -95,6 +95,16 @@ class PlaybackClock(QObject):
         return self._fps
 
     @property
+    def duration(self) -> int:
+        """Total frame duration of the active timeline range (end_frame - start_frame + 1)."""
+        return max(0, self._end_frame - self._start_frame + 1)
+
+    @property
+    def in_out_duration(self) -> int:
+        """Total frame duration of the active in/out range (out_frame - in_frame + 1)."""
+        return max(0, self._out_frame - self._in_frame + 1)
+
+    @property
     def is_playing(self) -> bool:
         return self._is_playing
 
@@ -373,18 +383,18 @@ class PlaybackClock(QObject):
     set_current_frame = set_frame
     seek = set_frame
 
-    def step_forward(self, count: int = 1) -> None:
-        """Step forward by N frames."""
+    def step_forward(self, count: int = 1, wrap: bool = True) -> None:
+        """Step forward by N frames. If wrap is False, clamps at out_frame."""
         target = self._current_frame + count
         if target > self._out_frame:
-            target = self._in_frame
+            target = self._in_frame if wrap else self._out_frame
         self.set_frame(target)
 
-    def step_backward(self, count: int = 1) -> None:
-        """Step backward by N frames."""
+    def step_backward(self, count: int = 1, wrap: bool = True) -> None:
+        """Step backward by N frames. If wrap is False, clamps at in_frame."""
         target = self._current_frame - count
         if target < self._in_frame:
-            target = self._out_frame
+            target = self._out_frame if wrap else self._in_frame
         self.set_frame(target)
 
     def first_frame(self) -> None:

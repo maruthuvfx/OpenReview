@@ -177,12 +177,73 @@ class MicroBufferAudioScrubber(QObject):
     def set_volume(self, volume: float) -> None:
         self._volume = max(0.0, min(1.0, float(volume)))
         if self._sink and not self._is_muted:
-            self._sink.setVolume(self._volume)
+            try:
+                self._sink.setVolume(self._volume)
+            except (RuntimeError, Exception):
+                pass
 
     def set_muted(self, muted: bool) -> None:
         self._is_muted = bool(muted)
         if self._sink:
-            self._sink.setVolume(0.0 if self._is_muted else self._volume)
+            try:
+                self._sink.setVolume(0.0 if self._is_muted else self._volume)
+            except (RuntimeError, Exception):
+                pass
+
+    def _ensure_io_ready(self) -> bool:
+        """Check whether self._io is still alive and writable. Re-initialize if C++ object was deleted."""
+        if self._sink is None or self._io is None:
+            self._init_audio_sink()
+            if self._sink is None or self._io is None:
+                return False
+
+        try:
+            if self._io.isWritable():
+                return True
+        except (RuntimeError, Exception):
+            # C++ object was deleted or invalidated by Qt
+            pass
+
+        # Attempt to recover by restarting the sink or recreating it
+        self._io = None
+        try:
+            if self._sink is not None:
+                try:
+                    self._io = self._sink.start()
+                    if self._sink.state() != QAudio.State.SuspendedState:
+                        self._sink.suspend()
+                    if self._io:
+                        try:
+                            if self._io.isWritable():
+                                return True
+                        except (RuntimeError, Exception):
+                            pass
+                except Exception:
+                    self._io = None
+
+            # Full re-initialization if restart didn't work
+            if self._sink is not None:
+                try:
+                    self._sink.stop()
+                except Exception:
+                    pass
+                try:
+                    self._sink.deleteLater()
+                except Exception:
+                    pass
+                self._sink = None
+
+            self._init_audio_sink()
+            if self._io is not None:
+                try:
+                    return bool(self._io.isWritable())
+                except (RuntimeError, Exception):
+                    return False
+        except Exception as e:
+            logger.debug("MicroBufferAudioScrubber: Error recovering audio sink: %s", e)
+            return False
+
+        return False
 
     # --------------------------------------------------------------------------
     # Micro-Buffer Scrubbing Execution
@@ -202,7 +263,7 @@ class MicroBufferAudioScrubber(QObject):
         if pcm is None or len(pcm) == 0:
             return False
 
-        if not self._io or not self._io.isWritable():
+        if not self._ensure_io_ready():
             return False
 
         now = time.monotonic()
@@ -275,30 +336,38 @@ class MicroBufferAudioScrubber(QObject):
 
         # Hardware Output Stream
         try:
+            if not self._ensure_io_ready():
+                return False
+
             if self._sink and self._sink.state() == QAudio.State.SuspendedState:
                 self._sink.resume()
 
-            self._io.write(chunk.tobytes())
-            # Auto-suspend shortly after chunk completes to preserve dead silence when stationary
-            timeout_ms = int(chunk_duration * 1000.0) + 15
-            self._silence_timer.start(timeout_ms)
-            return True
-        except Exception as e:
+            if self._io:
+                self._io.write(chunk.tobytes())
+                # Auto-suspend shortly after chunk completes to preserve dead silence when stationary
+                timeout_ms = int(chunk_duration * 1000.0) + 15
+                self._silence_timer.start(timeout_ms)
+                return True
+            return False
+        except (RuntimeError, Exception) as e:
             logger.debug("MicroBufferAudioScrubber write error: %s", e)
+            self._io = None
             return False
 
     def stop(self) -> None:
         """Suspend hardware playback immediately."""
         self._silence_timer.stop()
-        if self._sink and self._sink.state() != QAudio.State.SuspendedState:
+        if self._sink:
             try:
-                self._sink.suspend()
-            except Exception:
+                if self._sink.state() != QAudio.State.SuspendedState:
+                    self._sink.suspend()
+            except (RuntimeError, Exception):
                 pass
 
     def _on_silence_timeout(self) -> None:
-        if self._sink and self._sink.state() != QAudio.State.SuspendedState:
+        if self._sink:
             try:
-                self._sink.suspend()
-            except Exception:
+                if self._sink.state() != QAudio.State.SuspendedState:
+                    self._sink.suspend()
+            except (RuntimeError, Exception):
                 pass

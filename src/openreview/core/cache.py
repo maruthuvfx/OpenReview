@@ -435,6 +435,7 @@ class RingBufferCache(QObject):
         self._frames: Dict[Any, Any] = {}
         self._frame_bytes: Dict[Any, int] = {}
         self._frame_mtimes: Dict[Any, float] = {}
+        self._frame_access_times: Dict[Any, float] = {}
         self._used_bytes: int = 0
 
         # Tier 2 Storage: Lazy raw multi-channel / pass layer cache
@@ -538,7 +539,8 @@ class RingBufferCache(QObject):
 
     def set_active_source(self, source_id: Optional[str]) -> None:
         """Set the active source context for single-frame lookup/store."""
-        self._active_source_id = source_id
+        with self._lock:
+            self._active_source_id = source_id
 
     def set_mode(self, mode: CacheMode | str) -> None:
         """Update caching operational mode."""
@@ -553,10 +555,7 @@ class RingBufferCache(QObject):
         """Inform the cache of the active In/Out region marks."""
         self._in_frame = in_frame
         self._out_frame = out_frame
-        if self._mode == CacheMode.REGION:
-            with self._lock:
-                self._evict_if_needed(self._current_playhead)
-            self._emit_status()
+        self._emit_status()
 
     @property
     def disk_cache_enabled(self) -> bool:
@@ -807,6 +806,7 @@ class RingBufferCache(QObject):
             if not (not allow_proxy and key in self._proxy_keys):
                 ram_res = self._frames.get(key)
                 if ram_res is not None:
+                    self._frame_access_times[key] = time.time()
                     return ram_res
 
         # Check native Rust Tiered Cache (Zero-GIL, fast f16 RAM ring + LZ4 disk)
@@ -894,9 +894,12 @@ class RingBufferCache(QObject):
         mtime: Optional[float] = None,
         write_to_disk: bool = False,
         is_proxy: bool = False,
+        force: bool = False,
     ) -> None:
         """Store a frame for a specific source into the shared RAM pool (and optionally Temp Disk)."""
-        if self._mode == CacheMode.OFF or not source_id or image_data is None:
+        if self._mode == CacheMode.OFF and not force:
+            return
+        if not source_id or image_data is None:
             return
 
         # Zero-loss RAM compression: Float32 frames are stored as Float16 (half-float),
@@ -914,8 +917,8 @@ class RingBufferCache(QObject):
         if byte_size == 0:
             return
 
-        # In Region mode, do not cache frames outside [in_frame, out_frame] unless it's playhead
-        if self._mode == CacheMode.REGION and self._in_frame is not None and self._out_frame is not None:
+        # In Region mode, do not cache frames outside [in_frame, out_frame] unless it's playhead or forced
+        if not force and self._mode == CacheMode.REGION and self._in_frame is not None and self._out_frame is not None:
             if not (self._in_frame <= frame <= self._out_frame) and frame != self._current_playhead:
                 return
 
@@ -926,7 +929,9 @@ class RingBufferCache(QObject):
 
             self._frames[key] = image_data
             self._frame_bytes[key] = byte_size
-            self._frame_mtimes[key] = float(mtime) if mtime is not None else time.time()
+            now = float(mtime) if mtime is not None else time.time()
+            self._frame_mtimes[key] = now
+            self._frame_access_times[key] = now
             if is_proxy:
                 self._proxy_keys.add(key)
             else:
@@ -1021,6 +1026,7 @@ class RingBufferCache(QObject):
                 self._used_bytes -= self._frame_bytes.pop(k, 0)
                 frame_data = self._frames.pop(k, None)
                 self._frame_mtimes.pop(k, None)
+                self._frame_access_times.pop(k, None)
                 self._proxy_keys.discard(k)
                 if isinstance(frame_data, np.ndarray):
                     FrameBufferPool.instance().release(frame_data)
@@ -1124,9 +1130,13 @@ class RingBufferCache(QObject):
                 if not (not allow_proxy and key in self._proxy_keys):
                     res = self._frames.get(key)
                     if res is not None:
+                        self._frame_access_times[key] = time.time()
                         return res
             if not (not allow_proxy and frame in self._proxy_keys):
-                return self._frames.get(frame)
+                res = self._frames.get(frame)
+                if res is not None:
+                    self._frame_access_times[frame] = time.time()
+                    return res
             return None
 
     def has_frame(self, frame: int, allow_proxy: bool = True) -> bool:
@@ -1140,9 +1150,18 @@ class RingBufferCache(QObject):
                 return allow_proxy or (frame not in self._proxy_keys)
             return False
 
-    def put_frame(self, frame: int, image_data: Union[np.ndarray, tuple], is_proxy: bool = False, compress_f16: bool = False) -> None:
+    def put_frame(
+        self,
+        frame: int,
+        image_data: Union[np.ndarray, tuple],
+        is_proxy: bool = False,
+        compress_f16: bool = False,
+        force: bool = False,
+    ) -> None:
         """Store a frame array or (primary, reference) tuple into the cache."""
-        if self._mode == CacheMode.OFF:
+        if self._mode == CacheMode.OFF and not force:
+            return
+        if image_data is None:
             return
 
         if compress_f16:
@@ -1167,8 +1186,8 @@ class RingBufferCache(QObject):
         else:
             return
 
-        # In Region mode, do not cache frames outside [in_frame, out_frame] unless it's playhead
-        if self._mode == CacheMode.REGION and self._in_frame is not None and self._out_frame is not None:
+        # In Region mode, do not cache frames outside [in_frame, out_frame] unless it's playhead or forced
+        if not force and self._mode == CacheMode.REGION and self._in_frame is not None and self._out_frame is not None:
             if not (self._in_frame <= frame <= self._out_frame) and frame != self._current_playhead:
                 return
 
@@ -1179,6 +1198,9 @@ class RingBufferCache(QObject):
 
             self._frames[key] = image_data
             self._frame_bytes[key] = byte_size
+            now = time.time()
+            self._frame_mtimes[key] = now
+            self._frame_access_times[key] = now
             if is_proxy:
                 self._proxy_keys.add(key)
             else:
@@ -1199,6 +1221,7 @@ class RingBufferCache(QObject):
             self._frames.clear()
             self._frame_bytes.clear()
             self._frame_mtimes.clear()
+            self._frame_access_times.clear()
             self._proxy_keys.clear()
             self._used_bytes = 0
             for arr in self._layer_cache.values():
@@ -1315,37 +1338,10 @@ class RingBufferCache(QObject):
                 return key[0] == self._active_source_id
             return True
 
-        def _eviction_priority(k: Any) -> tuple:
-            f = _get_frame_num(k)
-            # 1. Out of region frames evicted first in REGION mode
-            in_region = 1
-            if self._mode == CacheMode.REGION and self._in_frame is not None and self._out_frame is not None:
-                in_region = 0 if (self._in_frame <= f <= self._out_frame) else 1
-
-            # 2. Inactive source frames evicted before active source
-            is_active = 0 if _is_active_source(k) else 1
-
-            # 3. Directional distance using lookback ratio and lookahead windows:
-            # Frames beyond lookbehind window are evicted first.
-            # Frames beyond lookahead window are evicted second.
-            # Frames inside lookbehind window are protected until lookahead needs RAM.
-            # Frames inside lookahead window are prioritized for playback.
-            diff = f - playhead
-            if diff < -self._lookbehind:
-                dist_score = 100000 + abs(diff)  # Beyond lookbehind: highest eviction priority
-            elif diff > self._lookahead:
-                dist_score = 50000 + diff         # Beyond lookahead: next to evict
-            elif diff < 0:
-                dist_score = 10000 + abs(diff)    # Inside lookbehind window: evict oldest lookbehind first
-            else:
-                dist_score = diff                 # Inside lookahead window: evict furthest ahead first
-
-            return (in_region, is_active, dist_score)
-
+        # Evict strictly when RAM budget is exceeded, using true LRU (least recently accessed first).
         candidates = sorted(
             self._frames.keys(),
-            key=_eviction_priority,
-            reverse=True,
+            key=lambda k: self._frame_access_times.get(k, 0.0),
         )
 
         for k in candidates:
@@ -1375,6 +1371,7 @@ class RingBufferCache(QObject):
             b = self._frame_bytes.pop(k, 0)
             frame_data = self._frames.pop(k, None)
             self._frame_mtimes.pop(k, None)
+            self._frame_access_times.pop(k, None)
             self._proxy_keys.discard(k)
             self._used_bytes -= b
             if isinstance(frame_data, np.ndarray):

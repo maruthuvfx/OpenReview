@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.1.0] - 2026-11-16
+
+### Added
+- **Multi-Track Timeline Mode (`multitrack_timeline.py`, `timeline_sequence.py`)**: Full non-linear editorial timeline workspace activated via `F10`. Supports unlimited video and audio tracks, track headers with mute/solo/lock, interactive clip dragging, playhead ruler, and sub-frame audio synchronization.
+- **Editorial Conform & Media Relinking Wizard (`conform_dialog.py`, `core/conform/`)**: Studio conform engine parsing CMX 3600 EDL, Final Cut Pro XML, and AAF files with timecode matching, recursive directory search, and intelligent media relinking.
+- **OpenTimelineIO (.otio) Integration (`timeline_exporter.py`)**: Seamless import and export of industry-standard `.otio` sequences preserving multi-track arrangements, clip names, and In/Out timecodes.
+- **Stackable GPU Soft Effects (`soft_effects_inspector.py`)**: Non-destructive real-time effect cards applied directly to timeline clips, including CDL Grade (`slope`, `offset`, `power`, `saturation`), Transform/Reformat, Retime, Crop & Blanking Masks, and Burn-in Text.
+- **Editorial Cut List Spreadsheet (`spreadsheet_widget.py`)**: High-density shot spreadsheet with two-way selection sync, shot status management (`MATCHED`, `WIP`, `APPROVED`, `CONFLICT`, `HOLD`), reel tags, and custom metadata inspection.
+- **Broadcast SDI & Secondary Display Monitor (`sdi_monitor.py`)**: Direct hardware broadcast monitor-out supporting Blackmagic DeckLink devices and secondary monitor full-screen mirror with zero tear and dedicated color profile routing.
+- **Dynamic Export Template Token Builder (`export_template_builder.py`)**: Visual breadcrumb pattern builder with token chips (`{project}`, `{shot}`, `{version}`, `{date}`, `{track}`, `{resolution}`, `{ext}`) for automated studio delivery directories and file naming.
+- **Sequence & Project Settings Dialog (`sequence_settings_dialog.py`)**: Dedicated sequence settings modal for configuring canvas resolution presets (HD, 2K, 4K, Scope, Vertical 9:16), FPS, starting timecode (e.g. `00:00:00:00`), and working color space.
+- **Audio Waveform Cache (`waveform_cache.py`)**: Fast persistent background calculation and rendering of visual audio waveforms with sub-millisecond audio scrub sync.
+- **Editorial Trimming Tools**: Interactive head/tail ripple trimming (`Q` / `W`), split razor cut (`C`), gap ripple delete, and linked video/audio clip manipulation.
+- **Dynamic Viewport Sliders Scaling**: Viewport on-screen color slider overlay expanded to 90% viewport width with piecewise linear mapping ensuring exactly 1.0 at the centered 50% midpoint.
+
+### Changed
+- **Aspect Ratio Consistency**: Preserved strict pixel aspect ratios across Stacking, Sequence, and Layout modes without jumping or stretching during media switching.
+- **Cache Persistence**: In-memory ring buffer now reliably retains cached frames across media switching and region bounds modifications, evicting only upon explicit clear or session close.
+- **DCC & Python Timeline API (`sdk/timeline_api.py`)**: Expanded programmatic SDK for remote shot conforming, clip insertion, and external automation via IPC.
+
+### Fixed
+- **Canvas Scrubbing Bounds**: Eliminated timeline playhead wrapping and clamped boundary transport cleanly at start and end frames.
+- **Audio Mute Sync**: Fixed mute button state and icon desynchronization during rapid transport toggling.
+- **Dock Gap Elimination**: Removed unwanted layout borders and dock margins in timeline editorial workspaces.
+
+---
+
 ## [2.0.0] - 2026-11-04
 
 ### Architecture Milestone: Native Rust Engine

@@ -599,6 +599,36 @@ class AnnotationsDockWidget(StudioDockWidget):
 
 
 # ------------------------------------------------------------------------------
+# 6. Spreadsheet / Cut List Dock
+# ------------------------------------------------------------------------------
+class SpreadsheetDockWidget(StudioDockWidget):
+    """
+    Studio Spreadsheet / Conform Cut List Dock:
+    Hosts high-density editorial cut list synced with timeline and conform events.
+    """
+    def __init__(self, parent: Optional[QMainWindow] = None):
+        super().__init__("Cut List", "SpreadsheetDockWidget", icon_name="spreadsheet", parent=parent)
+        from openreview.widgets.spreadsheet_widget import SpreadsheetWidget
+        self.spreadsheet = SpreadsheetWidget(self)
+        self.setWidget(self.spreadsheet)
+
+
+# ------------------------------------------------------------------------------
+# 7. Soft Effects & Color Inspector Dock
+# ------------------------------------------------------------------------------
+class SoftEffectsDockWidget(StudioDockWidget):
+    """
+    Studio Soft Effects & Color Inspector Dock:
+    Hosts GPU Grade/CDL, Transform, Aspect Mask, and Burn-in modifiers.
+    """
+    def __init__(self, parent: Optional[QMainWindow] = None):
+        super().__init__("Soft Effects", "SoftEffectsDockWidget", icon_name="color", parent=parent)
+        from openreview.widgets.soft_effects_inspector import SoftEffectsInspector
+        self.inspector = SoftEffectsInspector(self)
+        self.setWidget(self.inspector)
+
+
+# ------------------------------------------------------------------------------
 # Studio Workspace Definition Data Model
 # ------------------------------------------------------------------------------
 @dataclass
@@ -636,6 +666,8 @@ STUDIO_WORKSPACES: Dict[str, StudioWorkspace] = {
             "AnnotationsDockWidget",
             "FileBrowserDockWidget",
             "CompQCDockWidget",
+            "SpreadsheetDockWidget",
+            "SoftEffectsDockWidget",
         ],
         dock_areas={
             "SourcesDockWidget": Qt.DockWidgetArea.LeftDockWidgetArea,
@@ -662,6 +694,8 @@ STUDIO_WORKSPACES: Dict[str, StudioWorkspace] = {
             "AnnotationsDockWidget",
             "FileBrowserDockWidget",
             "CompQCDockWidget",
+            "SpreadsheetDockWidget",
+            "SoftEffectsDockWidget",
         ],
         dock_areas={
             "SourcesDockWidget": Qt.DockWidgetArea.LeftDockWidgetArea,
@@ -693,6 +727,8 @@ STUDIO_WORKSPACES: Dict[str, StudioWorkspace] = {
             "AnnotationsDockWidget",
             "FileBrowserDockWidget",
             "CompQCDockWidget",
+            "SpreadsheetDockWidget",
+            "SoftEffectsDockWidget",
         ],
         dock_areas={
             "SourcesDockWidget": Qt.DockWidgetArea.LeftDockWidgetArea,
@@ -723,6 +759,8 @@ STUDIO_WORKSPACES: Dict[str, StudioWorkspace] = {
             "FileBrowserDockWidget",
             "CompQCDockWidget",
             "TimelineDockWidget",
+            "SpreadsheetDockWidget",
+            "SoftEffectsDockWidget",
         ],
         show_top_bar=False,
         show_timeline=False,
@@ -745,12 +783,47 @@ STUDIO_WORKSPACES: Dict[str, StudioWorkspace] = {
             "ColorGradingDockWidget",
             "FileBrowserDockWidget",
             "CompQCDockWidget",
+            "SpreadsheetDockWidget",
+            "SoftEffectsDockWidget",
         ],
         dock_areas={
             "SourcesDockWidget": Qt.DockWidgetArea.LeftDockWidgetArea,
             "AnnotationsDockWidget": Qt.DockWidgetArea.RightDockWidgetArea,
             "TimelineDockWidget": Qt.DockWidgetArea.BottomDockWidgetArea,
         },
+        show_top_bar=True,
+        show_timeline=True,
+    ),
+    "timeline_mode": StudioWorkspace(
+        id="timeline_mode",
+        name="Timeline Mode",
+        icon="timeline",
+        description="Multi-track editorial conform, spreadsheet cut list, and soft effects studio layout.",
+        shortcut="F10",
+        visible_docks=[
+            "SourcesDockWidget",
+            "SpreadsheetDockWidget",
+            "SoftEffectsDockWidget",
+            "TimelineDockWidget",
+        ],
+        hidden_docks=[
+            "ScopesDockWidget",
+            "InspectorDockWidget",
+            "VFXEXRDockWidget",
+            "ColorGradingDockWidget",
+            "AnnotationsDockWidget",
+            "FileBrowserDockWidget",
+            "CompQCDockWidget",
+        ],
+        dock_areas={
+            "SourcesDockWidget": Qt.DockWidgetArea.LeftDockWidgetArea,
+            "SpreadsheetDockWidget": Qt.DockWidgetArea.LeftDockWidgetArea,
+            "SoftEffectsDockWidget": Qt.DockWidgetArea.RightDockWidgetArea,
+            "TimelineDockWidget": Qt.DockWidgetArea.BottomDockWidgetArea,
+        },
+        tab_groups=[
+            ("SourcesDockWidget", "SpreadsheetDockWidget"),
+        ],
         show_top_bar=True,
         show_timeline=True,
     ),
@@ -862,10 +935,15 @@ class StudioWorkspaceManager(QObject):
         if hasattr(main_window, "resizeDocks"):
             right_docks = [d for d_name, d in dock_map.items() if d.isVisible() and ws.dock_areas.get(d_name) == Qt.DockWidgetArea.RightDockWidgetArea]
             if right_docks:
-                main_window.resizeDocks(right_docks, [380] * len(right_docks), Qt.Orientation.Horizontal)
+                right_w = 260 if workspace_id == "timeline_mode" else 360
+                main_window.resizeDocks(right_docks, [right_w] * len(right_docks), Qt.Orientation.Horizontal)
             left_docks = [d for d_name, d in dock_map.items() if d.isVisible() and ws.dock_areas.get(d_name) == Qt.DockWidgetArea.LeftDockWidgetArea]
             if left_docks:
                 main_window.resizeDocks(left_docks, [280] * len(left_docks), Qt.Orientation.Horizontal)
+            bottom_docks = [d for d_name, d in dock_map.items() if d.isVisible() and ws.dock_areas.get(d_name) == Qt.DockWidgetArea.BottomDockWidgetArea]
+            if bottom_docks:
+                bottom_h = getattr(main_window, "_last_multitrack_timeline_height", 280) if workspace_id == "timeline_mode" else 64
+                main_window.resizeDocks(bottom_docks, [bottom_h] * len(bottom_docks), Qt.Orientation.Vertical)
 
         self.workspace_changed.emit(workspace_id)
         return True

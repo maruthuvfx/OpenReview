@@ -304,6 +304,14 @@ class SequenceView:
             return source, last_clip.trim_out
         return None, timeline_frame
 
+    def get_format(self, sources_map: Dict[str, SourceItem]) -> Tuple[int, int]:
+        """Return master format resolution (width, height) derived from the first valid clip or default 1920x1080."""
+        for c in self.clips:
+            s = sources_map.get(c.source_id)
+            if s and s.width > 0 and s.height > 0:
+                return s.width, s.height
+        return 1920, 1080
+
     def move_clip(self, from_idx: int, to_idx: int) -> None:
         if 0 <= from_idx < len(self.clips) and 0 <= to_idx < len(self.clips):
             clip = self.clips.pop(from_idx)
@@ -360,6 +368,17 @@ class StackView:
     channels_a: Tuple[bool, bool, bool, bool] = (True, True, True, True)
     manual_in: Optional[int] = None
     manual_out: Optional[int] = None
+
+    def get_format(self, sources_map: Dict[str, SourceItem]) -> Tuple[int, int]:
+        """Return master format resolution (width, height) derived from Layer A or first valid source."""
+        la = self.get_layer_a(sources_map)
+        if la and la.width > 0 and la.height > 0:
+            return la.width, la.height
+        for sid in self.source_ids:
+            s = sources_map.get(sid)
+            if s and s.width > 0 and s.height > 0:
+                return s.width, s.height
+        return 1920, 1080
 
     def cycle_forward(self) -> int:
         """Cycle strictly between Layer A and Layer B in stack."""
@@ -743,7 +762,7 @@ class SessionGraph(QObject):
         self.graph_changed.emit()
         return item
 
-    def add_source_from_path(self, path: str, parent_folder_id: Optional[str] = None, auto_activate: bool = True) -> Optional[SourceItem]:
+    def add_source_from_path(self, path: str, parent_folder_id: Optional[str] = None, auto_activate: bool = True, force_reload: bool = False) -> Optional[SourceItem]:
         """Inspect media file or sequence on disk and add to sources bin."""
         if not path or not os.path.exists(path):
             return None
@@ -752,6 +771,16 @@ class SessionGraph(QObject):
         norm_path = os.path.normpath(path)
         for s in self.sources.values():
             if os.path.normpath(s.path) == norm_path:
+                if force_reload:
+                    updated = build_source_item_from_path(path, s.parent_folder_id)
+                    if updated:
+                        s.start_frame = updated.start_frame
+                        s.end_frame = updated.end_frame
+                        s.fps = updated.fps
+                        s.width = updated.width
+                        s.height = updated.height
+                        s.colorspace = updated.colorspace
+                        self.source_properties_changed.emit(s.id)
                 return s
 
         source = build_source_item_from_path(path, parent_folder_id)

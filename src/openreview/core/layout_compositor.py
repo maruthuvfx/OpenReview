@@ -74,6 +74,42 @@ def resize_frame_fast(frame: np.ndarray, target_w: int, target_h: int) -> np.nda
     return frame[row_indices[:, None], col_indices]
 
 
+def conform_frame_to_format(
+    frame: np.ndarray,
+    target_w: int,
+    target_h: int,
+) -> np.ndarray:
+    """
+    Fit frame into (target_w, target_h) preserving source aspect ratio with centered
+    letterboxing/pillarboxing. If frame already matches target_w and target_h, returns frame unchanged.
+    """
+    if frame is None or target_w <= 0 or target_h <= 0:
+        return frame
+
+    src_h, src_w = frame.shape[:2]
+    if src_w == target_w and src_h == target_h:
+        return frame
+
+    fit_scale = min(float(target_w) / float(src_w), float(target_h) / float(src_h))
+    scaled_w = max(1, int(round(src_w * fit_scale)))
+    scaled_h = max(1, int(round(src_h * fit_scale)))
+
+    resized = resize_frame_fast(frame, scaled_w, scaled_h)
+
+    if scaled_w == target_w and scaled_h == target_h:
+        return resized
+
+    channels = frame.shape[2] if frame.ndim > 2 else 4
+    canvas = np.zeros((target_h, target_w, channels), dtype=frame.dtype)
+    if channels == 4:
+        canvas[:, :, 3] = 1.0 if np.issubdtype(frame.dtype, np.floating) else 255
+
+    pad_x = (target_w - scaled_w) // 2
+    pad_y = (target_h - scaled_h) // 2
+    canvas[pad_y : pad_y + scaled_h, pad_x : pad_x + scaled_w] = resized
+    return canvas
+
+
 def composite_layout_grid(
     layout: LayoutView,
     sources_map: Dict[str, SourceItem],

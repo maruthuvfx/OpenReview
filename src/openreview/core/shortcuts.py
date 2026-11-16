@@ -77,8 +77,13 @@ class ShortcutManager(QObject):
         self._key_map: Dict[str, str] = {}
         self._aliases: Dict[str, str] = {}
         self._suppress_predicate: Optional[Callable[[], bool]] = None
+        self._active_workspace: str = "review"
         self._init_default_actions()
         self.load_from_preferences()
+
+    def set_active_workspace(self, ws_id: str) -> None:
+        """Set the active workspace ID for context-aware shortcut routing."""
+        self._active_workspace = ws_id
 
     def set_suppress_predicate(self, predicate: Optional[Callable[[], bool]]) -> None:
         """Register a callback that returns True when global shortcuts should be suppressed (e.g. typing)."""
@@ -154,8 +159,14 @@ class ShortcutManager(QObject):
             ("color.sliders_overlay", "Toggle On-Screen Color Sliders", "Color & Exposure", "S", "Toggle on-screen Gain, Gamma, Hue, and Saturation sliders"),
 
             # Timeline
+            ("timeline.tool_select", "Select Tool", "Timeline", "V", "Activate selection and trimming arrow tool"),
+            ("timeline.tool_slide", "Slide Tool", "Timeline", "U", "Activate slide edit tool"),
+            ("timeline.tool_razor", "Razor Tool", "Timeline", "C", "Activate razor blade edit tool"),
             ("timeline.zoom_in", "Timeline Zoom In", "Timeline", "Ctrl+=", "Zoom in timeline view"),
             ("timeline.zoom_out", "Timeline Zoom Out", "Timeline", "Ctrl+-", "Zoom out timeline view"),
+            ("timeline.delete_selected", "Delete Selected Item", "Timeline", "Delete", "Delete selected timeline clips, markers, or gap"),
+            ("timeline.ripple_delete", "Ripple Delete Clips", "Timeline", "Shift+Delete", "Ripple delete selected timeline clips"),
+            ("timeline.split_cut", "Split Clip at Playhead", "Timeline", "C", "Razor / split active clip at playhead position"),
             ("timeline.magnifier_toggle", "Toggle Magnified Timeline", "Timeline", "Shift+T", "Toggle magnified timeline scrub mini-ruler"),
             ("timeline.toggle_timecode", "Toggle SMPTE Timecode", "Timeline", "Ctrl+T", "Switch between Frame numbers and SMPTE Timecode HH:MM:SS:FF"),
             ("timeline.goto_frame", "Goto Frame", "Timeline", "Ctrl+G", "Open numeric Go to frame dialog"),
@@ -198,7 +209,9 @@ class ShortcutManager(QObject):
             ("hud.console", "Toggle Console Window", "HUDs & Panels", "Ctrl+Shift+L", "Show/hide diagnostic console and error log window"),
             ("hud.comp_qc", "Toggle xtra QC Utils", "HUDs & Panels", "Q", "Show/hide dockable xtra QC Utils panel (Hold Q to peek)"),
 
-            # Annotations
+            # Annotations & Global Edit
+            ("edit.undo", "Global Undo", "Edit", "Ctrl+Z", "Undo last action across application"),
+            ("edit.redo", "Global Redo", "Edit", "Ctrl+Shift+Z", "Redo last undone action"),
             ("annot.toggle_pen", "Toggle Pen Drawing Tool", "Annotations", "D", "Enable or disable freehand pencil draw"),
             ("annot.undo", "Undo Annotation", "Annotations", "Ctrl+Z", "Undo last drawing action on active frame"),
             ("annot.redo", "Redo Annotation", "Annotations", "Ctrl+Shift+Z", "Redo last undone drawing action on active frame"),
@@ -238,6 +251,7 @@ class ShortcutManager(QObject):
             ("workspace.vfx_breakdown", "VFX Breakdown Workspace", "Studio Workspaces", "F7", "Switch to VFX Breakdown & Multi-Channel EXR workspace layout"),
             ("workspace.cinema", "Cinema Theater Workspace", "Studio Workspaces", "F8", "Switch to distraction-free Cinema Theater workspace layout"),
             ("workspace.annotations", "Supervisor Review Workspace", "Studio Workspaces", "F9", "Switch to Supervisor Review & Notes workspace layout"),
+            ("workspace.timeline_mode", "Timeline Mode Workspace", "Studio Workspaces", "F10", "Switch to Multi-Track Timeline Mode workspace layout"),
         ]
 
         for action_id, name, cat, default_key, desc in defs:
@@ -251,6 +265,16 @@ class ShortcutManager(QObject):
             )
 
         self._aliases = {
+            "Ctrl+Z": "edit.undo",
+            "Ctrl+z": "edit.undo",
+            "Ctrl+Shift+Z": "edit.redo",
+            "Ctrl+Shift+z": "edit.redo",
+            "Ctrl+Y": "edit.redo",
+            "Ctrl+y": "edit.redo",
+            "U": "timeline.tool_slide",
+            "u": "timeline.tool_slide",
+            "V": "timeline.tool_select",
+            "v": "timeline.tool_select",
             "Ctrl+B": "hud.toggle_file_browser",
             "Ctrl+b": "hud.toggle_file_browser",
             "Ctrl+G": "timeline.goto_frame",
@@ -281,6 +305,8 @@ class ShortcutManager(QObject):
             "f8": "workspace.cinema",
             "F9": "workspace.annotations",
             "f9": "workspace.annotations",
+            "F10": "workspace.timeline_mode",
+            "f10": "workspace.timeline_mode",
             "Y": "channel.luma",
             "y": "channel.luma",
             "E": "color.exp_reset",
@@ -671,6 +697,34 @@ class ShortcutManager(QObject):
                 action_id = self._key_map.get(key_enum_name) or self._aliases.get(key_enum_name)
             except Exception:
                 pass
+
+        # Context-aware override based on active workspace:
+        if getattr(self, "_active_workspace", "review") == "timeline_mode":
+            has_ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            has_alt = bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
+            has_shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+
+            # 1. 'I' sets In Mark
+            if key == Qt.Key.Key_I and not has_ctrl and not has_alt:
+                action_id = "mark.in"
+            # 2. 'O' sets Out Mark
+            elif key == Qt.Key.Key_O and not has_ctrl and not has_alt:
+                action_id = "mark.out"
+            # 3. Delete / Backspace deletes selected timeline clips/markers/gap
+            elif key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+                if has_shift:
+                    action_id = "timeline.ripple_delete"
+                else:
+                    action_id = "timeline.delete_selected"
+            # 4. '+' or '=' zooms in timeline
+            elif key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal) or event.text() in ("+", "="):
+                action_id = "timeline.zoom_in"
+            # 5. '-' or '_' zooms out timeline
+            elif key in (Qt.Key.Key_Minus, Qt.Key.Key_Underscore) or event.text() in ("-", "_"):
+                action_id = "timeline.zoom_out"
+            # 6. 'C' splits/cuts at playhead
+            elif key == Qt.Key.Key_C and not has_ctrl and not has_alt:
+                action_id = "timeline.split_cut"
 
         if action_id:
             act = self._actions.get(action_id)

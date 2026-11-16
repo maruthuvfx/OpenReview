@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import math
 from typing import Optional, Set
-from PySide6.QtCore import Qt, QRectF, QPointF, QPoint, Signal, QTimer, QEvent
+from PySide6.QtCore import Qt, QRectF, QPointF, QPoint, Signal, QTimer, QEvent, QSize
 from PySide6.QtGui import QPainter, QColor, QPen, QFont, QPolygonF, QPixmap, QPainterPath, QLinearGradient, QCursor
 from PySide6.QtWidgets import (
     QWidget,
@@ -27,6 +27,8 @@ from PySide6.QtWidgets import (
     QMenu,
     QLineEdit,
     QMessageBox,
+    QApplication,
+    QSizePolicy,
 )
 from openreview.core.clock import PlaybackClock
 from openreview.models.annotations import AnnotationStore
@@ -70,9 +72,16 @@ class TimelineRuler(QWidget):
         self._cached_frames: Set[int] = set()
         self._ram_cached_frames: Set[int] = set()
         self._disk_cached_frames: Set[int] = set()
+        self._audio_path: Optional[str] = None
 
         if self.annotation_store:
             self.annotation_store.annotations_changed.connect(lambda _: self._invalidate_bg_cache())
+
+    def set_audio_path(self, path: Optional[str]) -> None:
+        """Assign audio file path for waveform envelope rendering on timeline ruler."""
+        if self._audio_path != path:
+            self._audio_path = path
+            self._invalidate_bg_cache()
 
     def _invalidate_bg_cache(self) -> None:
         """Invalidate static track background cache and trigger repaint."""
@@ -377,6 +386,38 @@ class TimelineRuler(QWidget):
             in_x = self._frame_to_x(self.clock.in_frame)
             out_x = self._frame_to_x(self.clock.out_frame)
             p.fillRect(QRectF(in_x, 0, max(1.0, out_x - in_x), h), QColor(36, 36, 36, 180))
+
+            # Audio Waveform Envelope on Scrubber Track (when audio is active)
+            if self._audio_path:
+                try:
+                    from openreview.audio.waveform_cache import WaveformCache
+                    fps = self.clock.fps if hasattr(self, "clock") and self.clock else 24.0
+                    start_f = self.clock.start_frame
+                    end_f = self.clock.end_frame
+                    total_f = max(1, end_f - start_f + 1)
+                    peaks = WaveformCache.instance().get_waveform_peaks(
+                        self._audio_path,
+                        fps=fps,
+                        fallback_frames=total_f,
+                    )
+                    if peaks is not None and len(peaks) > 0:
+                        mid_y = h / 2.0
+                        half_h = (h - 6.0) / 2.0
+                        p.setPen(QPen(QColor(46, 204, 113, 110), 1))
+                        step_px = 2.0
+                        cur_px = 0.0
+                        while cur_px < w:
+                            norm_x = cur_px / max(1.0, float(w))
+                            f_idx = int(norm_x * len(peaks))
+                            f_idx = min(len(peaks) - 1, max(0, f_idx))
+                            min_amp = peaks[f_idx, 0]
+                            max_amp = peaks[f_idx, 1]
+                            top_y = mid_y - max_amp * half_h
+                            bot_y = mid_y - min_amp * half_h
+                            p.drawLine(QPointF(cur_px, top_y), QPointF(cur_px, bot_y))
+                            cur_px += step_px
+                except Exception:
+                    pass
 
             # In / Out Bracket Handles (Warm amber with grab handles)
             p.setPen(QPen(QColor(229, 168, 35), 2))
@@ -816,6 +857,8 @@ class TimelineWidget(QFrame):
     seek_requested = Signal(int)
     seek_finished = Signal(int)
     audio_clicked = Signal()
+    audio_toggle_mute_requested = Signal()
+    audio_settings_requested = Signal()
     focus_viewport_requested = Signal()
     clear_cache_requested = Signal()
     clear_annotations_requested = Signal()
@@ -835,6 +878,14 @@ class TimelineWidget(QFrame):
         self.magnified_popup: Optional[MagnifiedTimelinePopup] = None
         self._setup_ui()
         self.clock.fps_changed.connect(self._on_clock_fps_changed)
+        self.setFixedHeight(64)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def sizeHint(self) -> QSize:
+        return QSize(800, 64)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(400, 64)
 
     def set_canvas_widget(self, canvas: QWidget) -> None:
         """Set the canvas/viewport widget used as the overlay parent for the magnifier."""
@@ -1109,10 +1160,12 @@ class TimelineWidget(QFrame):
         # Extreme Right: Audio Settings & Volume HUD Button
         self.btn_audio = QPushButton(self)
         self.btn_audio.setIcon(get_svg_icon("audio", color_normal="#cccccc", size=14))
-        self.btn_audio.setToolTip("Audio Settings & Offsets (Toggle HUD)")
+        self.btn_audio.setToolTip("Audio: Unmuted (Click to Mute / Ctrl+M, Right-Click for Settings)")
         self.btn_audio.setStyleSheet("color: #cccccc; font-size: 11px; padding: 1px 4px; min-width: 24px;")
         self.btn_audio.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.btn_audio.clicked.connect(self.audio_clicked.emit)
+        self.btn_audio.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.btn_audio.customContextMenuRequested.connect(lambda pos: self.audio_settings_requested.emit())
+        self.btn_audio.clicked.connect(self._on_audio_btn_clicked)
         transport_row.addWidget(self.btn_audio)
 
         # Ensure transport buttons don't steal focus from main keyboard shortcuts
@@ -1191,6 +1244,31 @@ class TimelineWidget(QFrame):
 
     def toggle_timecode_mode(self) -> None:
         self.set_timecode_mode(not self.timecode_mode)
+
+    def _on_audio_btn_clicked(self) -> None:
+        modifiers = QApplication.keyboardModifiers()
+        if modifiers & Qt.KeyboardModifier.AltModifier:
+            self.audio_settings_requested.emit()
+        else:
+            self.audio_toggle_mute_requested.emit()
+            self.audio_clicked.emit()
+
+    def set_audio_path(self, path: Optional[str]) -> None:
+        """Forward audio path to ruler for waveform display."""
+        if hasattr(self, "ruler") and self.ruler:
+            self.ruler.set_audio_path(path)
+
+    def set_audio_muted(self, muted: bool) -> None:
+        """Update audio button icon and tooltip based on mute state."""
+        self._audio_muted = bool(muted)
+        if self._audio_muted:
+            self.btn_audio.setIcon(get_svg_icon("audio_mute", color_normal="#e74c3c", size=14))
+            self.btn_audio.setToolTip("Audio: Muted (Click to Unmute / Ctrl+M, Right-Click for Settings)")
+            self.btn_audio.setStyleSheet("color: #e74c3c; font-size: 11px; padding: 1px 4px; min-width: 24px;")
+        else:
+            self.btn_audio.setIcon(get_svg_icon("audio", color_normal="#cccccc", size=14))
+            self.btn_audio.setToolTip("Audio: Unmuted (Click to Mute / Ctrl+M, Right-Click for Settings)")
+            self.btn_audio.setStyleSheet("color: #cccccc; font-size: 11px; padding: 1px 4px; min-width: 24px;")
 
     def set_timecode_mode(self, enabled: bool) -> None:
         self.timecode_mode = bool(enabled)

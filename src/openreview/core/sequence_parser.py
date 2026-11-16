@@ -212,6 +212,10 @@ class DiskSequenceReader(MediaReader):
         self.seq = sequence_info
         self.active_layer = active_layer
         self.active_mapping = None
+        self._last_valid_frame_data: Optional[np.ndarray] = None
+        self._last_valid_frame_idx: Optional[int] = None
+        self._cached_width = 1920
+        self._cached_height = 1080
 
     def set_matrix_mapping(self, mapping: Optional[Any]) -> None:
         self.active_mapping = mapping

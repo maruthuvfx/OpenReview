@@ -170,16 +170,56 @@ class IpcServer(QObject):
             "bookmarks": sorted(list(win.clock.bookmarks)),
         }
 
+    def _rpc_activate_window(self, params: dict) -> dict:
+        win = self.main_window
+        if not win:
+            return {"status": "error", "message": "MainWindow not attached"}
+
+        from PySide6.QtCore import Qt
+        if win.isMinimized():
+            win.setWindowState(win.windowState() & ~Qt.WindowState.WindowMinimized | Qt.WindowState.WindowActive)
+        win.show()
+        win.raise_()
+        win.activateWindow()
+
+        import sys
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                hwnd = int(win.winId())
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+
+        return {"status": "activated"}
+
     def _rpc_load_media(self, params: dict) -> dict:
         path = params.get("path")
         if not path:
             raise ValueError("Missing 'path' argument")
 
+        reload_flag = bool(params.get("reload", True))
+        activate_flag = bool(params.get("activate", True))
+
         win = self.main_window
         if win and hasattr(win, "_load_path"):
-            win._load_path(path)
+            win._load_path(path, force_reload=reload_flag)
+            if activate_flag:
+                self._rpc_activate_window({})
             return {"status": "loaded", "path": path}
         return {"status": "error", "message": "MainWindow not attached"}
+
+    def _rpc_reload_media(self, params: dict) -> dict:
+        path = params.get("path")
+        win = self.main_window
+        if not win:
+            return {"status": "error", "message": "MainWindow not attached"}
+        target_path = path or getattr(win, "_current_media_path", None)
+        if target_path and hasattr(win, "_load_path"):
+            win._load_path(target_path, force_reload=True)
+            self._rpc_activate_window({})
+            return {"status": "reloaded", "path": target_path}
+        return {"status": "error", "message": "No media to reload"}
 
     def _rpc_play(self, params: dict) -> dict:
         if self.main_window and hasattr(self.main_window, "clock"):

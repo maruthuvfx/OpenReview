@@ -108,7 +108,7 @@ def test_color_sliders_overlay_open_and_live_preview(qtbot):
     assert emitted.gain == (2.0, 2.0, 2.0)
 
 
-def test_color_sliders_overlay_dynamic_70_percent_width(qtbot):
+def test_color_sliders_overlay_dynamic_90_percent_width(qtbot):
     parent = QWidget()
     parent.resize(1600, 900)
     parent.show()
@@ -117,14 +117,14 @@ def test_color_sliders_overlay_dynamic_70_percent_width(qtbot):
     overlay = ColorSlidersOverlay(parent=parent)
     overlay.open_overlay(ColorGradeSettings())
 
-    # At 1600px width, 70% is 1120px
-    expected_w = int(1600 * 0.70)
+    # At 1600px width, 90% is 1440px
+    expected_w = int(1600 * 0.90)
     assert abs(overlay.width() - expected_w) <= 2
 
     # Resize parent to 1200px
     parent.resize(1200, 800)
     overlay.auto_center_in_parent()
-    expected_w_2 = int(1200 * 0.70)
+    expected_w_2 = int(1200 * 0.90)
     assert abs(overlay.width() - expected_w_2) <= 2
 
 

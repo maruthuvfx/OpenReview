@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 )
 
 from openreview.core.clock import PlaybackClock
+from openreview.core.undo_manager import UndoManager
 from openreview.core.cache import (
     RingBufferCache,
     CacheMode,
@@ -75,7 +76,12 @@ from openreview.ui.workspaces import (
     VFXEXRDockWidget,
     ColorGradingDockWidget,
     AnnotationsDockWidget,
+    SpreadsheetDockWidget,
+    SoftEffectsDockWidget,
 )
+from openreview.widgets.multitrack_timeline import MultiTrackTimelineWidget
+from openreview.core.sdi_monitor import SDIMonitorManager
+from openreview.models.timeline_sequence import TimelineSequence, Track, ClipItem, ShotStatus, TrackType
 from openreview.color.ocio_manager import OCIOManager
 from openreview.color.standard_colorspaces import (
     STANDARD_COLORSPACES,
@@ -131,7 +137,7 @@ from openreview.packages.builtin.comp_qc.hud_comp_qc import CompQCDockWidget
 from openreview.packages.builtin.comp_qc.qc_state import CompQCState
 from openreview.core.console_logger import ConsoleLogManager, LogEntry
 from openreview.ui.console_window import ConsoleWindow
-from openreview.core.layout_compositor import composite_layout_grid
+from openreview.core.layout_compositor import composite_layout_grid, conform_frame_to_format
 from openreview.core.version_control import get_next_version, get_prev_version, get_version_summary
 from openreview.core.timecode import frame_to_timecode
 from openreview.ui.theme import get_3dequalizer_stylesheet
@@ -424,6 +430,7 @@ class MainWindow(QMainWindow):
         self.viewport.contact_sheet_tile_double_clicked.connect(self._on_exr_contact_sheet_tile_double_clicked)
         self.top_bar.scrub_mode_toggled.connect(self._on_scrub_mode_toggled)
         self.viewport.scrub_requested.connect(self._on_viewport_scrub)
+        self.viewport.play_pause_requested.connect(self._toggle_playback)
         self.viewport.set_scrub_mode(True)
         self.top_bar.set_scrub_mode(True)
         self.setCentralWidget(self.viewport)
@@ -442,7 +449,11 @@ class MainWindow(QMainWindow):
         self.timeline_dock.setObjectName("TimelineDockWidget")
         self.timeline_dock.setAllowedAreas(Qt.DockWidgetArea.BottomDockWidgetArea)
         self.timeline_dock.setFeatures(QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
-        self.timeline_dock.setTitleBarWidget(QWidget(self.timeline_dock))
+        dummy_title = QWidget(self.timeline_dock)
+        dummy_title.setFixedHeight(0)
+        dummy_title.setMaximumHeight(0)
+        dummy_title.setVisible(False)
+        self.timeline_dock.setTitleBarWidget(dummy_title)
         self.timeline = TimelineWidget(
             self.clock,
             self.annotation_store,
@@ -450,9 +461,24 @@ class MainWindow(QMainWindow):
             canvas_widget=self.viewport,
         )
         self.timeline.fps_dialog_requested.connect(self._on_choose_frame_rate)
-        self.timeline_dock.setWidget(self.timeline)
+
+        self._last_multitrack_timeline_height = 280
+        from PySide6.QtWidgets import QStackedWidget, QSizePolicy
+        self.timeline_stack = QStackedWidget(self.timeline_dock)
+        self.timeline_stack.addWidget(self.timeline)
+        self.multitrack_timeline = MultiTrackTimelineWidget(self.timeline_dock)
+        self.timeline_stack.addWidget(self.multitrack_timeline)
+        self.timeline_dock.setWidget(self.timeline_stack)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.timeline_dock)
         self.timeline_dock.show()
+
+        # Initialize stack in compact review state
+        self.multitrack_timeline.setMinimumHeight(0)
+        self.multitrack_timeline.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.timeline.setFixedHeight(64)
+        self.timeline.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.timeline_stack.setFixedHeight(64)
+        self.timeline_dock.setFixedHeight(64)
 
         # 6. Bottom Status Bar with Live Pixel Inspector & Cache Meter
         self._setup_status_bar()
@@ -823,10 +849,34 @@ class MainWindow(QMainWindow):
         batch_export_act.triggered.connect(self._on_batch_export_media)
 
         file_menu.addSeparator()
+        conform_wizard_act = file_menu.addAction("Conform Turnover Wizard (EDL / XML / AAF / OTIO)...")
+        conform_wizard_act.triggered.connect(self._on_open_conform_dialog)
+
+        file_menu.addSeparator()
         exit_act = file_menu.addAction("Exit (Ctrl+Q)")
         exit_act.triggered.connect(self.close)
 
-        # 2. Image Menu
+        # 2. Edit Menu
+        edit_menu = mb.addMenu("&Edit")
+        self.undo_act = edit_menu.addAction("Undo (Ctrl+Z)")
+        self.undo_act.setShortcut(QKeySequence("Ctrl+Z"))
+        self.undo_act.setEnabled(False)
+        self.undo_act.triggered.connect(self._on_global_undo)
+
+        self.redo_act = edit_menu.addAction("Redo (Ctrl+Shift+Z / Ctrl+Y)")
+        self.redo_act.setShortcut(QKeySequence("Ctrl+Shift+Z"))
+        self.redo_act.setEnabled(False)
+        self.redo_act.triggered.connect(self._on_global_redo)
+
+        edit_menu.addSeparator()
+        self.del_act = edit_menu.addAction("Delete Selected (Delete)")
+        self.del_act.triggered.connect(lambda: self.multitrack_timeline.canvas.remove_selected_clips(ripple=False) if hasattr(self, "multitrack_timeline") else None)
+        self.rip_del_act = edit_menu.addAction("Ripple Delete Selected (Shift+Delete)")
+        self.rip_del_act.triggered.connect(lambda: self.multitrack_timeline.canvas.remove_selected_clips(ripple=True) if hasattr(self, "multitrack_timeline") else None)
+
+        UndoManager.instance().undo_state_changed.connect(self._update_undo_actions)
+
+        # 3. Image Menu
         img_menu = mb.addMenu("&Image")
         scale_sub = img_menu.addMenu("Scale")
         scale_sub.addAction("1:1 Actual Size (Ctrl+1)").triggered.connect(lambda: self.viewport.set_scale_preset(1.0))
@@ -1092,13 +1142,17 @@ class MainWindow(QMainWindow):
         self.info_strip_act.triggered.connect(self._on_toggle_info_strip)
 
         review_menu.addSeparator()
+        self.act_seq_settings = review_menu.addAction("Sequence / Project Settings...")
+        self.act_seq_settings.triggered.connect(self._on_open_sequence_settings)
+
+        review_menu.addSeparator()
 
         review_menu.addAction("Process Info & Performance...").triggered.connect(self._on_show_process_info)
 
         # 5. Marking Menu
         mark_menu = mb.addMenu("&Marking")
-        bm_act = mark_menu.addAction("Toggle Bookmark (M)")
-        bm_act.triggered.connect(lambda: self.clock.toggle_bookmark())
+        bm_act = mark_menu.addAction("Toggle Bookmark / Review Marker (M)")
+        bm_act.triggered.connect(self._on_bookmark_toggle_or_timeline_marker)
 
         next_bm_act = mark_menu.addAction("Next Marker / Bookmark (Alt+Right)")
         next_bm_act.triggered.connect(self._on_next_marker)
@@ -1344,6 +1398,7 @@ class MainWindow(QMainWindow):
         ws_menu.addAction("VFX Breakdown & EXR (F7)").triggered.connect(lambda: self._apply_workspace("vfx_breakdown"))
         ws_menu.addAction("Cinema / Dailies Theater (F8)").triggered.connect(lambda: self._apply_workspace("cinema"))
         ws_menu.addAction("Supervisor Review & Notes (F9)").triggered.connect(lambda: self._apply_workspace("annotations"))
+        ws_menu.addAction("Timeline Mode (F10)").triggered.connect(lambda: self._apply_workspace("timeline_mode"))
         ws_menu.addSeparator()
         ws_menu.addAction("Save Current Workspace As...").triggered.connect(self._on_save_workspace_as)
         ws_menu.addAction("Reset Workspace to Default").triggered.connect(self._on_reset_workspace)
@@ -1362,6 +1417,11 @@ class MainWindow(QMainWindow):
         self.act_console_window = console_act
         win_menu.addAction("File Browser (Ctrl+B)").triggered.connect(self._on_toggle_file_browser)
         win_menu.addAction("Sources & Session Manager (`)").triggered.connect(self._on_toggle_playlist)
+        cut_list_act = win_menu.addAction("Cut List / Editorial Spreadsheet")
+        cut_list_act.setCheckable(True)
+        cut_list_act.setChecked(False)
+        cut_list_act.triggered.connect(self._on_toggle_cut_list_dock)
+        self.act_cut_list = cut_list_act
 
         # Category 3: Panel Layout & Docking (Alphabetical A-Z)
         win_menu.addSection("Panel Layout & Docking")
@@ -1468,7 +1528,7 @@ class MainWindow(QMainWindow):
         sm = self.shortcut_mgr
 
         # Transport & Playback
-        sm.bind_callback("playback.toggle", self.clock.toggle_playback)
+        sm.bind_callback("playback.toggle", self._toggle_playback)
         sm.bind_callback("playback.play_fwd", self.clock.play_forward)
         sm.bind_callback("playback.play_back", self.clock.play_backward)
         sm.bind_callback("playback.step_fwd", lambda: self.clock.step_forward(1))
@@ -1481,6 +1541,10 @@ class MainWindow(QMainWindow):
         sm.bind_callback("playback.shuttle_stop", self.clock.shuttle_stop)
         sm.bind_callback("playback.shuttle_fwd", self.clock.shuttle_forward)
         sm.bind_callback("playback.set_fps", self._on_choose_frame_rate)
+
+        # Edit & Global Undo/Redo
+        sm.bind_callback("edit.undo", self._on_global_undo)
+        sm.bind_callback("edit.redo", self._on_global_redo)
 
         # Channels
         sm.bind_callback("channel.rgb", lambda: self.top_bar.toggle_channel_mode(0))
@@ -1523,16 +1587,22 @@ class MainWindow(QMainWindow):
         sm.bind_callback("color.sliders_overlay", self._on_toggle_color_sliders)
 
         # Timeline
-        sm.bind_callback("timeline.zoom_in", self.timeline.zoom_in)
-        sm.bind_callback("timeline.zoom_out", self.timeline.zoom_out)
+        sm.bind_callback("timeline.tool_select", lambda: self.multitrack_timeline._set_tool("select") if hasattr(self, "multitrack_timeline") else None)
+        sm.bind_callback("timeline.tool_slide", lambda: self.multitrack_timeline._set_tool("slide") if hasattr(self, "multitrack_timeline") else None)
+        sm.bind_callback("timeline.tool_razor", lambda: self.multitrack_timeline._set_tool("razor") if hasattr(self, "multitrack_timeline") else None)
+        sm.bind_callback("timeline.zoom_in", self._on_timeline_zoom_in)
+        sm.bind_callback("timeline.zoom_out", self._on_timeline_zoom_out)
+        sm.bind_callback("timeline.delete_selected", self._on_timeline_delete_selected)
+        sm.bind_callback("timeline.ripple_delete", self._on_timeline_ripple_delete)
+        sm.bind_callback("timeline.split_cut", self._on_timeline_split_cut)
         sm.bind_callback("timeline.goto_frame", self._on_goto_frame_modal)
         sm.bind_callback("timeline.magnifier_toggle", self.timeline.toggle_magnifier_widget)
 
         # Marking & Bookmarks
-        sm.bind_callback("mark.in", lambda: self.clock.set_in_mark())
-        sm.bind_callback("mark.out", lambda: self.clock.set_out_mark())
+        sm.bind_callback("mark.in", self._on_timeline_mark_in)
+        sm.bind_callback("mark.out", self._on_timeline_mark_out)
         sm.bind_callback("mark.clear_in_out", self.clock.clear_in_out)
-        sm.bind_callback("mark.bookmark_toggle", lambda: self.clock.toggle_bookmark())
+        sm.bind_callback("mark.bookmark_toggle", self._on_bookmark_toggle_or_timeline_marker)
         sm.bind_callback("mark.bookmark_next", self._on_next_marker)
         sm.bind_callback("mark.bookmark_prev", self._on_prev_marker)
         sm.bind_callback("mark.bookmark_segment_next", self._on_step_clip_or_segment_next)
@@ -1568,8 +1638,8 @@ class MainWindow(QMainWindow):
 
         # Annotations
         sm.bind_callback("annot.toggle_pen", self.markup_palette.toggle_draw)
-        sm.bind_callback("annot.undo", lambda: self.annotation_store.undo(self.clock.current_frame))
-        sm.bind_callback("annot.redo", lambda: self.annotation_store.redo(self.clock.current_frame))
+        sm.bind_callback("annot.undo", self._on_global_undo)
+        sm.bind_callback("annot.redo", self._on_global_redo)
         sm.bind_callback("annot.clear_frame", self._on_clear_annotations)
         sm.bind_callback("annot.next_keyframe", self._on_next_keyframe)
         sm.bind_callback("annot.prev_keyframe", self._on_prev_keyframe)
@@ -1607,12 +1677,78 @@ class MainWindow(QMainWindow):
         sm.bind_callback("workspace.vfx_breakdown", lambda: self._apply_workspace("vfx_breakdown"))
         sm.bind_callback("workspace.cinema", lambda: self._apply_workspace("cinema"))
         sm.bind_callback("workspace.annotations", lambda: self._apply_workspace("annotations"))
+        sm.bind_callback("workspace.timeline_mode", lambda: self._apply_workspace("timeline_mode"))
         sm.bind_callback("app.preferences", self._on_open_preferences)
         sm.bind_callback("app.clear_cache", self._on_clear_cache)
         sm.bind_callback("app.clear_all_cache", self._on_clear_all_cache)
         sm.bind_callback("app.toggle_cache", self._on_toggle_cache)
         sm.bind_callback("app.quit", self.close)
         sm.bind_callback("app.escape", self._on_escape_pressed)
+
+    def _on_bookmark_toggle_or_timeline_marker(self) -> None:
+        """Toggle review bookmark or open timeline review marker dialog in Timeline Mode."""
+        if getattr(self, "workspace_mgr", None) and self.workspace_mgr.current_workspace == "timeline_mode":
+            if hasattr(self, "multitrack_timeline") and hasattr(self.multitrack_timeline, "canvas"):
+                f = self.multitrack_timeline.canvas._playhead_frame
+                seq = self.multitrack_timeline.canvas._sequence
+                if seq and seq.get_marker_at_frame(f):
+                    self.multitrack_timeline.canvas.edit_marker_dialog(f)
+                else:
+                    self.multitrack_timeline.canvas.add_marker_dialog(f)
+                return
+        self.clock.toggle_bookmark()
+
+    def _on_channel_luma_or_slip_tool(self) -> None:
+        """Toggle Luma channel mode in Review Mode."""
+        self.top_bar.toggle_channel_mode(5)
+
+    def _on_global_undo(self) -> None:
+        """Perform unified global undo."""
+        mgr = UndoManager.instance()
+        if mgr.can_undo():
+            mgr.undo()
+            if hasattr(self, "multitrack_timeline"):
+                self.multitrack_timeline.canvas.update()
+            if hasattr(self, "spreadsheet_cut_list"):
+                self.spreadsheet_cut_list.populate_from_sequence(self._active_sequence)
+            self._render_active_composite_frame()
+            self.viewport.update()
+        else:
+            # Fallback to annotation store undo if on a review frame with drawings
+            if hasattr(self, "annotation_store") and hasattr(self, "clock"):
+                self.annotation_store.undo(self.clock.current_frame)
+                self.viewport.update()
+
+    def _on_global_redo(self) -> None:
+        """Perform unified global redo."""
+        mgr = UndoManager.instance()
+        if mgr.can_redo():
+            mgr.redo()
+            if hasattr(self, "multitrack_timeline"):
+                self.multitrack_timeline.canvas.update()
+            if hasattr(self, "spreadsheet_cut_list"):
+                self.spreadsheet_cut_list.populate_from_sequence(self._active_sequence)
+            self._render_active_composite_frame()
+            self.viewport.update()
+        else:
+            # Fallback to annotation store redo
+            if hasattr(self, "annotation_store") and hasattr(self, "clock"):
+                self.annotation_store.redo(self.clock.current_frame)
+                self.viewport.update()
+
+    def _update_undo_actions(self) -> None:
+        """Update Edit menu Undo / Redo action text and enabled states."""
+        mgr = UndoManager.instance()
+        can_u = mgr.can_undo()
+        can_r = mgr.can_redo()
+        if hasattr(self, "undo_act"):
+            self.undo_act.setEnabled(can_u)
+            u_txt = mgr.undo_text()
+            self.undo_act.setText(f"Undo {u_txt} (Ctrl+Z)" if can_u and u_txt else "Undo (Ctrl+Z)")
+        if hasattr(self, "redo_act"):
+            self.redo_act.setEnabled(can_r)
+            r_txt = mgr.redo_text()
+            self.redo_act.setText(f"Redo {r_txt} (Ctrl+Shift+Z)" if can_r and r_txt else "Redo (Ctrl+Shift+Z / Ctrl+Y)")
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         """Handle top-level keyboard events via centralized ShortcutManager."""
@@ -1709,6 +1845,14 @@ class MainWindow(QMainWindow):
                 event.accept()
                 return
 
+        # Direct M hotkey in Timeline Mode to add Review Marker
+        if event.modifiers() == Qt.KeyboardModifier.NoModifier and event.key() == Qt.Key.Key_M:
+            if getattr(self, "workspace_mgr", None) and self.workspace_mgr.current_workspace == "timeline_mode":
+                if hasattr(self, "multitrack_timeline") and hasattr(self.multitrack_timeline, "canvas"):
+                    self.multitrack_timeline.canvas.add_marker_dialog()
+                    event.accept()
+                    return
+
         if self.shortcut_mgr.eventFilter(self, event):
             return
 
@@ -1746,7 +1890,12 @@ class MainWindow(QMainWindow):
         self.timeline.cache_mode_cycle_requested.connect(self._on_cycle_cache_mode)
         if hasattr(self.timeline, "cache_mode_selected"):
             self.timeline.cache_mode_selected.connect(self._on_set_cache_mode)
-        self.timeline.audio_clicked.connect(self._on_open_audio_settings)
+        if hasattr(self.timeline, "audio_toggle_mute_requested"):
+            self.timeline.audio_toggle_mute_requested.connect(self._on_toggle_audio_mute)
+        if hasattr(self.timeline, "audio_settings_requested"):
+            self.timeline.audio_settings_requested.connect(self._on_open_audio_settings)
+        else:
+            self.timeline.audio_clicked.connect(self._on_open_audio_settings)
         self.timeline.clear_cache_requested.connect(self._on_clear_all_cache)
         self.timeline.clear_annotations_requested.connect(
             lambda: (self.viewport.update(), self.statusBar().showMessage("All annotations cleared.", 3000))
@@ -1827,7 +1976,16 @@ class MainWindow(QMainWindow):
         self.clock.range_changed.connect(lambda s, e: self.audio_engine.set_sequence_context(s, self.clock.fps))
         self.clock.fps_changed.connect(lambda fps: self.audio_engine.set_sequence_context(self.clock.start_frame, fps))
         self.audio_engine.offsets_changed.connect(lambda _s, _f: self._on_audio_clock_sync(self.clock.current_frame))
-        self.audio_engine.mute_changed.connect(lambda m: hasattr(self, 'audio_mute_act') and self.audio_mute_act.setChecked(m))
+        def _on_mute_changed(m: bool):
+            if hasattr(self, 'audio_mute_act'):
+                self.audio_mute_act.setChecked(m)
+            if hasattr(self, 'timeline') and hasattr(self.timeline, 'set_audio_muted'):
+                self.timeline.set_audio_muted(m)
+        self.audio_engine.mute_changed.connect(_on_mute_changed)
+        if hasattr(self, 'timeline') and hasattr(self.timeline, 'set_audio_muted'):
+            self.timeline.set_audio_muted(self.audio_engine.is_muted())
+        self.audio_engine.track_loaded.connect(lambda p: hasattr(self, 'timeline') and hasattr(self.timeline, 'set_audio_path') and self.timeline.set_audio_path(p))
+        self.audio_engine.track_unloaded.connect(lambda: hasattr(self, 'timeline') and hasattr(self.timeline, 'set_audio_path') and self.timeline.set_audio_path(None))
         self.audio_engine.scrubbing_changed.connect(lambda s: hasattr(self, 'audio_scrub_act') and self.audio_scrub_act.setChecked(s))
 
         # Dailies Sync Engine Signals
@@ -1886,60 +2044,58 @@ class MainWindow(QMainWindow):
         """Handle completion of an immediate high-priority asynchronous decode."""
         if not success or data is None:
             return
+
+        # Always store decoded frame in cache so work is never discarded
+        if hasattr(self, "cache") and self.cache and not is_proxy:
+            if source_id:
+                self.cache.put_source_frame(source_id, source_frame, data, is_proxy=False, force=True)
+            else:
+                self.cache.put_frame(timeline_frame, data, is_proxy=False, force=True)
+
         if self.clock.current_frame != timeline_frame:
             return
 
-        orig_w = getattr(self.viewport, "_img_width", 0)
-        orig_h = getattr(self.viewport, "_img_height", 0)
-        logical_size = (orig_w, orig_h) if is_proxy and orig_w > 0 else None
+        # Resolve true native dimensions of the decoded source
+        source_obj = self.session_graph.sources.get(source_id) if (source_id and hasattr(self, "session_graph")) else None
+        native_w = source_obj.width if (source_obj and source_obj.width > 0) else 0
+        native_h = source_obj.height if (source_obj and source_obj.height > 0) else 0
+        if native_w == 0 or native_h == 0:
+            if hasattr(data, "shape") and len(data.shape) >= 2:
+                native_w = data.shape[1]
+                native_h = data.shape[0]
 
-        # Store in cache if full-res upgrade and caching not OFF
-        if hasattr(self, "cache") and self.cache and self.cache.mode != CacheMode.OFF and not is_proxy:
-            if source_id:
-                self.cache.put_source_frame(source_id, source_frame, data, is_proxy=False)
-            else:
-                self.cache.put_frame(timeline_frame, data, is_proxy=False)
+        logical_size = (native_w, native_h) if is_proxy and native_w > 0 else None
 
         viewable = self.session_graph.get_active_viewable() if hasattr(self, "session_graph") else None
         if isinstance(viewable, SequenceView):
             source, src_frame = viewable.resolve_frame(timeline_frame, self.session_graph.sources)
             if source and (source.id == source_id or not source_id):
                 self._update_pinned_frame(source.id, source_frame)
-                self.viewport.set_primary_frame(timeline_frame, data, logical_size=logical_size, is_proxy=is_proxy)
-                if hasattr(data, "shape") and len(data.shape) >= 2:
-                    if is_proxy:
-                        pw = orig_w if orig_w > 0 else data.shape[1]
-                        ph = orig_h if orig_h > 0 else data.shape[0]
-                        self._update_resolution_status(f"{pw}x{ph} (Proxy)")
-                    else:
-                        self._update_resolution_status(f"{data.shape[1]}x{data.shape[0]}")
-                self._update_hud_scopes(data)
+                seq_w, seq_h = viewable.get_format(self.session_graph.sources)
+                disp_data = conform_frame_to_format(data, seq_w, seq_h)
+                self.viewport.set_primary_frame(timeline_frame, disp_data, logical_size=(seq_w, seq_h), is_proxy=is_proxy)
+                self._update_resolution_status(f"{seq_w}x{seq_h}" + (" (Proxy)" if is_proxy else ""))
+                self._update_hud_scopes(disp_data)
         elif isinstance(viewable, StackView):
             layer_a = viewable.get_layer_a(self.session_graph.sources)
             layer_b = viewable.get_layer_b(self.session_graph.sources)
+            stk_w, stk_h = viewable.get_format(self.session_graph.sources)
             if layer_a and (layer_a.id == source_id or not source_id):
                 self._update_pinned_frame(layer_a.id, source_frame)
-                self.viewport.set_primary_frame(timeline_frame, data, logical_size=logical_size, is_proxy=is_proxy)
-                if hasattr(data, "shape") and len(data.shape) >= 2:
-                    if is_proxy:
-                        pw = orig_w if orig_w > 0 else data.shape[1]
-                        ph = orig_h if orig_h > 0 else data.shape[0]
-                        self._update_resolution_status(f"{pw}x{ph} (Proxy)")
-                    else:
-                        self._update_resolution_status(f"{data.shape[1]}x{data.shape[0]}")
-                self._update_hud_scopes(data)
+                disp_a = conform_frame_to_format(data, stk_w, stk_h)
+                self.viewport.set_primary_frame(timeline_frame, disp_a, logical_size=(stk_w, stk_h), is_proxy=is_proxy)
+                self._update_resolution_status(f"{stk_w}x{stk_h}" + (" (Proxy)" if is_proxy else ""))
+                self._update_hud_scopes(disp_a)
             elif layer_b and layer_b.id == source_id:
-                self.viewport.set_reference_frame(data)
+                disp_b = conform_frame_to_format(data, stk_w, stk_h)
+                self.viewport.set_reference_frame(disp_b)
         else:
             self._update_pinned_frame(source_id or None, timeline_frame)
             self.viewport.set_primary_frame(timeline_frame, data, logical_size=logical_size, is_proxy=is_proxy)
             if hasattr(data, "shape") and len(data.shape) >= 2:
-                if is_proxy:
-                    pw = orig_w if orig_w > 0 else data.shape[1]
-                    ph = orig_h if orig_h > 0 else data.shape[0]
-                    self._update_resolution_status(f"{pw}x{ph} (Proxy)")
-                else:
-                    self._update_resolution_status(f"{data.shape[1]}x{data.shape[0]}")
+                pw = native_w if is_proxy else data.shape[1]
+                ph = native_h if is_proxy else data.shape[0]
+                self._update_resolution_status(f"{pw}x{ph}" + (" (Proxy)" if is_proxy else ""))
             self._update_hud_scopes(data)
 
     def _on_frame_changed(self, frame: int) -> None:
@@ -1949,12 +2105,19 @@ class MainWindow(QMainWindow):
         if hasattr(self, "pkg_mgr") and self.pkg_mgr:
             self.pkg_mgr.dispatch_hook("on_frame_changed", frame)
 
+        in_timeline_mode = (
+            (getattr(self, "workspace_mgr", None) and self.workspace_mgr.current_workspace == "timeline_mode")
+            or (hasattr(self, "timeline_stack") and self.timeline_stack.currentWidget() == getattr(self, "multitrack_timeline", None))
+        )
+        if in_timeline_mode and getattr(self, "current_sequence", None):
+            self._render_timeline_frame(frame)
+            return
+
         viewable = self.session_graph.get_active_viewable() if hasattr(self, "session_graph") else None
         sync_read_allowed = not getattr(self, "_async_drop_active", False)
         is_fast_transport = (
-            self.clock.is_playing
-            or self._is_scrubbing
-            or abs(getattr(self.clock, "shuttle_speed", 1.0)) > 1.0
+            self._is_scrubbing
+            or abs(getattr(self.clock, "shuttle_speed", 1.0)) > 2.0
         )
         prefer_proxy = (
             is_fast_transport
@@ -1977,15 +2140,15 @@ class MainWindow(QMainWindow):
                     reader = self._get_reader_for_source(source)
                     if reader:
                         if is_fast_transport:
-                            # Zero-block asynchronous decode: never block Qt GUI thread during scrub or playback
+                            # Zero-block asynchronous decode: never block Qt GUI thread during scrub or high-speed shuttle
                             if hasattr(self, "reader_engine") and self.reader_engine:
                                 self.reader_engine.request_immediate_frame(
                                     source.id, src_frame, frame, reader=reader, downsample=True, callback=self._on_immediate_frame_ready
                                 )
-                        elif not self.clock.is_playing and sync_read_allowed:
+                        elif sync_read_allowed:
                             data = self._normalize_frame_data(reader.read_frame(src_frame))
-                            if self.cache.mode != CacheMode.OFF and data is not None:
-                                self.cache.put_source_frame(source.id, src_frame, data, is_proxy=False)
+                            if data is not None:
+                                self.cache.put_source_frame(source.id, src_frame, data, is_proxy=False, force=True)
                         elif hasattr(self, "reader_engine") and self.reader_engine:
                             self.reader_engine.request_immediate_frame(
                                 source.id, src_frame, frame, reader=reader, downsample=False, callback=self._on_immediate_frame_ready
@@ -1994,23 +2157,11 @@ class MainWindow(QMainWindow):
             self.viewport.set_reference_frame(None)
             if data is not None:
                 self._update_pinned_frame(source.id if source else None, src_frame if source else frame)
-                orig_w = getattr(self.viewport, "_img_width", 0)
-                orig_h = getattr(self.viewport, "_img_height", 0)
-                if orig_w == 0 or orig_h == 0:
-                    orig_w = getattr(reader, "width", 0) if "reader" in locals() and reader else 0
-                    orig_h = getattr(reader, "height", 0) if "reader" in locals() and reader else 0
-                if hasattr(data, "shape") and orig_w > 0 and data.shape[1] < orig_w:
-                    is_proxy = True
-                logical_size = (orig_w, orig_h) if is_proxy and orig_w > 0 else None
-                self.viewport.set_primary_frame(frame, data, logical_size=logical_size, is_proxy=is_proxy)
-                if hasattr(data, "shape") and len(data.shape) >= 2:
-                    if is_proxy:
-                        pw = orig_w if orig_w > 0 else data.shape[1]
-                        ph = orig_h if orig_h > 0 else data.shape[0]
-                        self._update_resolution_status(f"{pw}x{ph} (Proxy)")
-                    else:
-                        self._update_resolution_status(f"{data.shape[1]}x{data.shape[0]}")
-                self._update_hud_scopes(data)
+                seq_w, seq_h = viewable.get_format(self.session_graph.sources)
+                disp_data = conform_frame_to_format(data, seq_w, seq_h)
+                self.viewport.set_primary_frame(frame, disp_data, logical_size=(seq_w, seq_h), is_proxy=is_proxy)
+                self._update_resolution_status(f"{seq_w}x{seq_h}" + (" (Proxy)" if is_proxy else ""))
+                self._update_hud_scopes(disp_data)
             elif source is None:
                 self.viewport.set_primary_frame(frame, None)
 
@@ -2039,10 +2190,10 @@ class MainWindow(QMainWindow):
                                     self.reader_engine.request_immediate_frame(
                                         layer_b.id, frame, frame, reader=reader_b, downsample=True, callback=self._on_immediate_frame_ready
                                     )
-                            elif not self.clock.is_playing and sync_read_allowed:
+                            elif sync_read_allowed:
                                 data_b = self._normalize_frame_data(reader_b.read_frame(frame))
-                                if self.cache.mode != CacheMode.OFF and data_b is not None:
-                                    self.cache.put_source_frame(layer_b.id, frame, data_b, is_proxy=False)
+                                if data_b is not None:
+                                    self.cache.put_source_frame(layer_b.id, frame, data_b, is_proxy=False, force=True)
                             elif hasattr(self, "reader_engine") and self.reader_engine:
                                 self.reader_engine.request_immediate_frame(
                                     layer_b.id, frame, frame, reader=reader_b, downsample=False, callback=self._on_immediate_frame_ready
@@ -2053,21 +2204,11 @@ class MainWindow(QMainWindow):
                 self.viewport.set_reference_frame(None)
                 if data_b is not None:
                     self._update_pinned_frame(layer_b.id if layer_b else None, frame)
-                    orig_w = getattr(self.viewport, "_img_width", 0)
-                    orig_h = getattr(self.viewport, "_img_height", 0)
-                    if orig_w == 0 or orig_h == 0:
-                        orig_w = getattr(reader_b, "width", 0) if "reader_b" in locals() and reader_b else 0
-                        orig_h = getattr(reader_b, "height", 0) if "reader_b" in locals() and reader_b else 0
-                    logical_size = (orig_w, orig_h) if is_proxy_b and orig_w > 0 else None
-                    self.viewport.set_primary_frame(frame, data_b, logical_size=logical_size, is_proxy=is_proxy_b)
-                    if hasattr(data_b, "shape") and len(data_b.shape) >= 2:
-                        if is_proxy_b:
-                            pw = orig_w if orig_w > 0 else data_b.shape[1]
-                            ph = orig_h if orig_h > 0 else data_b.shape[0]
-                            self._update_resolution_status(f"{pw}x{ph} (Proxy)")
-                        else:
-                            self._update_resolution_status(f"{data_b.shape[1]}x{data_b.shape[0]}")
-                    self._update_hud_scopes(data_b)
+                    stk_w, stk_h = viewable.get_format(self.session_graph.sources)
+                    disp_b = conform_frame_to_format(data_b, stk_w, stk_h)
+                    self.viewport.set_primary_frame(frame, disp_b, logical_size=(stk_w, stk_h), is_proxy=is_proxy_b)
+                    self._update_resolution_status(f"{stk_w}x{stk_h}" + (" (Proxy)" if is_proxy_b else ""))
+                    self._update_hud_scopes(disp_b)
                 elif layer_b is None:
                     self.viewport.set_primary_frame(frame, None)
                 disp_data = data_b
@@ -2095,10 +2236,10 @@ class MainWindow(QMainWindow):
                                     self.reader_engine.request_immediate_frame(
                                         layer_a.id, frame, frame, reader=reader_a, downsample=True, callback=self._on_immediate_frame_ready
                                     )
-                            elif not self.clock.is_playing and sync_read_allowed:
+                            elif sync_read_allowed:
                                 data_a = self._normalize_frame_data(reader_a.read_frame(frame))
-                                if self.cache.mode != CacheMode.OFF and data_a is not None:
-                                    self.cache.put_source_frame(layer_a.id, frame, data_a, is_proxy=False)
+                                if data_a is not None:
+                                    self.cache.put_source_frame(layer_a.id, frame, data_a, is_proxy=False, force=True)
                             elif hasattr(self, "reader_engine") and self.reader_engine:
                                 self.reader_engine.request_immediate_frame(
                                     layer_a.id, frame, frame, reader=reader_a, downsample=False, callback=self._on_immediate_frame_ready
@@ -2115,10 +2256,10 @@ class MainWindow(QMainWindow):
                                     self.cache.put_source_frame(layer_b.id, frame, data_b, is_proxy=True)
                         reader_b = self._get_reader_for_source(layer_b)
                         if reader_b:
-                            if not self.clock.is_playing and sync_read_allowed:
+                            if sync_read_allowed:
                                 data_b = self._normalize_frame_data(reader_b.read_frame(frame))
-                                if self.cache.mode != CacheMode.OFF and data_b is not None:
-                                    self.cache.put_source_frame(layer_b.id, frame, data_b)
+                                if data_b is not None:
+                                    self.cache.put_source_frame(layer_b.id, frame, data_b, is_proxy=False, force=True)
                             elif hasattr(self, "reader_engine") and self.reader_engine:
                                 self.reader_engine.request_immediate_frame(
                                     layer_b.id, frame, frame, reader=reader_b, callback=self._on_immediate_frame_ready
@@ -2140,28 +2281,24 @@ class MainWindow(QMainWindow):
                 self.viewport.comparison_state.mode = comp_mode
                 self.viewport.comparison_state.stack_mix = getattr(viewable, "stack_mix", 1.0)
                 self.viewport.comparison_state.channels_a = getattr(viewable, "channels_a", (True, True, True, True))
+                stk_w, stk_h = viewable.get_format(self.session_graph.sources)
                 if data_a is not None:
                     self._update_pinned_frame(layer_a.id if layer_a else None, frame)
-                    orig_w = getattr(self.viewport, "_img_width", 0)
-                    orig_h = getattr(self.viewport, "_img_height", 0)
-                    logical_size = (orig_w, orig_h) if is_proxy_a and orig_w > 0 else None
-                    self.viewport.set_primary_frame(frame, data_a, logical_size=logical_size, is_proxy=is_proxy_a)
+                    disp_a = conform_frame_to_format(data_a, stk_w, stk_h)
+                    self.viewport.set_primary_frame(frame, disp_a, logical_size=(stk_w, stk_h), is_proxy=is_proxy_a)
                 elif layer_a is None:
                     self.viewport.set_primary_frame(frame, None)
 
                 if data_b is not None:
-                    self.viewport.set_reference_frame(data_b)
+                    disp_b = conform_frame_to_format(data_b, stk_w, stk_h)
+                    self.viewport.set_reference_frame(disp_b)
                 elif layer_b is None:
                     self.viewport.set_reference_frame(None)
                 disp_data = data_a
 
             if disp_data is not None and hasattr(disp_data, "shape") and len(disp_data.shape) >= 2:
-                if disp_is_proxy:
-                    orig_w = getattr(self.viewport, "_img_width", disp_data.shape[1])
-                    orig_h = getattr(self.viewport, "_img_height", disp_data.shape[0])
-                    self._update_resolution_status(f"{orig_w}x{orig_h} (Proxy)")
-                else:
-                    self._update_resolution_status(f"{disp_data.shape[1]}x{disp_data.shape[0]}")
+                stk_w, stk_h = viewable.get_format(self.session_graph.sources)
+                self._update_resolution_status(f"{stk_w}x{stk_h}" + (" (Proxy)" if disp_is_proxy else ""))
             if disp_data is not None:
                 self._update_hud_scopes(disp_data)
 
@@ -2171,10 +2308,16 @@ class MainWindow(QMainWindow):
                 d = self.cache.get_source_frame(src.id, sf)
                 if d is None:
                     r = self._get_reader_for_source(src)
-                    if r and hasattr(self, "reader_engine") and self.reader_engine:
-                        self.reader_engine.request_immediate_frame(
-                            src.id, sf, frame, reader=r, callback=self._on_immediate_frame_ready
-                        )
+                    if r:
+                        if is_fast_transport:
+                            if hasattr(self, "reader_engine") and self.reader_engine:
+                                self.reader_engine.request_immediate_frame(
+                                    src.id, sf, frame, reader=r, callback=self._on_immediate_frame_ready
+                                )
+                        elif sync_read_allowed:
+                            d = self._normalize_frame_data(r.read_frame(sf))
+                            if d is not None:
+                                self.cache.put_source_frame(src.id, sf, d, force=True)
                 return d
 
             comp_data = composite_layout_grid(
@@ -2218,10 +2361,10 @@ class MainWindow(QMainWindow):
                             self.reader_engine.request_immediate_frame(
                                 cur_src_id, frame, frame, reader=self.reader, downsample=True, callback=self._on_immediate_frame_ready
                             )
-                    elif (not self.clock.is_playing or self.viewport._image_a is None) and sync_read_allowed:
+                    elif sync_read_allowed:
                         data = self._normalize_frame_data(self.reader.read_frame(frame))
-                        if self.cache.mode != CacheMode.OFF and data is not None:
-                            self.cache.put_source_frame(cur_src_id, frame, data, is_proxy=False)
+                        if data is not None:
+                            self.cache.put_source_frame(cur_src_id, frame, data, is_proxy=False, force=True)
                     elif hasattr(self, "reader_engine") and self.reader_engine:
                         self.reader_engine.request_immediate_frame(
                             cur_src_id, frame, frame, reader=self.reader, downsample=False, callback=self._on_immediate_frame_ready
@@ -2240,10 +2383,10 @@ class MainWindow(QMainWindow):
                             self.reader_engine.request_immediate_frame(
                                 "", frame, frame, reader=self.reader, downsample=True, callback=self._on_immediate_frame_ready
                             )
-                    elif (not self.clock.is_playing or self.viewport._image_a is None) and sync_read_allowed:
+                    elif sync_read_allowed:
                         data = self._normalize_frame_data(self.reader.read_frame(frame))
-                        if self.cache.mode != CacheMode.OFF and data is not None:
-                            self.cache.put_frame(frame, data, is_proxy=False)
+                        if data is not None:
+                            self.cache.put_frame(frame, data, is_proxy=False, force=True)
                     elif hasattr(self, "reader_engine") and self.reader_engine:
                         self.reader_engine.request_immediate_frame(
                             "", frame, frame, reader=self.reader, downsample=False, callback=self._on_immediate_frame_ready
@@ -2251,20 +2394,21 @@ class MainWindow(QMainWindow):
 
             if data is not None:
                 self._update_pinned_frame(cur_src_id, frame)
-                orig_w = getattr(self.viewport, "_img_width", 0)
-                orig_h = getattr(self.viewport, "_img_height", 0)
-                if orig_w == 0 or orig_h == 0:
-                    orig_w = getattr(self.reader, "width", 0) if hasattr(self, "reader") and self.reader else 0
-                    orig_h = getattr(self.reader, "height", 0) if hasattr(self, "reader") and self.reader else 0
-                if hasattr(data, "shape") and orig_w > 0 and data.shape[1] < orig_w:
+                source_obj = self.session_graph.sources.get(cur_src_id) if (cur_src_id and hasattr(self, "session_graph")) else None
+                native_w = source_obj.width if (source_obj and source_obj.width > 0) else (getattr(self.reader, "width", 0) if hasattr(self, "reader") and self.reader else 0)
+                native_h = source_obj.height if (source_obj and source_obj.height > 0) else (getattr(self.reader, "height", 0) if hasattr(self, "reader") and self.reader else 0)
+                if native_w == 0 or native_h == 0:
+                    if hasattr(data, "shape") and len(data.shape) >= 2:
+                        native_w = data.shape[1]
+                        native_h = data.shape[0]
+
+                if hasattr(data, "shape") and native_w > 0 and data.shape[1] < native_w:
                     is_proxy = True
-                logical_size = (orig_w, orig_h) if is_proxy and orig_w > 0 else None
+                logical_size = (native_w, native_h) if is_proxy and native_w > 0 else None
                 self.viewport.set_primary_frame(frame, data, logical_size=logical_size, is_proxy=is_proxy)
                 if hasattr(data, "shape") and len(data.shape) >= 2:
                     if is_proxy:
-                        pw = orig_w if orig_w > 0 else data.shape[1]
-                        ph = orig_h if orig_h > 0 else data.shape[0]
-                        self._update_resolution_status(f"{pw}x{ph} (Proxy)")
+                        self._update_resolution_status(f"{native_w}x{native_h} (Proxy)")
                     else:
                         self._update_resolution_status(f"{data.shape[1]}x{data.shape[0]}")
                 self._update_hud_scopes(data)
@@ -2428,7 +2572,10 @@ class MainWindow(QMainWindow):
             self.reader_engine.pause_prefetch()
         if hasattr(self, "_delayed_cache_timer"):
             self._delayed_cache_timer.stop()
-        self.clock.step_forward(delta)
+        if delta > 0:
+            self.clock.step_forward(delta, wrap=False)
+        elif delta < 0:
+            self.clock.step_backward(-delta, wrap=False)
         if not self.clock.is_playing and hasattr(self, "audio_engine") and self.audio_engine:
             self.audio_engine.scrub_frame(self.clock.current_frame)
         if hasattr(self, "_scrub_settle_timer"):
@@ -2498,15 +2645,35 @@ class MainWindow(QMainWindow):
         if frame == self.clock.current_frame:
             self._on_frame_changed(frame)
 
+    def _toggle_playback(self) -> None:
+        """Toggle playback, ensuring timeline sequence playback range is synchronized if in timeline mode."""
+        in_timeline_mode = (
+            (getattr(self, "workspace_mgr", None) and self.workspace_mgr.current_workspace == "timeline_mode")
+            or (hasattr(self, "timeline_stack") and self.timeline_stack.currentWidget() == getattr(self, "multitrack_timeline", None))
+        )
+        if in_timeline_mode and hasattr(self, "_sync_timeline_playback_range"):
+            self._sync_timeline_playback_range()
+        self.clock.toggle_playback()
+
     def _on_playback_state_changed(self, is_playing: bool) -> None:
         """Synchronize audio playback state immediately and prefetch frames ahead when playback starts."""
+        in_timeline_mode = (
+            (getattr(self, "workspace_mgr", None) and self.workspace_mgr.current_workspace == "timeline_mode")
+            or (hasattr(self, "timeline_stack") and self.timeline_stack.currentWidget() == getattr(self, "multitrack_timeline", None))
+        )
+        if is_playing and in_timeline_mode and hasattr(self, "_sync_timeline_playback_range"):
+            self._sync_timeline_playback_range()
+
         if hasattr(self, "viewport") and self.viewport:
             self.viewport.set_is_playing(is_playing)
         if hasattr(self, "audio_engine") and self.audio_engine:
             if is_playing:
-                self.audio_engine.sync_to_frame(
-                    self.clock.current_frame, True, self.clock.shuttle_speed
-                )
+                if self._is_in_timeline_mode() and getattr(self, "current_sequence", None):
+                    self._sync_timeline_audio_to_frame(self.clock.current_frame, True, self.clock.shuttle_speed)
+                else:
+                    self.audio_engine.sync_to_frame(
+                        self.clock.current_frame, True, self.clock.shuttle_speed
+                    )
             else:
                 self.audio_engine.pause(self.clock.current_frame)
         if is_playing:
@@ -3051,7 +3218,11 @@ class MainWindow(QMainWindow):
             for r in self._source_readers.values():
                 if hasattr(r, "set_matrix_mapping"):
                     r.set_matrix_mapping(mapping)
-        self.cache.clear()
+        viewable = self.session_graph.get_active_viewable() if hasattr(self, "session_graph") else None
+        if viewable and hasattr(viewable, "id"):
+            self.cache.clear_source(viewable.id)
+        else:
+            self.cache.clear()
         self._on_frame_changed(self.clock.current_frame)
         self.statusBar().showMessage("EXR Channel Matrix Routing Applied", 2500)
 
@@ -3550,6 +3721,10 @@ class MainWindow(QMainWindow):
             if self._is_current_media_exr(viewable, frame_num):
                 raw, _ = self._composite_current_exr_contact_sheet(viewable, frame_num)
 
+        if raw is None and self._is_in_timeline_mode() and getattr(self, "current_sequence", None):
+            frame_data, cdl, extra = self.timeline_compositor.render_frame(self.current_sequence, frame_num)
+            raw = frame_data
+
         if raw is None and hasattr(self, "session_graph"):
             viewable = self.session_graph.get_active_viewable()
             if isinstance(viewable, SourceItem):
@@ -3626,7 +3801,10 @@ class MainWindow(QMainWindow):
 
     def _on_audio_clock_sync(self, frame: int) -> None:
         """Synchronize audio engine playback position with clock frame."""
-        self.audio_engine.sync_to_frame(frame, self.clock.is_playing, self.clock.shuttle_speed)
+        if self._is_in_timeline_mode() and getattr(self, "current_sequence", None):
+            self._sync_timeline_audio_to_frame(frame, self.clock.is_playing, self.clock.shuttle_speed)
+        else:
+            self.audio_engine.sync_to_frame(frame, self.clock.is_playing, self.clock.shuttle_speed)
 
     def _on_toggle_audio_mute(self) -> None:
         """Toggle audio mute state (Ctrl+M)."""
@@ -4037,6 +4215,64 @@ class MainWindow(QMainWindow):
             self.clock.set_fps(fps)
             self.statusBar().showMessage(f"Playback Frame Rate set to {fps:.2f} FPS", 3000)
 
+    def _on_timeline_zoom_in(self) -> None:
+        in_tl = (
+            (getattr(self, "workspace_mgr", None) and self.workspace_mgr.current_workspace == "timeline_mode")
+            or (hasattr(self, "timeline_stack") and self.timeline_stack.currentWidget() == getattr(self, "multitrack_timeline", None))
+        )
+        if in_tl and hasattr(self, "multitrack_timeline"):
+            self.multitrack_timeline.zoom_in()
+        elif hasattr(self, "timeline"):
+            self.timeline.zoom_in()
+
+    def _on_timeline_zoom_out(self) -> None:
+        in_tl = (
+            (getattr(self, "workspace_mgr", None) and self.workspace_mgr.current_workspace == "timeline_mode")
+            or (hasattr(self, "timeline_stack") and self.timeline_stack.currentWidget() == getattr(self, "multitrack_timeline", None))
+        )
+        if in_tl and hasattr(self, "multitrack_timeline"):
+            self.multitrack_timeline.zoom_out()
+        elif hasattr(self, "timeline"):
+            self.timeline.zoom_out()
+
+    def _on_timeline_delete_selected(self) -> None:
+        if hasattr(self, "multitrack_timeline") and hasattr(self.multitrack_timeline, "canvas"):
+            from PySide6.QtGui import QKeyEvent
+            from PySide6.QtCore import QEvent
+            ev = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Delete, Qt.KeyboardModifier.NoModifier)
+            self.multitrack_timeline.canvas.keyPressEvent(ev)
+
+    def _on_timeline_ripple_delete(self) -> None:
+        if hasattr(self, "multitrack_timeline") and hasattr(self.multitrack_timeline, "canvas"):
+            from PySide6.QtGui import QKeyEvent
+            from PySide6.QtCore import QEvent
+            ev = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Delete, Qt.KeyboardModifier.ShiftModifier)
+            self.multitrack_timeline.canvas.keyPressEvent(ev)
+
+    def _on_timeline_split_cut(self) -> None:
+        if hasattr(self, "multitrack_timeline") and hasattr(self.multitrack_timeline, "canvas"):
+            self.multitrack_timeline.canvas._split_at_playhead()
+
+    def _on_timeline_mark_in(self) -> None:
+        in_tl = (
+            (getattr(self, "workspace_mgr", None) and self.workspace_mgr.current_workspace == "timeline_mode")
+            or (hasattr(self, "timeline_stack") and self.timeline_stack.currentWidget() == getattr(self, "multitrack_timeline", None))
+        )
+        if in_tl and hasattr(self, "multitrack_timeline"):
+            self.multitrack_timeline.mark_in()
+        if hasattr(self, "clock"):
+            self.clock.set_in_mark()
+
+    def _on_timeline_mark_out(self) -> None:
+        in_tl = (
+            (getattr(self, "workspace_mgr", None) and self.workspace_mgr.current_workspace == "timeline_mode")
+            or (hasattr(self, "timeline_stack") and self.timeline_stack.currentWidget() == getattr(self, "multitrack_timeline", None))
+        )
+        if in_tl and hasattr(self, "multitrack_timeline"):
+            self.multitrack_timeline.mark_out()
+        if hasattr(self, "clock"):
+            self.clock.set_out_mark()
+
     def _on_goto_frame_modal(self) -> None:
         """Prompt user with a modal dialog to jump to an exact frame number (Ctrl+G)."""
         start_f = self.clock.start_frame
@@ -4409,9 +4645,12 @@ class MainWindow(QMainWindow):
         direction = "Fwd" if speed > 0 else "Rev"
         self.shuttle_status_label.setText(f"{abs(speed):.1f}x {direction}" if speed != 1.0 else "1.0x")
         if hasattr(self, "audio_engine") and self.audio_engine:
-            self.audio_engine.sync_to_frame(
-                self.clock.current_frame, self.clock.is_playing, speed
-            )
+            if self._is_in_timeline_mode() and getattr(self, "current_sequence", None):
+                self._sync_timeline_audio_to_frame(self.clock.current_frame, self.clock.is_playing, speed)
+            else:
+                self.audio_engine.sync_to_frame(
+                    self.clock.current_frame, self.clock.is_playing, speed
+                )
 
     def _on_annotations_changed(self, frame: int) -> None:
         self.viewport.update()
@@ -4612,7 +4851,11 @@ class MainWindow(QMainWindow):
             if hasattr(self, "vfx_exr_dock") and hasattr(self.vfx_exr_dock, "layers_widget"):
                 self.vfx_exr_dock.layers_widget.refresh_list(["beauty"])
             if hasattr(self, "vfx_exr_dock") and hasattr(self.vfx_exr_dock, "channel_matrix_widget"):
-                self.vfx_exr_dock.channel_matrix_widget.populate_matrix({}, [])
+                self.vfx_exr_dock.channel_matrix_widget.blockSignals(True)
+                try:
+                    self.vfx_exr_dock.channel_matrix_widget.populate_matrix({}, [])
+                finally:
+                    self.vfx_exr_dock.channel_matrix_widget.blockSignals(False)
             return
 
         try:
@@ -4642,9 +4885,17 @@ class MainWindow(QMainWindow):
             try:
                 layers_dict, all_chans = inspect_exr_matrix(str(path))
                 if hasattr(self, "channel_matrix_widget"):
-                    self.channel_matrix_widget.populate_matrix(layers_dict, all_chans)
+                    self.channel_matrix_widget.blockSignals(True)
+                    try:
+                        self.channel_matrix_widget.populate_matrix(layers_dict, all_chans)
+                    finally:
+                        self.channel_matrix_widget.blockSignals(False)
                 if hasattr(self, "vfx_exr_dock") and hasattr(self.vfx_exr_dock, "channel_matrix_widget"):
-                    self.vfx_exr_dock.channel_matrix_widget.populate_matrix(layers_dict, all_chans)
+                    self.vfx_exr_dock.channel_matrix_widget.blockSignals(True)
+                    try:
+                        self.vfx_exr_dock.channel_matrix_widget.populate_matrix(layers_dict, all_chans)
+                    finally:
+                        self.vfx_exr_dock.channel_matrix_widget.blockSignals(False)
             except Exception:
                 pass
         except Exception:
@@ -4654,9 +4905,17 @@ class MainWindow(QMainWindow):
             if hasattr(self, "vfx_exr_dock") and hasattr(self.vfx_exr_dock, "layers_widget"):
                 self.vfx_exr_dock.layers_widget.refresh_list(["beauty"])
 
-    def _load_path(self, path: str) -> None:
+    def _load_path(self, path: str, force_reload: bool = False) -> None:
         if not path or not os.path.exists(path):
             return
+
+        if force_reload:
+            if hasattr(self, "cache"):
+                self.cache.clear()
+            if hasattr(self, "timeline_compositor"):
+                self.timeline_compositor.clear_cache()
+            if hasattr(self, "audio_engine") and hasattr(self.audio_engine, "clear_cache"):
+                self.audio_engine.clear_cache()
 
         self._is_exr_contact_sheet_active = False
         if hasattr(self, "layers_widget"):
@@ -4668,8 +4927,9 @@ class MainWindow(QMainWindow):
         self._update_recent_menu()
 
         if hasattr(self, "session_graph"):
-            src = self.session_graph.add_source_from_path(path)
-            self.session_graph.set_active_view(ViewType.SOURCE, src.id)
+            src = self.session_graph.add_source_from_path(path, force_reload=force_reload)
+            if src:
+                self.session_graph.set_active_view(ViewType.SOURCE, src.id)
             if hasattr(self, "sources_dock"):
                 self.sources_dock.panel.refresh_tree()
 
@@ -4710,6 +4970,11 @@ class MainWindow(QMainWindow):
                 self._auto_configure_media_colorspace(path, source_item=src if 'src' in locals() else None)
                 base = os.path.basename(path)
                 self._update_window_title()
+                self._populate_sequence_from_loaded_media(
+                    path, 1, vid_reader.total_frames, vid_reader.fps,
+                    width=getattr(vid_reader, "_width", 1920),
+                    height=getattr(vid_reader, "_height", 1080),
+                )
                 self.statusBar().showMessage(
                     f"Loaded Video: {base} ({vid_reader.total_frames} frames @ {vid_reader.fps:.2f} fps)",
                     6000,
@@ -4740,6 +5005,10 @@ class MainWindow(QMainWindow):
             gaps_info = f" ({len(seq_info.missing_frames)} gaps)" if seq_info.missing_frames else ""
             seq_display = f"{seq_info.prefix}{seq_info.separator}####{seq_info.extension}"
             self._update_window_title()
+            seq_pattern = f"{seq_info.prefix}{seq_info.separator}####{seq_info.extension}"
+            self._populate_sequence_from_loaded_media(
+                seq_pattern, seq_info.start_frame, seq_info.end_frame, self.clock.fps
+            )
             self.statusBar().showMessage(
                 f"Loaded Sequence: {seq_display} [{seq_info.start_frame}-{seq_info.end_frame}]{gaps_info}",
                 6000,
@@ -4756,7 +5025,7 @@ class MainWindow(QMainWindow):
 
             # Auto-configure colorspace from image metadata
             self._auto_configure_media_colorspace(path, source_item=src if 'src' in locals() else None)
-
+            self._populate_sequence_from_loaded_media(path, 1, 100, self.clock.fps)
             self._on_frame_changed(self.clock.current_frame)
             self._update_window_title()
             self.statusBar().showMessage(f"Loaded Media: {os.path.basename(path)}", 5000)
@@ -5556,17 +5825,21 @@ class MainWindow(QMainWindow):
     def _on_batch_export_media(self) -> None:
         """Open the Hardware-Accelerated Batch Export Queue Dialog."""
         name = "Media"
-        if hasattr(self, "session_graph"):
+        if self._is_in_timeline_mode() and getattr(self, "current_sequence", None):
+            name = getattr(self.current_sequence, "name", "Sequence")
+        elif hasattr(self, "session_graph"):
             viewable = self.session_graph.get_active_viewable()
             if viewable:
                 name = getattr(viewable, "name", "Shot")
         elif self.reader and getattr(self.reader, "path", None):
             name = Path(self.reader.path).stem
 
-        if self.clock.duration > 0:
-            frames = list(range(self.clock.duration))
+        if self.clock.end_frame >= self.clock.start_frame:
+            frames = list(range(self.clock.start_frame, self.clock.end_frame + 1))
+        elif hasattr(self.clock, "duration") and self.clock.duration > 0:
+            frames = list(range(self.clock.start_frame, self.clock.start_frame + self.clock.duration))
         else:
-            frames = [0]
+            frames = [getattr(self.clock, "current_frame", 0)]
 
         active_info = {
             "frame_provider": self._render_frame_for_export,
@@ -6251,6 +6524,10 @@ class MainWindow(QMainWindow):
             render_frame_callback=self._render_frame_for_export,
             parent=self,
         )
+        self.spreadsheet_dock = SpreadsheetDockWidget(self)
+        self.soft_effects_dock = SoftEffectsDockWidget(self)
+        self.sdi_monitor_mgr = SDIMonitorManager(self)
+        self.current_sequence = None
 
         # 2. Add to Dock Areas
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.scopes_dock)
@@ -6260,6 +6537,12 @@ class MainWindow(QMainWindow):
         # are integrated directly into Scopes accordion (sec_color).
         self.color_dock.hide()
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.annotations_dock)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.spreadsheet_dock)
+        self.tabifyDockWidget(self.sources_dock, self.spreadsheet_dock)
+        self.sources_dock.raise_()
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.soft_effects_dock)
+        self.resizeDocks([self.sources_dock, self.spreadsheet_dock], [280, 280], Qt.Orientation.Horizontal)
+        self.resizeDocks([self.soft_effects_dock], [260], Qt.Orientation.Horizontal)
 
         # 3. Register scopes with ScopeAsyncEngine
         if hasattr(self, "scope_engine"):
@@ -6311,16 +6594,108 @@ class MainWindow(QMainWindow):
         self.vfx_exr_dock.hide()
         self.color_dock.hide()
         self.annotations_dock.hide()
+        self.spreadsheet_dock.hide()
+        self.soft_effects_dock.hide()
+        # Connect Timeline Mode signals
+        self.multitrack_timeline.playhead_changed.connect(self._on_timeline_playhead_changed)
+        self.clock.frame_changed.connect(self.multitrack_timeline.set_playhead_frame)
+        self.clock.playback_state_changed.connect(self.multitrack_timeline.set_is_playing)
+        self.multitrack_timeline.clip_selected.connect(lambda trk_id, c_id: self._on_timeline_clip_selected(trk_id, c_id))
+        self.multitrack_timeline.sequence_changed.connect(self._on_timeline_sequence_changed)
+        self.multitrack_timeline.in_out_changed.connect(self._on_timeline_in_out_changed)
+        self.spreadsheet_dock.spreadsheet.clip_selected.connect(self._on_timeline_clip_selected)
+        self.spreadsheet_dock.spreadsheet.conform_requested.connect(self._on_timeline_conform_requested)
+        self.spreadsheet_dock.spreadsheet.relink_requested.connect(self._on_timeline_relink_requested)
+        self.spreadsheet_dock.spreadsheet.sequence_modified.connect(self._on_timeline_sequence_changed)
+        self.spreadsheet_dock.visibilityChanged.connect(
+            lambda v: self.act_cut_list.setChecked(v) if hasattr(self, "act_cut_list") else None
+        )
+        self.soft_effects_dock.inspector.effect_changed.connect(self._on_timeline_soft_effect_changed)
+        self.multitrack_timeline.scrub_frame_requested.connect(self._on_timeline_audio_scrub)
+        self.multitrack_timeline.scrub_started.connect(self._on_timeline_scrub_started)
+        self.multitrack_timeline.scrub_finished.connect(self._on_timeline_scrub_finished)
+        # Transport controls from timeline canvas
+        self.multitrack_timeline.toggle_playback_requested.connect(self._toggle_playback)
+        self.multitrack_timeline.shuttle_reverse_requested.connect(self.clock.shuttle_reverse)
+        self.multitrack_timeline.pause_requested.connect(self.clock.pause)
+        self.multitrack_timeline.shuttle_forward_requested.connect(self.clock.shuttle_forward)
+        self.multitrack_timeline.step_backward_requested.connect(lambda n: self.clock.step_backward(n))
+        self.multitrack_timeline.step_forward_requested.connect(lambda n: self.clock.step_forward(n))
+        self.multitrack_timeline.settings_requested.connect(self._on_open_sequence_settings)
 
         # 5. Load persisted custom workspaces
         custom_ws = getattr(self.pref_mgr.prefs, "custom_workspaces", {})
         if custom_ws:
             self.workspace_mgr.import_custom_workspaces(custom_ws)
 
+        # 6. Apply startup workspace based on preferences
+        startup_pref = getattr(self.pref_mgr.prefs, "startup_workspace", "last_used")
+        if startup_pref == "last_used":
+            target_ws = getattr(self.pref_mgr.prefs, "active_workspace", "review")
+        else:
+            target_ws = startup_pref
+        self._apply_workspace(target_ws)
+
+    def _on_toggle_cut_list_dock(self) -> None:
+        """Toggle visibility of the Cut List / Editorial Spreadsheet dock."""
+        if hasattr(self, "spreadsheet_dock") and self.spreadsheet_dock:
+            vis = not self.spreadsheet_dock.isVisible()
+            self.spreadsheet_dock.setVisible(vis)
+            if hasattr(self, "act_cut_list"):
+                self.act_cut_list.setChecked(vis)
+
     def _apply_workspace(self, ws_id: str) -> None:
         """Apply a studio workspace preset (review, color_qc, vfx_breakdown, cinema, annotations, or custom)."""
         ok = self.workspace_mgr.apply_workspace(ws_id, self)
         if ok:
+            from openreview.core.shortcuts import ShortcutManager
+            ShortcutManager.instance().set_active_workspace(ws_id)
+            if hasattr(self, "timeline_stack") and hasattr(self, "multitrack_timeline"):
+                from PySide6.QtWidgets import QSizePolicy
+                if ws_id == "timeline_mode":
+                    if hasattr(self, "timeline_dock"):
+                        self.timeline_dock.setMinimumHeight(160)
+                        self.timeline_dock.setMaximumHeight(16777215)
+                    self.timeline_stack.setMinimumHeight(160)
+                    self.timeline_stack.setMaximumHeight(16777215)
+                    self.multitrack_timeline.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+                    self.multitrack_timeline.setMinimumHeight(160)
+                    self.timeline_stack.setCurrentWidget(self.multitrack_timeline)
+                    if hasattr(self, "timeline_dock"):
+                        self.timeline_dock.setWindowTitle("Multi-Track Timeline")
+                        target_h = getattr(self, "_last_multitrack_timeline_height", 280)
+                        self.resizeDocks([self.timeline_dock], [target_h], Qt.Orientation.Vertical)
+                    if not self.current_sequence:
+                        self._init_demo_timeline_sequence()
+                    self._sync_timeline_playback_range()
+                    self._sync_timeline_audio_engine()
+                    self._render_timeline_frame(self.clock.current_frame)
+                else:
+                    if hasattr(self, "timeline_dock") and self.timeline_dock.isVisible():
+                        cur_h = self.timeline_dock.height()
+                        if cur_h > 120 and self.timeline_stack.currentWidget() == self.multitrack_timeline:
+                            self._last_multitrack_timeline_height = cur_h
+
+                    self.multitrack_timeline.setMinimumHeight(0)
+                    self.multitrack_timeline.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+                    self.timeline.setFixedHeight(64)
+                    self.timeline.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+                    self.timeline_stack.setCurrentWidget(self.timeline)
+                    self.timeline_stack.setFixedHeight(64)
+                    if hasattr(self, "timeline_dock"):
+                        self.timeline_dock.setWindowTitle("Timeline")
+                        self.timeline_dock.setMinimumHeight(64)
+                        self.timeline_dock.setMaximumHeight(64)
+                        self.timeline_dock.setFixedHeight(64)
+                        self.resizeDocks([self.timeline_dock], [64], Qt.Orientation.Vertical)
+                    if hasattr(self, "soft_effects_dock"):
+                        self.soft_effects_dock.hide()
+                    if hasattr(self, "spreadsheet_dock"):
+                        self.spreadsheet_dock.hide()
+                    if hasattr(self, "viewport"):
+                        self.viewport.set_cdl_enabled(False)
+                        self.viewport.aspect_ratio_mask = None
+                    self._on_frame_changed(self.clock.current_frame)
             ws = self.workspace_mgr.get_workspace(ws_id)
             name = ws.name if ws else ws_id
             if hasattr(self, "top_bar") and hasattr(self.top_bar, "set_active_workspace"):
@@ -6347,7 +6722,9 @@ class MainWindow(QMainWindow):
 
     def _on_reset_workspace(self) -> None:
         cur = self.workspace_mgr.current_workspace
-        base_id = cur if cur in ("review", "color_qc", "vfx_breakdown", "cinema", "annotations") else "review"
+        base_id = cur if cur in ("review", "color_qc", "vfx_breakdown", "cinema", "annotations", "timeline_mode") else "review"
+        if base_id == "timeline_mode":
+            self._last_multitrack_timeline_height = 280
         self._apply_workspace(base_id)
         self.statusBar().showMessage(f"Reset workspace to {base_id.title()}", 2500)
 
@@ -6613,18 +6990,18 @@ class MainWindow(QMainWindow):
             self.comparison_state.mode = ComparisonMode.OFF
             self.viewport.comparison_state.mode = ComparisonMode.OFF
             self.viewport.set_reference_frame(None)
+            seq_w, seq_h = viewable.get_format(self.session_graph.sources)
             from openreview.core.reader import CallableVirtualReader
             def _fetch_seq(f: int):
                 src, sf = viewable.resolve_frame(f, self.session_graph.sources)
                 if src:
                     d = self.cache.get_source_frame(src.id, sf)
-                    if d is not None:
-                        return d
-                    r = self._get_reader_for_source(src)
-                    d = r.read_frame(sf) if r else None
-                    if self.cache.mode != CacheMode.OFF and d is not None:
-                        self.cache.put_source_frame(src.id, sf, d)
-                    return d
+                    if d is None:
+                        r = self._get_reader_for_source(src)
+                        d = r.read_frame(sf) if r else None
+                        if self.cache.mode != CacheMode.OFF and d is not None:
+                            self.cache.put_source_frame(src.id, sf, d)
+                    return conform_frame_to_format(d, seq_w, seq_h) if d is not None else None
                 return None
             self.reader = CallableVirtualReader(_fetch_seq)
             self.reader_engine.set_reader(self.reader)
@@ -6673,6 +7050,7 @@ class MainWindow(QMainWindow):
             else:
                 start_f, end_f = 1, 100
 
+            stk_w, stk_h = viewable.get_format(self.session_graph.sources)
             from openreview.core.reader import CallableVirtualReader
             def _fetch_stack(f: int):
                 if self.viewport.comparison_state.mode != ComparisonMode.OFF:
@@ -6694,18 +7072,19 @@ class MainWindow(QMainWindow):
                             db = rb.read_frame(f) if rb else None
                             if self.cache.mode != CacheMode.OFF and db is not None:
                                 self.cache.put_source_frame(lb.id, f, db)
-                    return (da, db)
+                    ca = conform_frame_to_format(da, stk_w, stk_h) if da is not None else None
+                    cb = conform_frame_to_format(db, stk_w, stk_h) if db is not None else None
+                    return (ca, cb)
                 else:
                     cur_layer = viewable.get_current_layer(self.session_graph.sources)
                     if cur_layer:
                         d = self.cache.get_source_frame(cur_layer.id, f)
-                        if d is not None:
-                            return d
-                        r = self._get_reader_for_source(cur_layer)
-                        d = r.read_frame(f) if r else None
-                        if self.cache.mode != CacheMode.OFF and d is not None:
-                            self.cache.put_source_frame(cur_layer.id, f, d)
-                        return d
+                        if d is None:
+                            r = self._get_reader_for_source(cur_layer)
+                            d = r.read_frame(f) if r else None
+                            if self.cache.mode != CacheMode.OFF and d is not None:
+                                self.cache.put_source_frame(cur_layer.id, f, d)
+                        return conform_frame_to_format(d, stk_w, stk_h) if d is not None else None
                     return None
             self.reader = CallableVirtualReader(_fetch_stack)
             self.reader_engine.set_reader(self.reader)
@@ -7100,6 +7479,376 @@ class MainWindow(QMainWindow):
             self.timeline.goto_frame_box.clearFocus()
         if hasattr(self, "viewport") and self.viewport:
             self.viewport.setFocus()
+
+
+    # --------------------------------------------------------------------------
+    # Timeline Mode & Conform Handlers
+    # --------------------------------------------------------------------------
+    def _init_empty_timeline_sequence(self) -> None:
+        """Initialize an empty sequence with clean default tracks (Video 1, Audio 1) and zero sample clips."""
+        from openreview.sdk.timeline_api import TimelineAPI
+        seq = TimelineAPI.create_sequence("Sequence 1", fps=24.0, width=1920, height=1080, start_timecode="00:00:00:00")
+        seq.add_video_track("Video 1")
+        seq.add_audio_track("Audio 1")
+        self._set_active_timeline_sequence(seq)
+
+    def _init_demo_timeline_sequence(self) -> None:
+        """Initialize a clean empty timeline sequence with Video 1 and Audio 1 tracks."""
+        self._init_empty_timeline_sequence()
+
+    def _populate_sequence_from_loaded_media(
+        self,
+        path: str,
+        start_frame: int,
+        end_frame: int,
+        fps: float,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+    ) -> None:
+        """Ensure active timeline sequence exists, but do NOT automatically insert clips into tracks.
+        Imported media resides in the Sources Bin / Session Manager until explicitly placed on the timeline.
+        """
+        if not getattr(self, "current_sequence", None):
+            self._init_empty_timeline_sequence()
+
+    def _sync_timeline_playback_range(self) -> None:
+        """Synchronize clock range and in/out points with active timeline sequence.
+        Spans from the sequence start to the tail of all timeline clips so playback
+        flows continuously through the entire multi-clip sequence like an NLE.
+        """
+        if not getattr(self, "current_sequence", None) or not hasattr(self, "clock"):
+            return
+        seq = self.current_sequence
+        if seq.in_mark is not None and seq.out_mark is not None and seq.in_mark < seq.out_mark:
+            self.clock.set_range(seq.in_mark, seq.out_mark)
+            return
+
+        all_clips = [c for t in seq.tracks for c in t.clips]
+        if all_clips:
+            start_f = min(seq.in_frame, min(c.dst_in for c in all_clips))
+            end_f = max(c.dst_out for c in all_clips)
+        else:
+            start_f = seq.in_frame
+            end_f = max(start_f, seq.out_frame)
+        self.clock.set_range(start_f, end_f)
+
+    def _sync_timeline_audio_engine(self) -> None:
+        """Auto-detect and load audio track from current timeline sequence into audio engine."""
+        if not hasattr(self, "audio_engine") or not self.audio_engine or not getattr(self, "current_sequence", None):
+            return
+
+        seq = self.current_sequence
+        audio_path = None
+
+        # 1. First priority: Dedicated audio tracks (respecting solo and mute)
+        a_tracks = [t for t in seq.tracks if t.track_type == TrackType.AUDIO]
+        has_a_solo = any(t.solo for t in a_tracks)
+        for t in a_tracks:
+            if t.mute or (has_a_solo and not t.solo):
+                continue
+            for c in t.clips:
+                if c.file_path and os.path.exists(c.file_path):
+                    audio_path = c.file_path
+                    break
+            if audio_path:
+                break
+
+        # 2. Second priority: Video track clips that contain audio (if visible and not muted/solo-bypassed)
+        if not audio_path:
+            v_tracks = [t for t in seq.tracks if t.track_type == TrackType.VIDEO]
+            has_v_solo = any(t.solo for t in v_tracks)
+            for t in v_tracks:
+                if not t.visible or (has_v_solo and not t.solo):
+                    continue
+                for c in t.clips:
+                    if c.file_path and os.path.exists(c.file_path):
+                        _, ext = os.path.splitext(c.file_path.lower())
+                        if ext in (".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm"):
+                            audio_path = c.file_path
+                            break
+                if audio_path:
+                    break
+
+        if audio_path:
+            self.audio_engine.load_audio(audio_path)
+            self.audio_engine.set_sequence_context(seq.in_frame, seq.fps)
+        else:
+            self.audio_engine.unload_audio()
+
+    def _on_timeline_scrub_started(self) -> None:
+        """Handle start of continuous scrub drag: pause prefetch and throttle scopes for maximum responsiveness."""
+        self._is_scrubbing = True
+        if hasattr(self, "reader_engine") and self.reader_engine:
+            self.reader_engine.pause_prefetch()
+
+    def _on_timeline_scrub_finished(self, frame: int) -> None:
+        """Handle end of scrub drag: resume background prefetch and render full settled frame."""
+        self._is_scrubbing = False
+        if getattr(self, "current_sequence", None):
+            self._render_timeline_frame(frame)
+
+    def _on_timeline_playhead_changed(self, frame: int) -> None:
+        """Handle timeline playhead scrub/jump: update clock and authoritative composite viewer."""
+        if hasattr(self, "clock"):
+            self.clock.set_frame(frame)
+        elif getattr(self, "current_sequence", None):
+            self._render_timeline_frame(frame)
+
+    def _on_timeline_sequence_changed(self) -> None:
+        """Synchronize spreadsheet, canvas, clock range, audio engine, and viewer when clips change."""
+        if hasattr(self, "spreadsheet_dock") and hasattr(self.spreadsheet_dock, "spreadsheet"):
+            self.spreadsheet_dock.spreadsheet.refresh()
+        if hasattr(self, "multitrack_timeline") and hasattr(self.multitrack_timeline, "canvas"):
+            self.multitrack_timeline.canvas.update()
+        if hasattr(self, "current_sequence") and self.current_sequence:
+            self._sync_timeline_playback_range()
+            self._sync_timeline_audio_engine()
+            self._render_timeline_frame(self.clock.current_frame)
+
+    def _on_timeline_in_out_changed(self, in_mark: Optional[int], out_mark: Optional[int]) -> None:
+        """Constrain playback loop clock range to marked In/Out editorial points."""
+        if not hasattr(self, "clock"):
+            return
+        if in_mark is not None and out_mark is not None and in_mark < out_mark:
+            self.clock.set_range(in_mark, out_mark)
+        elif getattr(self, "current_sequence", None):
+            self._sync_timeline_playback_range()
+
+    def _is_in_timeline_mode(self) -> bool:
+        """Return True if currently active in Timeline Mode."""
+        return (
+            (getattr(self, "workspace_mgr", None) and self.workspace_mgr.current_workspace == "timeline_mode")
+            or (hasattr(self, "timeline_stack") and self.timeline_stack.currentWidget() == getattr(self, "multitrack_timeline", None))
+        )
+
+    def _sync_timeline_audio_to_frame(self, frame: int, is_playing: bool, shuttle_speed: float) -> None:
+        """Synchronize audio engine directly to the active audio clip at the timeline frame."""
+        if not hasattr(self, "audio_engine") or not self.audio_engine:
+            return
+        seq = getattr(self, "current_sequence", None)
+        if not seq:
+            return
+        match = seq.get_active_audio_clip_at_frame(frame)
+        active_clip = match[1] if match else None
+        if active_clip and active_clip.file_path and os.path.exists(active_clip.file_path):
+            if self.audio_engine.current_file != active_clip.file_path:
+                self.audio_engine.load_audio(active_clip.file_path)
+            src_frame = active_clip.map_dst_to_src_frame(frame)
+            target_ms = int(round((src_frame - 1) / seq.fps * 1000.0))
+            self.audio_engine.sync_to_ms(target_ms, is_playing, shuttle_speed, frame)
+        else:
+            # Over gap or muted track: pause / mute audio
+            self.audio_engine.pause(frame)
+
+    def _on_timeline_audio_scrub(self, frame: int) -> None:
+        """Trigger low-latency micro-buffer audio burst during multi-track scrub."""
+        if hasattr(self, "audio_engine") and self.audio_engine:
+            try:
+                if self._is_in_timeline_mode() and getattr(self, "current_sequence", None):
+                    match = self.current_sequence.get_active_audio_clip_at_frame(frame)
+                    active_clip = match[1] if match else None
+                    if active_clip and active_clip.file_path and os.path.exists(active_clip.file_path):
+                        if self.audio_engine.current_file != active_clip.file_path:
+                            self.audio_engine.load_audio(active_clip.file_path)
+                        src_frame = active_clip.map_dst_to_src_frame(frame)
+                        target_ms = int(round((src_frame - 1) / self.current_sequence.fps * 1000.0))
+                        self.audio_engine.scrub_to_ms(target_ms, frame, self.current_sequence.fps)
+                    else:
+                        self.audio_engine.pause(frame)
+                else:
+                    self.audio_engine.scrub_frame(frame)
+            except Exception as e:
+                logger.debug("Error during timeline audio scrub: %s", e)
+
+    def _set_active_timeline_sequence(self, sequence: TimelineSequence) -> None:
+        self.current_sequence = sequence
+        if hasattr(self, "clock") and sequence:
+            self._sync_timeline_playback_range()
+            self.clock.set_fps(sequence.fps)
+            self.clock.set_frame(sequence.in_frame)
+        if hasattr(self, "spreadsheet_dock") and hasattr(self.spreadsheet_dock, "spreadsheet"):
+            self.spreadsheet_dock.spreadsheet.set_sequence(sequence)
+        if hasattr(self, "multitrack_timeline"):
+            self.multitrack_timeline.set_sequence(sequence)
+
+        # Pre-load audio track for micro-scrubbing and audio engine playback
+        self._sync_timeline_audio_engine()
+
+    def load_timeline_sequence(self, sequence: TimelineSequence) -> None:
+        self._set_active_timeline_sequence(sequence)
+
+    def _on_timeline_clip_selected(self, track_id: str, clip_id: str, dst_in: int = None) -> None:
+        if dst_in is not None and hasattr(self, "clock"):
+            self.clock.set_frame(dst_in)
+        if hasattr(self, "current_sequence") and self.current_sequence:
+            for t in self.current_sequence.tracks:
+                if t.id == track_id or not track_id:
+                    for c in t.clips:
+                        if c.id == clip_id:
+                            if hasattr(self, "soft_effects_dock") and hasattr(self.soft_effects_dock, "inspector"):
+                                self.soft_effects_dock.inspector.set_clip(c)
+                            if hasattr(self, "spreadsheet_dock") and hasattr(self.spreadsheet_dock, "spreadsheet"):
+                                self.spreadsheet_dock.spreadsheet.select_clip(clip_id)
+                            if hasattr(self, "multitrack_timeline"):
+                                if clip_id not in self.multitrack_timeline.canvas._selected_clip_ids:
+                                    self.multitrack_timeline.select_clip(clip_id)
+                            return
+
+    def _on_open_conform_dialog(self, initial_file: str = "") -> None:
+        """Open the Visual Conform & Relinking Turnover Wizard Dialog."""
+        from openreview.ui.conform_dialog import ConformDialog
+        dlg = ConformDialog(initial_file=initial_file, parent=self)
+        dlg.conform_committed.connect(self._set_active_timeline_sequence)
+        if dlg.exec():
+            if self.workspace_mgr.current_workspace != "timeline_mode":
+                self._apply_workspace("timeline_mode")
+
+    def _on_timeline_conform_requested(self, file_or_seq) -> None:
+        if isinstance(file_or_seq, TimelineSequence):
+            self._set_active_timeline_sequence(file_or_seq)
+            if self.workspace_mgr.current_workspace != "timeline_mode":
+                self._apply_workspace("timeline_mode")
+            self.statusBar().showMessage(f"Committed conformed sequence: {file_or_seq.name}", 3500)
+            return
+
+        self._on_open_conform_dialog(initial_file=str(file_or_seq))
+
+    def _on_timeline_relink_requested(self) -> None:
+        if not hasattr(self, "current_sequence") or not self.current_sequence:
+            return
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+        from openreview.core.conform import MediaRelinker
+        folder = QFileDialog.getExistingDirectory(self, "Select Media Root Directory for Relinking")
+        if folder:
+            relinker = MediaRelinker([folder])
+            report = relinker.relink_sequence(self.current_sequence)
+            if hasattr(self, "spreadsheet_dock") and hasattr(self.spreadsheet_dock, "spreadsheet"):
+                self.spreadsheet_dock.spreadsheet.refresh()
+            if hasattr(self, "multitrack_timeline") and hasattr(self.multitrack_timeline, "canvas"):
+                self.multitrack_timeline.canvas.update()
+            QMessageBox.information(
+                self, "Relink Complete",
+                f"Relink Report:\nMatched: {report.matched} / {report.total_clips} clips\nMissing: {report.missing}"
+            )
+
+    def _render_timeline_frame(self, frame: int) -> None:
+        """Render active timeline composite frame, execute GLSL soft effects, and stream to SDI."""
+        frame_data = None
+        cdl = None
+        extra = {}
+
+        if getattr(self, "current_sequence", None):
+            if not hasattr(self, "timeline_compositor"):
+                from openreview.core.timeline_compositor import TimelineCompositor
+                self.timeline_compositor = TimelineCompositor()
+
+            frame_data, cdl, extra = self.timeline_compositor.render_frame(self.current_sequence, frame)
+
+        # Fallback to session media reader ONLY if sequence has zero clips placed
+        has_any_clips = any(len(t.clips) > 0 for t in self.current_sequence.tracks) if getattr(self, "current_sequence", None) else False
+        if frame_data is None and not has_any_clips and hasattr(self, "reader") and self.reader is not None:
+            try:
+                raw_frame = self.reader.read_frame(frame)
+                frame_data = self._normalize_frame_data(raw_frame)
+            except Exception:
+                frame_data = None
+
+        if frame_data is None and not getattr(self, "current_sequence", None):
+            return
+
+        # 1. Apply GPU ASC CDL Grade
+        if cdl is not None:
+            self.viewport.set_cdl(cdl)
+            self.viewport.set_cdl_enabled(True)
+        else:
+            self.viewport.set_cdl_enabled(False)
+
+        # 2. Apply Aspect Ratio Scope Mask
+        mask_str = extra.get("aspect_mask")
+        if mask_str:
+            if "2.39" in mask_str:
+                self.viewport.aspect_ratio_mask = 2.39
+            elif "1.85" in mask_str:
+                self.viewport.aspect_ratio_mask = 1.85
+            elif "1.78" in mask_str:
+                self.viewport.aspect_ratio_mask = 1.777778
+            elif "1.33" in mask_str:
+                self.viewport.aspect_ratio_mask = 1.333333
+        else:
+            self.viewport.aspect_ratio_mask = None
+
+        # 3. Upload frame texture to OpenGL Viewport
+        seq_w = self.current_sequence.width if getattr(self, "current_sequence", None) else 1920
+        seq_h = self.current_sequence.height if getattr(self, "current_sequence", None) else 1080
+
+        if frame_data is not None:
+            self.viewport.is_timeline_empty_frame = False
+            self.viewport.set_primary_frame(frame, frame_data, logical_size=(seq_w, seq_h))
+            self._update_resolution_status(f"{seq_w}x{seq_h} (Timeline)")
+            if not getattr(self, "_is_scrubbing", False) and hasattr(self, "_update_hud_scopes"):
+                self._update_hud_scopes(frame_data)
+        else:
+            self.viewport.is_timeline_empty_frame = True
+            self.viewport.set_primary_frame(frame, None)
+            self._update_resolution_status(f"{seq_w}x{seq_h} (Empty)")
+        self.viewport.update()
+
+        # 3b. Reference Track A/B Comparison Frame (feeds Image B for Wipe/Difference)
+        if getattr(self, "current_sequence", None):
+            ref_frame_data = self.timeline_compositor.render_reference_frame(self.current_sequence, frame)
+            if hasattr(self.viewport, "set_secondary_frame"):
+                self.viewport.set_secondary_frame(frame, ref_frame_data, logical_size=(seq_w, seq_h))
+            elif hasattr(self.viewport, "set_reference_frame"):
+                self.viewport.set_reference_frame(ref_frame_data)
+
+        # 4. SDI Monitor-Out Broadcast lock
+        if hasattr(self, "sdi_monitor_mgr") and self.sdi_monitor_mgr.is_active:
+            self.sdi_monitor_mgr.send_frame(frame)
+
+        # 5. Highlight cut row in Spreadsheet
+        if hasattr(self, "spreadsheet_dock") and hasattr(self.spreadsheet_dock, "spreadsheet"):
+            self.spreadsheet_dock.spreadsheet.highlight_frame(frame)
+
+        # 6. Update Timeline RAM Cache bar & on-demand lookahead prefetch
+        if hasattr(self, "multitrack_timeline") and hasattr(self.multitrack_timeline, "canvas"):
+            cached_dst = self.timeline_compositor.get_cached_dst_frames(self.current_sequence)
+            self.multitrack_timeline.canvas.set_cached_sequence_frames(cached_dst)
+
+        if hasattr(self, "clock") and getattr(self.clock, "_is_playing", False):
+            QTimer.singleShot(0, lambda: self.timeline_compositor.prefetch_ahead(self.current_sequence, frame, count=36))
+
+    def _on_timeline_soft_effect_changed(self, clip_id: str, effect_id: str) -> None:
+        if hasattr(self, "timeline_compositor"):
+            self.timeline_compositor.clear_cache()
+        if hasattr(self, "clock"):
+            self._render_timeline_frame(self.clock.current_frame)
+        if hasattr(self, "viewport"):
+            self.viewport.update()
+        if hasattr(self, "multitrack_timeline") and hasattr(self.multitrack_timeline, "canvas"):
+            self.multitrack_timeline.canvas.update()
+
+    def _on_open_sequence_settings(self) -> None:
+        """Open the Sequence / Project Settings modal dialog to configure canvas resolution, FPS, and colorspace."""
+        from openreview.ui.sequence_settings_dialog import SequenceSettingsDialog
+        seq = getattr(self, "current_sequence", None)
+        dlg = SequenceSettingsDialog(sequence=seq, parent=self)
+        if dlg.exec():
+            if seq:
+                self.clock.set_fps(seq.fps)
+                self._sync_timeline_playback_range()
+                if hasattr(self, "timeline_compositor"):
+                    self.timeline_compositor.clear_cache()
+                self._render_timeline_frame(self.clock.current_frame)
+                if hasattr(self, "viewport"):
+                    self.viewport.fit_image()
+                if hasattr(self, "spreadsheet_dock") and hasattr(self.spreadsheet_dock, "spreadsheet"):
+                    self.spreadsheet_dock.spreadsheet.refresh()
+                if hasattr(self, "multitrack_timeline") and hasattr(self.multitrack_timeline, "canvas"):
+                    self.multitrack_timeline.canvas.update()
+                self.statusBar().showMessage(
+                    f"Project Settings updated: {seq.width}x{seq.height} @ {seq.fps:.2f}fps ({seq.colorspace})",
+                    4000
+                )
 
     def closeEvent(self, event) -> None:
         if hasattr(self, "workspace_mgr") and hasattr(self, "pref_mgr"):

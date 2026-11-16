@@ -3,7 +3,14 @@ Application Bootstrap and Entry Point for OpenReview.
 """
 from __future__ import annotations
 
+import os
 import sys
+from pathlib import Path
+
+_SRC_DIR = str(Path(__file__).resolve().parent.parent)
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QSurfaceFormat
 from PySide6.QtWidgets import QApplication
@@ -69,6 +76,38 @@ def main() -> int:
         if clean_arg and not clean_arg.startswith("-") and os.path.exists(clean_arg):
             initial_file = clean_arg
             break
+
+    # Single-instance enforcement: Forward to running OpenReview instance if available
+    if "--new-instance" not in sys.argv and "--multi-instance" not in sys.argv:
+        try:
+            import json
+            import socket
+            with socket.create_connection(("127.0.0.1", 45124), timeout=0.25) as s:
+                if initial_file:
+                    abs_path = os.path.abspath(initial_file)
+                    req = {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "load_media",
+                        "params": {"path": abs_path, "reload": True, "activate": True},
+                    }
+                    s.sendall((json.dumps(req) + "\n").encode("utf-8"))
+                    s.settimeout(5.0)
+                    try:
+                        s.recv(4096)
+                    except Exception:
+                        pass
+                else:
+                    req = {"jsonrpc": "2.0", "id": 1, "method": "activate_window", "params": {}}
+                    s.sendall((json.dumps(req) + "\n").encode("utf-8"))
+                    s.settimeout(2.0)
+                    try:
+                        s.recv(4096)
+                    except Exception:
+                        pass
+                return 0
+        except (ConnectionRefusedError, socket.timeout, OSError):
+            pass
 
     app = create_application()
     window = MainWindow()

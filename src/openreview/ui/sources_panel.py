@@ -12,7 +12,7 @@ from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal, QPoint, QPointF, QRect, QSize, QMimeData, QModelIndex, QTimer, QEvent, QUrl
-from PySide6.QtGui import QIcon, QAction, QCursor, QDragEnterEvent, QDropEvent, QPainter, QColor, QPen, QKeyEvent
+from PySide6.QtGui import QIcon, QAction, QCursor, QDrag, QDragEnterEvent, QDropEvent, QPainter, QColor, QPen, QKeyEvent
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
@@ -70,8 +70,19 @@ class MediaSourcesTreeWidget(QTreeWidget):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
-        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setDefaultDropAction(Qt.DropAction.CopyAction)
         self.setDragEnabled(True)
+
+    def supportedDropActions(self) -> Qt.DropActions:
+        return Qt.DropAction.CopyAction | Qt.DropAction.MoveAction
+
+    def startDrag(self, supportedActions: Qt.DropActions) -> None:
+        items = self.selectedItems()
+        if not items:
+            return
+        drag = QDrag(self)
+        drag.setMimeData(self.mimeData(items))
+        drag.exec(Qt.DropAction.CopyAction | Qt.DropAction.MoveAction, Qt.DropAction.CopyAction)
 
     def mimeData(self, items: List[QTreeWidgetItem]) -> QMimeData:
         mime = super().mimeData(items)
@@ -175,7 +186,7 @@ class SourcesPanelWidget(QWidget):
     def __init__(self, graph: SessionGraph, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.graph = graph
-        self.setMinimumWidth(240)
+        self.setMinimumWidth(220)
         self._suppress_tree_events = False
         self._source_selection_order: List[str] = []
 
@@ -237,9 +248,10 @@ class SourcesPanelWidget(QWidget):
                 background-color: #282828;
                 border: 1px solid #3a3a3a;
                 color: #e0e0e0;
-                padding: 4px 8px;
+                padding: 2px 6px;
                 border-radius: 2px;
                 font-size: 11px;
+                min-height: 0px;
             }
             QPushButton:hover {
                 background-color: #353535;
@@ -392,60 +404,65 @@ class SourcesPanelWidget(QWidget):
 
         # 3. Action Toolbar (SVG vector icons)
         tools_box = QHBoxLayout()
-        tools_box.setSpacing(3)
+        tools_box.setSpacing(2)
+        tools_box.setContentsMargins(0, 0, 0, 0)
+        tools_box.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         self.btn_import = QPushButton("Import ▾", self)
-        self.btn_import.setStyleSheet("font-weight: bold; color: #e5a823; padding: 4px 6px;")
+        self.btn_import.setFixedHeight(22)
+        self.btn_import.setStyleSheet("font-weight: bold; color: #e5a823; padding: 1px 6px; font-size: 11px; min-height: 0px;")
         self.btn_import.setToolTip("Import Footages, Image Sequences, or Directories...")
         self.btn_import.clicked.connect(self._show_import_menu)
         tools_box.addWidget(self.btn_import)
         self.btn_add = self.btn_import
 
         self.btn_new_folder = QPushButton(self)
-        self.btn_new_folder.setIcon(get_svg_icon("folder", color_normal="#e5a823", size=15))
+        self.btn_new_folder.setIcon(get_svg_icon("folder", color_normal="#e5a823", size=14))
         self.btn_new_folder.setToolTip("New Folder")
-        self.btn_new_folder.setFixedSize(26, 24)
+        self.btn_new_folder.setFixedSize(24, 22)
         self.btn_new_folder.clicked.connect(self._on_create_folder)
         tools_box.addWidget(self.btn_new_folder)
 
         self.btn_expand_all = QPushButton(self)
-        self.btn_expand_all.setIcon(get_svg_icon("expand", color_normal="#cccccc", size=15))
+        self.btn_expand_all.setIcon(get_svg_icon("expand", color_normal="#cccccc", size=14))
         self.btn_expand_all.setToolTip("Expand All Folders & Sections")
-        self.btn_expand_all.setFixedSize(26, 24)
+        self.btn_expand_all.setFixedSize(24, 22)
         self.btn_expand_all.clicked.connect(self.tree.expandAll)
         tools_box.addWidget(self.btn_expand_all)
 
         self.btn_collapse_all = QPushButton(self)
-        self.btn_collapse_all.setIcon(get_svg_icon("collapse", color_normal="#cccccc", size=15))
+        self.btn_collapse_all.setIcon(get_svg_icon("collapse", color_normal="#cccccc", size=14))
         self.btn_collapse_all.setToolTip("Collapse All Folders & Sections")
-        self.btn_collapse_all.setFixedSize(26, 24)
+        self.btn_collapse_all.setFixedSize(24, 22)
         self.btn_collapse_all.clicked.connect(self.tree.collapseAll)
         tools_box.addWidget(self.btn_collapse_all)
 
         self.btn_delete = QPushButton(self)
-        self.btn_delete.setIcon(get_svg_icon("trash", color_normal="#ff6b6b", size=15))
+        self.btn_delete.setIcon(get_svg_icon("trash", color_normal="#ff6b6b", size=14))
         self.btn_delete.setToolTip("Delete Selected Source or View")
-        self.btn_delete.setFixedSize(26, 24)
+        self.btn_delete.setFixedSize(24, 22)
         self.btn_delete.clicked.connect(self._on_delete_selected)
         tools_box.addWidget(self.btn_delete)
 
         self.btn_info = QPushButton(self)
-        self.btn_info.setIcon(get_svg_icon("info", color_normal="#38d9c6", size=15))
+        self.btn_info.setIcon(get_svg_icon("info", color_normal="#38d9c6", size=14))
         self.btn_info.setToolTip("Edit Info / Properties")
-        self.btn_info.setFixedSize(26, 24)
+        self.btn_info.setFixedSize(24, 22)
         self.btn_info.clicked.connect(lambda: self.tabs.setCurrentIndex(1))
         tools_box.addWidget(self.btn_info)
 
         self.btn_make_active = QPushButton(self)
-        self.btn_make_active.setIcon(get_svg_icon("home", color_normal="#e5a823", size=15))
+        self.btn_make_active.setIcon(get_svg_icon("home", color_normal="#e5a823", size=14))
         self.btn_make_active.setToolTip("Set as Active View in Canvas")
-        self.btn_make_active.setFixedSize(26, 24)
+        self.btn_make_active.setFixedSize(24, 22)
         self.btn_make_active.clicked.connect(self._on_make_selected_active)
         tools_box.addWidget(self.btn_make_active)
 
         tools_box.addStretch()
 
-        self.btn_menu_new = QPushButton("▾ New Viewable", self)
-        self.btn_menu_new.setStyleSheet("font-weight: bold; color: #e5a823;")
+        self.btn_menu_new = QPushButton("+ View ▾", self)
+        self.btn_menu_new.setFixedHeight(22)
+        self.btn_menu_new.setStyleSheet("font-weight: bold; color: #e5a823; padding: 1px 6px; font-size: 11px; min-height: 0px;")
+        self.btn_menu_new.setToolTip("New Viewable: Sequence, Stack, Layout, or Contact Sheet")
         self.btn_menu_new.clicked.connect(self._show_new_viewable_menu)
         tools_box.addWidget(self.btn_menu_new)
 

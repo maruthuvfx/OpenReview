@@ -53,6 +53,8 @@ class ColorRulerSlider(QWidget):
         suffix: str = "",
         is_log: bool = False,
         log_ticks: Optional[List[Tuple[float, str]]] = None,
+        piecewise_mid: Optional[float] = None,
+        custom_ticks: Optional[List[Tuple[float, str, bool]]] = None,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
@@ -65,6 +67,8 @@ class ColorRulerSlider(QWidget):
         self.suffix = suffix
         self.is_log = is_log
         self.log_ticks = log_ticks or []
+        self.piecewise_mid = float(piecewise_mid) if piecewise_mid is not None else None
+        self.custom_ticks = custom_ticks or []
         self._value = float(default_val)
 
         # Log mapping params: default -6 EV (0.015625) to +6 EV (64.0)
@@ -113,6 +117,18 @@ class ColorRulerSlider(QWidget):
             span = self._log_max_ev - self._log_min_ev
             ratio = (ev - self._log_min_ev) / max(1e-4, span)
             return max(0.0, min(1.0, ratio))
+        elif self.piecewise_mid is not None:
+            mid = self.piecewise_mid
+            if val <= mid:
+                span = mid - self.min_val
+                if span <= 0:
+                    return 0.0
+                return max(0.0, min(0.5, 0.5 * ((val - self.min_val) / span)))
+            else:
+                span = self.max_val - mid
+                if span <= 0:
+                    return 1.0
+                return max(0.5, min(1.0, 0.5 + 0.5 * ((val - mid) / span)))
         else:
             span = self.max_val - self.min_val
             if span <= 0:
@@ -131,6 +147,13 @@ class ColorRulerSlider(QWidget):
                 return round(raw, 2)
             else:
                 return round(raw, 3)
+        elif self.piecewise_mid is not None:
+            mid = self.piecewise_mid
+            if ratio <= 0.5:
+                raw = self.min_val + (ratio / 0.5) * (mid - self.min_val)
+            else:
+                raw = mid + ((ratio - 0.5) / 0.5) * (self.max_val - mid)
+            return round(raw, self.decimals)
         else:
             raw = self.min_val + ratio * (self.max_val - self.min_val)
             return round(raw, self.decimals)
@@ -175,6 +198,10 @@ class ColorRulerSlider(QWidget):
                     start_ev = math.log2(max(1e-6, self._drag_start_val))
                     new_val = 2.0 ** (start_ev + delta_ev)
                     self.value = round(new_val, 3)
+                elif self.piecewise_mid is not None:
+                    delta_ratio = (dx / track_w) * 0.15
+                    start_ratio = self._val_to_ratio(self._drag_start_val)
+                    self.value = self._ratio_to_val(start_ratio + delta_ratio)
                 else:
                     delta_val = (dx / track_w) * (self.max_val - self.min_val) * 0.15
                     self.value = round(self._drag_start_val + delta_val, self.decimals)
@@ -326,6 +353,29 @@ class ColorRulerSlider(QWidget):
                 p.drawLine(QPointF(tx, base_y - tick_len), QPointF(tx, base_y))
 
                 if abs(tx - thumb_x) > 16.0:
+                    # Text Shadow
+                    p.setPen(QColor(0, 0, 0, 230 if is_active else 190))
+                    p.drawText(QRectF(tx - 15.0, base_y + 4.0, 30.0, 11.0), Qt.AlignmentFlag.AlignCenter, lbl)
+                    # Text Foreground
+                    p.setPen(QColor(230, 230, 230, 240 if is_active else 200))
+                    p.drawText(QRectF(tx - 15.0, base_y + 3.0, 30.0, 11.0), Qt.AlignmentFlag.AlignCenter, lbl)
+        elif self.custom_ticks:
+            for val, lbl, is_major in self.custom_ticks:
+                t_ratio = self._val_to_ratio(val)
+                tx = margin_x + t_ratio * track_w
+                dx = tx - thumb_x
+                base_y = track_y + amp * math.exp(- (dx / sigma) ** 2)
+                tick_len = 7.0 if is_major else 4.0
+
+                # Dark shadow under-stroke for ticks
+                p.setPen(QPen(QColor(0, 0, 0, 220 if is_active else 180), 2.6 if is_major else 2.0))
+                p.drawLine(QPointF(tx, base_y - tick_len), QPointF(tx, base_y))
+
+                # Foreground tick stroke
+                p.setPen(QPen(QColor(245, 245, 245, 240 if is_active else 200), 1.2 if is_major else 0.8))
+                p.drawLine(QPointF(tx, base_y - tick_len), QPointF(tx, base_y))
+
+                if is_major and lbl and abs(tx - thumb_x) > 16.0:
                     # Text Shadow
                     p.setPen(QColor(0, 0, 0, 230 if is_active else 190))
                     p.drawText(QRectF(tx - 15.0, base_y + 4.0, 30.0, 11.0), Qt.AlignmentFlag.AlignCenter, lbl)
@@ -487,8 +537,32 @@ class ColorSlidersOverlay(QWidget):
         self.slider_gain.valueChanged.connect(self._on_gain_changed)
         sliders_layout.addWidget(self.slider_gain)
 
-        # 2. Gamma Slider (0.0 to 4.0 matching top_bar, default 1.0)
-        self.slider_gamma = ColorRulerSlider("GAMMA", 0.0, 4.0, 1.0, step=0.025, decimals=3, suffix="", parent=self)
+        # 2. Gamma Slider (0.0 to 4.0 matching top_bar, default 1.0 at center)
+        gamma_ticks = [
+            (0.0, "0", True),
+            (0.25, "", False),
+            (0.5, "0.5", True),
+            (0.75, "", False),
+            (1.0, "1", True),
+            (1.5, "", False),
+            (2.0, "2", True),
+            (2.5, "", False),
+            (3.0, "3", True),
+            (3.5, "", False),
+            (4.0, "4", True),
+        ]
+        self.slider_gamma = ColorRulerSlider(
+            "GAMMA",
+            0.0,
+            4.0,
+            1.0,
+            step=0.025,
+            decimals=3,
+            suffix="",
+            piecewise_mid=1.0,
+            custom_ticks=gamma_ticks,
+            parent=self,
+        )
         self.slider_gamma.valueChanged.connect(self._on_gamma_changed)
         sliders_layout.addWidget(self.slider_gamma)
 
@@ -497,8 +571,32 @@ class ColorSlidersOverlay(QWidget):
         self.slider_hue.valueChanged.connect(self._on_hue_changed)
         sliders_layout.addWidget(self.slider_hue)
 
-        # 4. Saturation Slider (0.0 to 4.0 matching top_bar, default 1.0)
-        self.slider_sat = ColorRulerSlider("SATURATION", 0.0, 4.0, 1.0, step=0.025, decimals=3, suffix="", parent=self)
+        # 4. Saturation Slider (0.0 to 4.0 matching top_bar, default 1.0 at center)
+        sat_ticks = [
+            (0.0, "0", True),
+            (0.25, "", False),
+            (0.5, "0.5", True),
+            (0.75, "", False),
+            (1.0, "1", True),
+            (1.5, "", False),
+            (2.0, "2", True),
+            (2.5, "", False),
+            (3.0, "3", True),
+            (3.5, "", False),
+            (4.0, "4", True),
+        ]
+        self.slider_sat = ColorRulerSlider(
+            "SATURATION",
+            0.0,
+            4.0,
+            1.0,
+            step=0.025,
+            decimals=3,
+            suffix="",
+            piecewise_mid=1.0,
+            custom_ticks=sat_ticks,
+            parent=self,
+        )
         self.slider_sat.valueChanged.connect(self._on_sat_changed)
         sliders_layout.addWidget(self.slider_sat)
 
@@ -591,7 +689,7 @@ class ColorSlidersOverlay(QWidget):
 
     def auto_center_in_parent(self) -> None:
         """
-        Dynamically cover 70% of the viewport width with a sensible 640px minimum,
+        Dynamically cover 90% of the viewport width with a sensible 640px minimum,
         positioned horizontally centered at the bottom of the parent canvas.
         If the Magnified Time Scrub Ruler is active, position stacked on top of it.
         """
@@ -602,7 +700,7 @@ class ColorSlidersOverlay(QWidget):
         pw = parent.width()
         ph = parent.height()
 
-        desired_w = max(640, min(pw - 24, int(pw * 0.70)))
+        desired_w = max(640, min(pw - 24, int(pw * 0.90)))
         h = 100
         self.setFixedSize(desired_w, h)
 

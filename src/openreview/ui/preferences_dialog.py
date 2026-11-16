@@ -287,6 +287,26 @@ class PreferencesDialog(QDialog):
         grp_layout = QVBoxLayout(grp_startup)
         grp_layout.setSpacing(8)
 
+        startup_ws_row = QHBoxLayout()
+        lbl_ws = QLabel("Default Workspace on Startup:")
+        self.combo_startup_workspace = QComboBox()
+        self.combo_startup_workspace.addItem("Last Used Workspace", "last_used")
+        self.combo_startup_workspace.addItem("Standard Review (F5)", "review")
+        self.combo_startup_workspace.addItem("Color & QC Studio (F6)", "color_qc")
+        self.combo_startup_workspace.addItem("VFX Breakdown & EXR (F7)", "vfx_breakdown")
+        self.combo_startup_workspace.addItem("Cinema / Dailies Theater (F8)", "cinema")
+        self.combo_startup_workspace.addItem("Supervisor Review & Notes (F9)", "annotations")
+        self.combo_startup_workspace.addItem("Timeline Mode (F10)", "timeline_mode")
+
+        custom_ws = getattr(self.mgr.prefs, "custom_workspaces", {})
+        if isinstance(custom_ws, dict):
+            for cname in custom_ws.keys():
+                self.combo_startup_workspace.addItem(f"Custom: {cname}", f"custom_{cname}")
+
+        startup_ws_row.addWidget(lbl_ws)
+        startup_ws_row.addWidget(self.combo_startup_workspace, 1)
+        grp_layout.addLayout(startup_ws_row)
+
         self.chk_play_on_startup = QCheckBox("Play on startup")
         self.chk_fullscreen = QCheckBox("Start in full screen mode")
         self.chk_canvas_scrub = QCheckBox("Mouse scrub in canvas to scrub over timeline")
@@ -1205,6 +1225,9 @@ class PreferencesDialog(QDialog):
         self.chk_fullscreen.setChecked(p.start_fullscreen)
         self.chk_canvas_scrub.setChecked(p.canvas_scrub_enabled)
         self.chk_auto_retime.setChecked(p.auto_retime_mismatched_fps)
+        idx_ws = self.combo_startup_workspace.findData(getattr(p, "startup_workspace", "last_used"))
+        if idx_ws >= 0:
+            self.combo_startup_workspace.setCurrentIndex(idx_ws)
 
         # Performance settings
         idx_tex = self.combo_texture_mode.findData(getattr(p, "playback_texture_mode", "auto"))
@@ -1394,6 +1417,7 @@ class PreferencesDialog(QDialog):
         p.start_fullscreen = self.chk_fullscreen.isChecked()
         p.canvas_scrub_enabled = self.chk_canvas_scrub.isChecked()
         p.auto_retime_mismatched_fps = self.chk_auto_retime.isChecked()
+        p.startup_workspace = self.combo_startup_workspace.currentData() or "last_used"
         p.default_cache_mode = self.combo_cache_mode.currentData()
         p.cache_toggle_mode = self.combo_cache_toggle.currentData()
         p.auto_ram_budget = self.chk_auto_ram_budget.isChecked()

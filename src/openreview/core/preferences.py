@@ -94,6 +94,7 @@ class UserPreferences:
     safe_guides_matte_constrained: bool = True
     hud_opacity: float = 0.85  # 0.30 to 1.00 (30% to 100%)
     active_workspace: str = "review"
+    startup_workspace: str = "last_used"
     custom_workspaces: dict[str, str] = field(default_factory=dict)
 
     # Color Management Configuration
@@ -142,6 +143,8 @@ class UserPreferences:
     export_png_mode: str = "png8"  # "png8", "png24_opt", "16"
     export_png_dither: bool = True
     export_png_compression: int = 4  # 0..9
+    export_templates: dict[str, str] = field(default_factory=dict)
+    last_export_template: str = "{sequence}/{shot}/plates/{clip_name}_v{version}"
 
     # Metadata & Pipeline Inspection
     exiftool_path: str = ""
@@ -230,6 +233,7 @@ class PreferencesManager(QObject):
                     safe_guides_matte_constrained=bool(data.get("safe_guides_matte_constrained", True)),
                     hud_opacity=float(data.get("hud_opacity", 0.85)),
                     active_workspace=str(data.get("active_workspace", "review")),
+                    startup_workspace=str(data.get("startup_workspace", "last_used")),
                     custom_workspaces=dict(data.get("custom_workspaces", {})),
                     color_management_mode=str(data.get("color_management_mode", "standard")),
                     standard_view_transform=str(data.get("standard_view_transform", "sRGB")),
@@ -267,6 +271,8 @@ class PreferencesManager(QObject):
                     export_png_mode=str(data.get("export_png_mode", "png8")),
                     export_png_dither=bool(data.get("export_png_dither", True)),
                     export_png_compression=int(data.get("export_png_compression", 4)),
+                    export_templates=dict(data.get("export_templates", {})),
+                    last_export_template=str(data.get("last_export_template", "{sequence}/{shot}/plates/{clip_name}_v{version}")),
                 )
                 return self._prefs
             except Exception as e:
@@ -296,6 +302,8 @@ class PreferencesManager(QObject):
                 self._prefs.proxy_resolution_scale = int(settings.value("proxy_resolution_scale", 2))
                 self._prefs.console_auto_open_on_error = settings.value("console_auto_open_on_error", True, type=bool)
                 self._prefs.default_brush_width = float(settings.value("default_brush_width", 6.0))
+                self._prefs.active_workspace = str(settings.value("active_workspace", "review"))
+                self._prefs.startup_workspace = str(settings.value("startup_workspace", "last_used"))
                 self._prefs.hud_opacity = float(settings.value("hud_opacity", 0.85))
                 self._prefs.pdf_title = str(settings.value("pdf_title", "OpenReview - VFX Review Sheet"))
                 self._prefs.pdf_studio_name = str(settings.value("pdf_studio_name", ""))

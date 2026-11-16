@@ -41,6 +41,7 @@ from enum import Enum
 from openreview.color.shader_builder import VERTEX_SHADER_SOURCE, FRAGMENT_SHADER_SOURCE, build_fragment_shader
 from openreview.color.lut_manager import CubeLut, AscCdl, ColorGradeSettings
 from openreview.models.annotations import AnnotationStore, ShapeType, Stroke
+from openreview.core.undo_manager import UndoManager, AnnotationStrokeCommand
 from openreview.models.comparison import ComparisonState, ComparisonMode
 from openreview.core.preferences import PreferencesManager
 from openreview.widgets.canvas_text_editor import CanvasTextEditor
@@ -144,6 +145,7 @@ class ViewportCanvas(QOpenGLWidget):
     wipe_position_changed = Signal(float)  # 0.0 to 1.0 interactive wipe split position
     wipe_angle_changed = Signal(float)  # 0.0 to 360.0 interactive wipe rotation angle
     scrub_requested = Signal(int)  # delta frame scrub steps
+    play_pause_requested = Signal()  # single click on canvas toggles play/pause
     exit_presentation_requested = Signal()
     toggle_presentation_requested = Signal()
     exit_fullscreen_requested = Signal()
@@ -182,6 +184,7 @@ class ViewportCanvas(QOpenGLWidget):
         self._is_zooming_drag = False
         self.has_active_media: bool = False
         self.is_bad_frame: bool = False
+        self.is_timeline_empty_frame: bool = False
         self._is_wiping = False
         self._is_rotating_wipe = False
         self._wipe_drag_start_angle = 0.0
@@ -769,7 +772,9 @@ class ViewportCanvas(QOpenGLWidget):
         painter = QPainter(self)
         try:
             if self._image_a is None:
-                if self.has_active_media or self.is_bad_frame:
+                if getattr(self, "is_timeline_empty_frame", False):
+                    pass  # Clean black canvas for timeline empty frame / gap between clips
+                elif self.has_active_media or self.is_bad_frame:
                     self._paint_missing_frame_overlay(painter)
                 else:
                     self._paint_empty_state(painter)
@@ -1318,7 +1323,7 @@ class ViewportCanvas(QOpenGLWidget):
             return
 
         h, w = self._image_a.shape[:2]
-        if not getattr(self, "_is_proxy", False):
+        if not getattr(self, "_is_proxy", False) and not getattr(self, "_has_logical_size", False):
             self._img_width, self._img_height = w, h
 
         mode = PreferencesManager.instance().get_effective_texture_mode()
@@ -1549,9 +1554,9 @@ class ViewportCanvas(QOpenGLWidget):
             self.is_bad_frame = False
             if logical_size is not None and logical_size[0] > 0 and logical_size[1] > 0:
                 new_w, new_h = int(logical_size[0]), int(logical_size[1])
-            elif is_proxy and self._img_width > 0 and self._img_height > 0:
-                new_w, new_h = self._img_width, self._img_height
+                self._has_logical_size = True
             else:
+                self._has_logical_size = False
                 new_w = int(image_data.shape[1])
                 new_h = int(image_data.shape[0])
 
@@ -1621,7 +1626,23 @@ class ViewportCanvas(QOpenGLWidget):
             image_data = next((x for x in image_data if isinstance(x, np.ndarray)), None)
         self._image_b = image_data
         self._pending_upload_b = True if image_data is not None else False
+        if image_data is None and self._texture_b is not None:
+            self._texture_b.destroy()
+            self._texture_b = None
+            self._texture_b_fmt = None
         self.update()
+
+    def set_secondary_frame(
+        self,
+        frame_number: int,
+        image_data: Optional[np.ndarray],
+        logical_size: Optional[Tuple[int, int]] = None,
+    ) -> None:
+        """
+        Set secondary (Image B / reference) frame for comparison, A/B wipe, split,
+        and difference modes, matching set_primary_frame conventions.
+        """
+        self.set_reference_frame(image_data)
 
     def set_matte_frame(self, image_data: Optional[np.ndarray]) -> None:
         self._image_matte = image_data
@@ -2569,6 +2590,8 @@ class ViewportCanvas(QOpenGLWidget):
         ):
             self._is_scrubbing = True
             self._scrub_accum_dx = 0.0
+            self._left_press_pos = pos.toPoint()
+            self._has_scrub_dragged = False
             event.accept()
             return
 
@@ -2699,6 +2722,9 @@ class ViewportCanvas(QOpenGLWidget):
 
         # Handle Canvas Scrub Drag
         if self._is_scrubbing and (event.buttons() & Qt.MouseButton.LeftButton):
+            if hasattr(self, "_left_press_pos") and self._left_press_pos is not None:
+                if (pos.toPoint() - self._left_press_pos).manhattanLength() >= 4:
+                    self._has_scrub_dragged = True
             dx = pos.toPoint().x() - self._last_mouse_pos.x()
             self._scrub_accum_dx += dx
             step_pixels = 8.0
@@ -2821,6 +2847,19 @@ class ViewportCanvas(QOpenGLWidget):
 
         if self._is_scrubbing:
             self._is_scrubbing = False
+            # Check if this was a single click without drag
+            if event.button() == Qt.MouseButton.LeftButton:
+                has_dragged = getattr(self, "_has_scrub_dragged", False)
+                press_pos = getattr(self, "_left_press_pos", None)
+                if not has_dragged:
+                    if press_pos is not None:
+                        dist = (event.position().toPoint() - press_pos).manhattanLength()
+                        if dist < 4:
+                            self.play_pause_requested.emit()
+                    else:
+                        self.play_pause_requested.emit()
+            self._left_press_pos = None
+            self._has_scrub_dragged = False
             event.accept()
             return
 
@@ -2867,6 +2906,8 @@ class ViewportCanvas(QOpenGLWidget):
                 width=self._active_draw_width,
             )
             self.annotation_store.add_stroke(self.current_frame, stroke)
+            UndoManager.instance().push(AnnotationStrokeCommand(self.annotation_store, self.current_frame, on_change=self.update))
+            UndoManager.instance().push(AnnotationStrokeCommand(self.annotation_store, self.current_frame, on_change=self.update))
             self._current_stroke_points.clear()
             self.update()
             event.accept()
@@ -3298,6 +3339,7 @@ class ViewportCanvas(QOpenGLWidget):
                 text=clean_text,
             )
             self.annotation_store.add_stroke(self.current_frame, stroke)
+            UndoManager.instance().push(AnnotationStrokeCommand(self.annotation_store, self.current_frame, on_change=self.update))
 
             # Auto-sync typed annotation into frame's review note
             existing_note = self.annotation_store.get_frame_note(self.current_frame)

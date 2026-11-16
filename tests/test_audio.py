@@ -271,3 +271,30 @@ def test_main_window_pause_stops_audio_immediately(qtbot):
 
     win.close()
 
+
+def test_micro_scrubber_deleted_qiodevice_recovery():
+    """Verify micro-scrubber gracefully recovers and does not raise RuntimeError if QIODevice is deleted."""
+    from openreview.audio.micro_scrubber import MicroBufferAudioScrubber
+    import numpy as np
+
+    scrubber = MicroBufferAudioScrubber(sample_rate=48000)
+
+    # Provide synthetic PCM buffer
+    scrubber._pcm_data = np.zeros((48000, 2), dtype=np.int16)
+
+    # Simulate underlying QIODevice deletion/invalidation
+    class DeletedMockIODevice:
+        def isWritable(self):
+            raise RuntimeError("libshiboken: Internal C++ object (PySide6.QtCore.QIODevice) already deleted.")
+
+    scrubber._io = DeletedMockIODevice()
+
+    # Calling scrub must not raise RuntimeError and must gracefully handle/recover
+    result = scrubber.scrub(target_ms=100, frame=5, fps=24.0)
+    assert isinstance(result, bool)
+
+    # Also test AudioEngine scrub_frame does not raise
+    engine = AudioEngine()
+    engine._micro_scrubber = scrubber
+    engine.scrub_frame(10)
+
